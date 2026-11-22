@@ -1396,6 +1396,40 @@ pub(crate) fn provision_seat_before_launch<C: crate::events_tokens::TokenCli>(
     provision_seat_events_token(cli, state_dir, project, kind, pin, now_us);
 }
 
+/// One preparation step for BOTH spawn paths: mint the per-pin token, then
+/// write the harness's per-seat events config pointing at that 0600 file.
+/// Fail-open: a mint/config failure warns; the seat still spawns on the
+/// doorbell fallback.
+pub(crate) fn prepare_seat_events_before_launch<C: crate::events_tokens::TokenCli>(
+    cli: &C,
+    state_dir: &std::path::Path,
+    kind: &str,
+    project: &str,
+    pin: Option<&str>,
+    pane_env: &mut BTreeMap<String, String>,
+) {
+    let Some(pin) = pin else { return };
+    let now_us = chrono::Utc::now().timestamp_micros();
+    provision_seat_before_launch(cli, state_dir, project, kind, Some(pin), now_us);
+    let token_path = crate::events_tokens::token_path(state_dir, project, pin);
+    if !token_path.is_file() {
+        eprintln!(
+            "flywheel: warn: no events token for {pin}; {kind} seat uses the doorbell fallback"
+        );
+        return;
+    }
+    let configured = if kind == "opencode" {
+        hc::apply_opencode_events_config(pane_env, pin, &token_path)
+    } else if pi_style_events_kind(kind) {
+        hc::apply_pi_events_config(pane_env, project, pin, &token_path)
+    } else {
+        return;
+    };
+    if let Err(err) = configured {
+        eprintln!("flywheel: warn: events config for {pin}: {err}; doorbell fallback");
+    }
+}
+
 pub(crate) fn mint_harness_session(kind: &str, args: &mut Vec<String>) -> Option<String> {
     if crate::harness_registry::canonical(kind) != "opencode" {
         return None;
@@ -2241,22 +2275,17 @@ projects available: {}",
                 }
             };
             let mut pane_env = hc::plane_launch_env(cfg, mail_identity.as_deref());
-            // bd-rrlo2: mint the per-pin events token before launch so the
-            // config branches below find a file; without one they keep the
-            // doorbell fallback. Fail-open: a mint failure warns and the
-            // seat still spawns.
             {
                 let cli = crate::events_tokens::ToronTokenCli {
                     bin: std::env::var("TORON_BIN").unwrap_or_else(|_| "toron".to_string()),
                 };
-                let now_us = chrono::Utc::now().timestamp_micros();
-                provision_seat_before_launch(
+                prepare_seat_events_before_launch(
                     &cli,
                     &crate::config::state_dir(),
-                    project,
                     &kind,
+                    project,
                     mail_identity.as_deref(),
-                    now_us,
+                    &mut pane_env,
                 );
             }
             // bd-9os20/bd-mdpfr: Claude's flywheel plugin is delivered per seat
@@ -2271,39 +2300,6 @@ projects available: {}",
             }
             if let Some(m) = &env_model_pin {
                 hc::apply_opencode_model_pin(&mut pane_env, m)?;
-            }
-            // bd-o1z4m: an opencode seat gets a per-pane events config pointing
-            // at its 0600 token file. No plaintext enters the config or journal;
-            // without a token the doorbell (bd-f888z) fallback stays in charge.
-            if kind == "opencode"
-                && let Some(pin) = mail_identity.as_deref()
-            {
-                let token_path =
-                    crate::events_tokens::token_path(&crate::config::state_dir(), project, pin);
-                if token_path.is_file() {
-                    hc::apply_opencode_events_config(&mut pane_env, pin, &token_path)?;
-                } else {
-                    eprintln!(
-                        "flywheel: warn: no events token for {pin}; opencode seat uses the doorbell fallback"
-                    );
-                }
-            }
-            // bd-4n2bn: pi and omp seats get a per-seat agentDir whose settings
-            // load the first-party events extension; the token is a 0600 file
-            // PATH in the pane env, never plaintext. No token -> doorbell
-            // fallback. omp is a pi fork honoring PI_CODING_AGENT_DIR.
-            if pi_style_events_kind(&kind)
-                && let Some(pin) = mail_identity.as_deref()
-            {
-                let token_path =
-                    crate::events_tokens::token_path(&crate::config::state_dir(), project, pin);
-                if token_path.is_file() {
-                    hc::apply_pi_events_config(&mut pane_env, project, pin, &token_path)?;
-                } else {
-                    eprintln!(
-                        "flywheel: warn: no events token for {pin}; {kind} seat uses the doorbell fallback"
-                    );
-                }
             }
             // bd-mdpfr: hooks are installed by the operator-run integration
             // verb against the agent's real config dir, never at spawn.
@@ -3188,11 +3184,24 @@ pub(crate) fn cmd_spawn_rex(
                     (args, None, env_pin)
                 }
             };
-            let pane_env = crate::pane::pane_env_for_launch(
+            let mut pane_env = crate::pane::pane_env_for_launch(
                 cfg,
                 mail_identity.as_deref(),
                 env_model_pin.as_deref(),
             )?;
+            {
+                let cli = crate::events_tokens::ToronTokenCli {
+                    bin: std::env::var("TORON_BIN").unwrap_or_else(|_| "toron".to_string()),
+                };
+                prepare_seat_events_before_launch(
+                    &cli,
+                    &crate::config::state_dir(),
+                    &kind,
+                    project,
+                    mail_identity.as_deref(),
+                    &mut pane_env,
+                );
+            }
             let cwd = utf8_path(&dir, "workspace dir")?;
             let peer_args: Vec<String> = peer_template
                 .as_ref()
@@ -3821,6 +3830,74 @@ mod spawn_profile_plan_tests {
         );
         super::provision_seat_before_launch(&cli, &state, "demo", "pi", None, now_us);
         assert_eq!(cli.calls.get(), 1, "exactly one mint for the three seats");
+    }
+
+    /// bd-rrlo2: the rex spawn path never reached the mint. This is that
+    /// preparation seam, driven through a FakeMint and a throwaway state dir:
+    /// it must end with a 0600 token on disk AND a seat config pointing at it.
+    #[test]
+    fn rex_preparation_mints_0600_token_and_points_seat_config() {
+        let _home = crate::config::test_state_home();
+        let state = crate::config::state_dir();
+        let cli = FakeMint {
+            calls: std::cell::Cell::new(0),
+        };
+        let mut pane_env = std::collections::BTreeMap::new();
+        super::prepare_seat_events_before_launch(
+            &cli,
+            &state,
+            "opencode",
+            "demo",
+            Some("RexSeat"),
+            &mut pane_env,
+        );
+        let token = crate::events_tokens::token_path(&state, "demo", "RexSeat");
+        assert!(token.is_file(), "rex preparation must mint the token file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&token)
+                .expect("token metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the token file must be 0600: {mode:o}");
+        }
+        let config = pane_env
+            .get("OPENCODE_CONFIG_CONTENT")
+            .expect("opencode seat config written");
+        assert!(
+            config.contains(token.to_string_lossy().as_ref()),
+            "seat config must point at the token file: {config}"
+        );
+        assert_eq!(cli.calls.get(), 1, "exactly one mint");
+    }
+
+    /// bd-rrlo2: both spawn entrypoints must call the shared preparation before
+    /// launch. Removing the rex call (the original defect) turns this RED.
+    #[test]
+    fn both_spawn_paths_call_events_preparation() {
+        let src = crate::test_source::crate_source();
+        for (entry, until) in [
+            ("pub(crate) fn cmd_spawn(", "\nfn poll_child_exit("),
+            (
+                "pub(crate) fn cmd_spawn_rex(",
+                "\nfn doorbell_project_workspaces(",
+            ),
+        ] {
+            let start = src
+                .find(entry)
+                .unwrap_or_else(|| panic!("expected {entry:?}"));
+            let end = src[start..]
+                .find(until)
+                .map(|i| start + i)
+                .unwrap_or(src.len());
+            let body = &src[start..end];
+            assert!(
+                body.contains("prepare_seat_events_before_launch("),
+                "{entry} must mint/configure its events seats before launch"
+            );
+        }
     }
 
     /// bd-u7m1y: re-spawning one seat must never revoke another seat's
