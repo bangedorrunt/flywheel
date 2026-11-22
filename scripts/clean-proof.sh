@@ -285,6 +285,7 @@ SHORT="$(git -C "$ROOT" rev-parse --short "$PROVEN_SHA")"
 
 # Sibling trees: pinned revisions from proof.toml, archived from git objects.
 SIBLING_RECORDS=""
+SIBLING_TEST_STEPS=""
 while IFS='	' read -r rel pin; do
   [ -n "${rel:-}" ] || continue
   sib_repo="$(cd "$ROOT/$rel" && pwd)"
@@ -292,6 +293,8 @@ while IFS='	' read -r rel pin; do
   proof_archive "$sib_repo" "$pin" "$TMP/$sib_name" \
     || die "cannot archive sibling $rel at $pin"
   SIBLING_RECORDS="$SIBLING_RECORDS$rel=$pin
+"
+  SIBLING_TEST_STEPS="$SIBLING_TEST_STEPS$sib_name
 "
   echo "clean-proof: sibling $rel @ $pin"
 done < <(proof_siblings "$ROOT" "$PROVEN_SHA")
@@ -350,6 +353,19 @@ run_step() { # name cmd...
   fi
 }
 
+# bd-lfii3: a proof covers every repo it pins. Each sibling's OWN workspace
+# suite runs in this same export at its pinned rev, fail-fast before the
+# mutation stage, and is recorded as a receipt step.
+sibling_tests() { # reads sibling names on stdin
+  while IFS= read -r sib_name; do
+    [ -n "$sib_name" ] || continue
+    [ -z "$FAILED_STEP" ] || break
+    [ -f "$TMP/$sib_name/Cargo.toml" ] || continue
+    run_step "sibling-$sib_name-tests" env "CARGO_TARGET_DIR=$TMP/$sib_name/test-target" \
+      "${MBX[@]}" test --manifest-path "$TMP/$sib_name/Cargo.toml" --workspace || true
+  done
+}
+
 # Warnings are errors for every workspace target (skips cached deps).
 export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
 
@@ -397,6 +413,8 @@ elif [ -z "$FAILED_STEP" ]; then
     TORON_BIN_BUILT="$TMP/bin/toron"
   fi
 fi
+# bd-lfii3: sibling suites before flywheel's own suite and mutations.
+sibling_tests <<< "$SIBLING_TEST_STEPS"
 [ -n "$FAILED_STEP" ] || run_step suite "${MBX[@]}" test -p flywheel --tests || true
 [ -n "$FAILED_STEP" ] || run_step workflow-verify \
   env "XDG_CONFIG_HOME=$TMP/config" "XDG_STATE_HOME=$TMP/state" \

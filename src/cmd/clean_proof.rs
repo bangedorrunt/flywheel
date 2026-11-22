@@ -925,3 +925,113 @@ fn red_rows_mail_the_owner_with_log_and_rerun() {
         "a git author is never a mailing identity: {mailed}"
     );
 }
+
+fn sibling_tests_source() -> String {
+    let script = read_script("scripts/clean-proof.sh");
+    let start = script
+        .find("\nsibling_tests() {")
+        .expect("clean-proof.sh defines sibling_tests")
+        + 1;
+    let end = script[start..]
+        .find("\n}\n")
+        .expect("sibling_tests is a closed function")
+        + start
+        + 2;
+    script[start..end].to_string()
+}
+
+/// bd-lfii3: a red sibling suite fails the proof at a step that names the
+/// sibling and carries the sibling test's own failure line.
+#[test]
+fn a_failing_sibling_suite_fails_the_step_naming_it() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tmp = dir.path();
+    std::fs::create_dir_all(tmp.join("toron")).unwrap();
+    std::fs::write(
+        tmp.join("toron/Cargo.toml"),
+        "[package]\nname = \"toron\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let bin = tmp.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let mbx = bin.join("mbx");
+    std::fs::write(
+        &mbx,
+        "#!/bin/sh\nif [ \"$1\" = test ]; then echo 'test catalog_shapes ... FAILED'; exit 1; fi\nexit 0\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&mbx).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&mbx, perms).unwrap();
+
+    let sourced = tmp.join("sibling.sh");
+    std::fs::write(&sourced, sibling_tests_source()).unwrap();
+    let driver = tmp.join("driver.sh");
+    std::fs::write(
+        &driver,
+        r#"set -u
+TMP="$1"; MBX=("$2"); STEPS_LOG="$3"; FAILED_STEP=""
+. "$4"
+run_step() {
+  local name="$1"; shift
+  echo "$name" >> "$STEPS_LOG"
+  "$@" >> "$STEPS_LOG" 2>&1 || FAILED_STEP="$name"
+  return 0
+}
+sibling_tests <<< "toron"
+echo "FAILED=$FAILED_STEP"
+"#,
+    )
+    .unwrap();
+    let steps_log = tmp.join("steps.log");
+
+    let out = Command::new("bash")
+        .arg(&driver)
+        .arg(tmp)
+        .arg(&mbx)
+        .arg(&steps_log)
+        .arg(&sourced)
+        .output()
+        .expect("run sibling_tests");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = std::fs::read_to_string(&steps_log).unwrap_or_default();
+    assert!(
+        log.contains("sibling-toron-tests"),
+        "step names sibling: {log}"
+    );
+    assert!(
+        log.contains("catalog_shapes"),
+        "sibling test failure carried: {log}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("FAILED=sibling-toron-tests"),
+        "failed step recorded: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    std::fs::write(&mbx, "#!/bin/sh\necho 'test result: ok'\nexit 0\n").unwrap();
+    let mut perms = std::fs::metadata(&mbx).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&mbx, perms).unwrap();
+    std::fs::write(&steps_log, "").unwrap();
+    let out = Command::new("bash")
+        .arg(&driver)
+        .arg(tmp)
+        .arg(&mbx)
+        .arg(&steps_log)
+        .arg(&sourced)
+        .output()
+        .expect("run sibling_tests green");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("FAILED="),
+        "a green sibling does not fail the proof: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
