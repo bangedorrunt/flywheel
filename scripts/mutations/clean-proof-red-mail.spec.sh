@@ -17,3 +17,9 @@ mutation "R2  unresolved owner falls back to a git name" \
     expect=red_rows_mail_the_owner_with_log_and_rerun \
     find='captain = os.environ.get("AGENT_NAME") or sender' \
     replace='captain = "bangedorrunt"'
+
+mutation "R3  a sibling step is resolved in the flywheel repo" \
+    file=scripts/clean-proof.sh \
+    expect=red_rows_mail_the_owner_with_log_and_rerun \
+    find='                scoped_repo = os.path.normpath(os.path.join(repo, sib["path"]))' \
+    replace='                scoped_repo = repo'

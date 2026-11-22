@@ -598,9 +598,9 @@ mail_red_owners() {
   PROOF_RECEIPT="$1" PROOF_REPO="$2" PROOF_PROJECT="$3" PROOF_MAIL_AS="$4" python3 - <<'PY'
 import json, os, subprocess
 
-def run(args):
+def run(args, cwd=None):
     try:
-        return subprocess.run(args, cwd=os.environ.get("PROOF_REPO", "."),
+        return subprocess.run(args, cwd=cwd or os.environ.get("PROOF_REPO", "."),
                               capture_output=True, text=True, check=False).stdout
     except OSError:
         return ""
@@ -634,9 +634,22 @@ def owner_for(target):
     # bead cited by the last commit touching the target; otherwise the captain.
     return pin_for(bead_in(run(["git", "log", "-1", "--format=%B", "--", target]))) or captain
 
-def owner_for_step(base):
-    span = f"{base}..HEAD" if base else "-10"
-    msg = run(["git", "log", span, "--format=%B"])
+def owner_for_step(failed, base):
+    # bd-n21ml follow-up: a failed sibling step belongs to a SIBLING commit.
+    # Ask that repo (at the rev the receipt pins), never the flywheel git name.
+    scoped_repo = repo
+    msg = ""
+    if failed.startswith("sibling-") and failed.endswith("-tests"):
+        name = failed[len("sibling-"):-len("-tests")]
+        for sib in receipt.get("siblings", []):
+            if os.path.basename(sib.get("path", "")) == name:
+                scoped_repo = os.path.normpath(os.path.join(repo, sib["path"]))
+                rev = sib.get("rev", "")
+                msg += run(["git", "log", "-1", "--format=%B", rev], scoped_repo) if rev else ""
+                break
+    base = base or receipt.get("sha")
+    if base:
+        msg += run(["git", "log", f"{base}..HEAD", "--format=%B"], scoped_repo)
     for token in (t.rstrip(".,;:") for t in msg.split() if t.startswith("bd-")):
         pin = pin_for(token)
         if pin and pin != captain:
@@ -662,7 +675,7 @@ for row in receipt.get("mutations", []):
 
 failed = receipt.get("failed_step")
 if failed:
-    owner = owner_for_step(receipt.get("mutations_base") or receipt.get("sha"))
+    owner = owner_for_step(failed, receipt.get("mutations_base") or receipt.get("sha"))
     log = f"{logs}/{failed}.log" if logs else "(see receipt logs)"
     rows.append((owner, f"clean-proof failed at {failed}\nlog: {log}\nrerun: bash scripts/clean-proof.sh --sha <sha>"))
 
@@ -670,9 +683,14 @@ batched = {}
 for owner, body in rows:
     batched.setdefault(owner, []).append(body)
 for owner, bodies in sorted(batched.items()):
+    body = "\n\n".join(bodies)
+    # bd-n21ml follow-up: a long test dump made the captain mail fail gift-wrap.
+    # The log path and rerun command are the payload; never paste full output.
+    if len(body) > 2000:
+        body = body[:2000].rsplit("\n", 1)[0] + "\n... (truncated; see the log path above)"
     args = ["toron", "mail", "send", "--project", project, "--as", sender, "--to", owner,
             "--subject", f"[clean-proof] {len(bodies)} red row(s)",
-            "--body", "\n\n".join(bodies)]
+            "--body", body]
     try:
         out = subprocess.run(args, cwd=repo, capture_output=True, text=True, check=False)
         if out.returncode:
@@ -701,7 +719,7 @@ proof_write_receipt "$RECEIPT" "$OK" "$PROVEN_SHA" "$SHORT" "$STAMP" "$MODE" "$T
 # bd-n21ml: route red rows to their owners once the receipt exists. Never fail
 # a proof because a mail could not be delivered.
 mail_red_owners "$RECEIPT" "$ROOT" "${CLEAN_PROOF_PROJECT:-flywheel}" \
-  "${FLYWHEEL_MAIL_AS:-Flywheel}" || true
+  "${AGENT_NAME:-${FLYWHEEL_MAIL_AS:-Flywheel}}" || true
 
 # bd-jp9z1.2: the witness for a freshly proved spec is THIS receipt, so the
 # entries are written only after it exists.

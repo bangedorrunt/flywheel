@@ -815,7 +815,7 @@ fn red_rows_mail_the_owner_with_log_and_rerun() {
     let br = bin.join("br");
     std::fs::write(
         &br,
-        "#!/bin/sh\nprintf '%s' '{\"assignee\":\"CrewOwner\"}'\n",
+        "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in bd-owner1) printf '%s' '{\"assignee\":\"CrewOwner\"}'; exit 0;; bd-owner2) printf '%s' '{\"assignee\":\"CrewTwo\"}'; exit 0;; esac; done\nprintf '%s' '{}'\n",
     )
     .unwrap();
     let toron = bin.join("toron");
@@ -923,6 +923,86 @@ fn red_rows_mail_the_owner_with_log_and_rerun() {
     assert!(
         !mailed.contains("--to Test") && !mailed.contains("--to bangedorrunt"),
         "a git author is never a mailing identity: {mailed}"
+    );
+
+    // A failed SIBLING step resolves its owner from the sibling's own commit,
+    // and the mail body is capped so a long test dump cannot break gift-wrap.
+    std::fs::write(
+        &br,
+        "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in bd-owner2) printf '%s' '{\"assignee\":\"CrewTwo\"}'; exit 0;; esac; done\nprintf '%s' '{}'\n",
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&br).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&br, perms).unwrap();
+    let sib = dir.path().join("sib");
+    std::fs::create_dir_all(&sib).unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "s@example.com"],
+        vec!["config", "user.name", "S"],
+    ] {
+        assert!(
+            Command::new("git")
+                .current_dir(&sib)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(sib.join("x"), "x").unwrap();
+    for args in [
+        vec!["add", "x"],
+        vec!["commit", "-qm", "bd-owner2 sibling fix"],
+    ] {
+        assert!(
+            Command::new("git")
+                .current_dir(&sib)
+                .args(&args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let srev = String::from_utf8(
+        Command::new("git")
+            .current_dir(&sib)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let long = "x".repeat(2500);
+    std::fs::write(
+        &receipt,
+        format!(
+            "{{\"ok\":false,\"failed_step\":\"sibling-sib-tests\",\"siblings\":[{{\"path\":\"sib\",\"rev\":\"{srev}\"}}],\"logs\":\"/logs\",\"mutations\":[{{\"spec\":\"demo.spec.sh\",\"id\":\"D1\",\"expect_test\":\"{long}\",\"verdict\":\"RED\"}}]}}"
+        ),
+    )
+    .unwrap();
+    std::fs::write(&mail_log, "").unwrap();
+    let out = run();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mailed = std::fs::read_to_string(&mail_log).unwrap_or_default();
+    assert!(
+        mailed.contains("--to CrewTwo"),
+        "sibling owner resolved: {mailed}"
+    );
+    assert!(
+        mailed.contains("(truncated"),
+        "a long failure dump is capped before mailing"
+    );
+    assert!(
+        !mailed.contains(&long),
+        "the full test dump never reaches the mail"
     );
 }
 
