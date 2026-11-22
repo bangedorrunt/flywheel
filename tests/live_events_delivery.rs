@@ -30,10 +30,6 @@ fn live_var(key: &str) -> String {
         .unwrap_or_else(|| panic!("{GATE}=1 requires {key} to be set"))
 }
 
-fn flywheel() -> String {
-    std::env::var("FLYWHEEL_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_flywheel").to_string())
-}
-
 fn toron() -> String {
     std::env::var("TORON_BIN").unwrap_or_else(|_| "toron".to_string())
 }
@@ -51,14 +47,6 @@ fn text(out: &std::process::Output) -> String {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     )
-}
-
-fn json_field(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
-    let mut cur = v;
-    for key in keys {
-        cur = cur.get(key)?;
-    }
-    cur.as_str().map(str::to_string)
 }
 
 fn poll(secs: u64, mut ready: impl FnMut() -> bool) -> bool {
@@ -80,24 +68,10 @@ fn one_addressed_mail_reaches_the_seat_through_events_not_doorbell() {
         return;
     }
     let project = live_var("FLYWHEEL_LIVE_PROJECT");
-    let state_dir = PathBuf::from(live_var("FLYWHEEL_LIVE_STATE_DIR"));
-    let bin = flywheel();
+    // The runner's no-door grok seat: only those get a daemon events pump and
+    // an events-<pin>.jsonl journal row (pi/opencode ride their own MCP config).
+    let pin = live_var("FLYWHEEL_LIVE_EVENTS_PIN");
     let tag = format!("znczi-{}", std::process::id());
-
-    // The runner spawned one real harness seat in this project. Discover it the
-    // same way the runner does: a row with a pin and a live pane.
-    let status = run(&bin, &["swarm", "status", &project, "--json"]);
-    assert!(status.status.success(), "status failed: {}", text(&status));
-    let doc: serde_json::Value = serde_json::from_slice(&status.stdout).expect("status JSON");
-    let seats = doc
-        .get("seats")
-        .and_then(serde_json::Value::as_array)
-        .expect("a seats array");
-    let pin = seats
-        .iter()
-        .find(|s| json_field(s, &["pin"]).is_some() && json_field(s, &["pane_id"]).is_some())
-        .and_then(|s| json_field(s, &["pin"]))
-        .unwrap_or_else(|| panic!("the runner must leave one harness seat: {seats:?}"));
 
     // bd-rrlo2 guard: the rex spawn path must have minted a 0600 per-pin token
     // before launch. No token means this seat is on the doorbell fallback.
@@ -148,7 +122,7 @@ fn one_addressed_mail_reaches_the_seat_through_events_not_doorbell() {
     assert!(sent.status.success(), "mail send failed: {}", text(&sent));
 
     // (1) Events path active: the per-pin events journal got a fetch row.
-    let events_journal = state_dir
+    let events_journal = flywheel_state
         .join("doorbell")
         .join(format!("events-{pin}.jsonl"));
     let events_ok = poll(90, || {
@@ -162,7 +136,7 @@ fn one_addressed_mail_reaches_the_seat_through_events_not_doorbell() {
     );
 
     // (2) No doorbell ring for this pin bearing our marker.
-    let doorbell_journal_dir = state_dir.join("journals");
+    let doorbell_journal_dir = flywheel_state.join("journals");
     let mut rings = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&doorbell_journal_dir) {
         for entry in entries.flatten() {

@@ -277,7 +277,10 @@ export TORON_BIN
 # bd-oo7zi: the operator-typing guard needs a REAL harness pane: a bare zsh box
 # classifies as Unknown, which may_inject allows. Spawn one in THIS project only,
 # read its pin + pane_id from swarm status, and retire it in cleanup.
-spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
+# bd-znczi/rrlo2: a grok seat rides the no-door events pump; spawn it in the
+# SAME command so its registry row and token exist before the doorbell arms the
+# pump (the pump reads the registry once at daemon start).
+spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --gk 1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
     || die "flywheel spawn failed: $spawn_out"
 seated="$(FLYWHEEL_BIN="$FLYWHEEL_BIN" "$PYTHON_BIN" - <<'PY'
 import json, os, subprocess
@@ -296,6 +299,23 @@ SPAWNED_PANE="${seated##*$'\t'}"
 SPAWNED_SESSION="$(printf '%s\n' "$spawn_out" | sed -nE 's/.*(session:[^ ]+) created.*/\1/p' | head -1)"
 [ -n "$SPAWNED_PIN" ] || die "swarm status named no pin"
 [ -n "$SPAWNED_SESSION" ] || die "spawn did not name its workspace session"
+
+# bd-znczi: the events witness needs a NO-DOOR seat — only those get a daemon
+# events pump and an events-<pin>.jsonl journal row (pi/opencode ride their own
+# MCP config instead). Find the grok seat spawned above.
+GROK_PIN="$(FLYWHEEL_BIN="$FLYWHEEL_BIN" "$PYTHON_BIN" - <<'PY'
+import json, os, subprocess
+doc = json.loads(subprocess.check_output([
+    os.environ["FLYWHEEL_BIN"], "swarm", "status", "e2e-live-five", "--json"
+], text=True))
+rows = doc.get("seats", doc if isinstance(doc, list) else [])
+for r in rows:
+    if str(r.get("harness", "")).lower() == "grok" and r.get("pin"):
+        print(r["pin"])
+        break
+PY
+)" || die "cannot read the grok seat from swarm status"
+[ -n "$GROK_PIN" ] || die "swarm status named no grok seat"
 
 # A freshly spawned agent stays WORKING while it boots; the send door correctly
 # refuses "not at a prompt". Poll ITS status until it is idle (up to 2 min).
@@ -337,6 +357,11 @@ for t in "${TESTS[@]}"; do
         export FLYWHEEL_LIVE_PIN="$PIN"
         export FLYWHEEL_LIVE_BLOCK="$BLOCK_ID"
         export FLYWHEEL_LIVE_AS="$AS"
+    fi
+    if [ "$t" = "tests/live_events_delivery.rs" ]; then
+        export FLYWHEEL_LIVE_EVENTS_PIN="$GROK_PIN"
+    else
+        unset FLYWHEEL_LIVE_EVENTS_PIN
     fi
     if (cd "$TEST_REPO" && "$CARGO_BIN" test --test "$(basename "$t" .rs)" -- --ignored --nocapture >"$log" 2>&1); then
         printf '  PASS  %s\n' "$t"
