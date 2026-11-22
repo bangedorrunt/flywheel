@@ -2582,6 +2582,21 @@ pub fn read_tail_lines(path: &Path, max_lines: usize, max_bytes: u64) -> Result<
 pub const LOG_TAIL_LINES: usize = 5_000;
 pub const LOG_TAIL_BYTES: u64 = 4 * 1024 * 1024;
 
+/// Parse one log line, tolerating older shapes without warning (bd-ihiqo.2).
+/// A doorbell `already-pulled` audit or a row with no `kind` is not a flywheel
+/// event; it is skipped, not reported as corruption on every command.
+fn legacy_log_line(value: &serde_json::Value) -> bool {
+    value.get("kind").is_none() || value["kind"].as_str() == Some("already-pulled")
+}
+
+fn parse_log_line(line: &str) -> Option<LogEntry> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if legacy_log_line(&value) {
+        return None;
+    }
+    serde_json::from_value(value).ok()
+}
+
 /// The project's JSONL log, newest-last, bounded to the tail window.
 pub fn read_log(project: &str) -> Result<Vec<LogEntry>> {
     let path = project_log_path(project);
@@ -2594,9 +2609,8 @@ pub fn read_log(project: &str) -> Result<Vec<LogEntry>> {
         if line.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<LogEntry>(&line) {
-            Ok(e) => out.push(e),
-            Err(err) => eprintln!("flywheel: skipping malformed log line: {err}"),
+        if let Some(entry) = parse_log_line(&line) {
+            out.push(entry);
         }
     }
     Ok(out)
@@ -4986,5 +5000,45 @@ mod plan_base_tests {
             "a second ensure_plan rewrote the base under an existing id"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod legacy_log_shape_tests {
+    use super::parse_log_line;
+
+    /// bd-ihiqo.2: old log shapes (a doorbell audit kind, a row with no kind,
+    /// or a sequence-typed payload) must be skipped without a warning.
+    #[test]
+    fn old_log_shapes_are_skipped_silently() {
+        let stale = [
+            r#"{"ts":"1","kind":"already-pulled","project":"p","data":{}}"#,
+            r#"{"ts":"2","project":"p","data":[]}"#,
+            r#"{"ts":"3","kind":"spawn","project":"p","data":["old","shape"]}"#,
+        ];
+        let legacy = |line: &str| {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            super::legacy_log_line(&value)
+        };
+        assert!(legacy(stale[0]), "audit kind is a legacy shape");
+        assert!(legacy(stale[1]), "a row without a kind is a legacy shape");
+        assert!(!legacy(stale[2]), "a real event is not legacy");
+        assert!(
+            parse_log_line(stale[0]).is_none(),
+            "audit kind is not an event"
+        );
+        assert!(
+            parse_log_line(stale[1]).is_none(),
+            "a row without a kind is not an event"
+        );
+        assert!(
+            parse_log_line(stale[2]).is_some(),
+            "a real event with a legacy sequence payload still parses"
+        );
+        let src = crate::test_source::crate_source();
+        assert!(
+            !src.contains("eprintln!(\"flywheel: skipping malformed log line"),
+            "the loader must not warn on old shapes"
+        );
     }
 }
