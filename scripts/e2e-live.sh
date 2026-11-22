@@ -524,7 +524,7 @@ print(json.load(sys.stdin)["seats"][0]["pin"])')"
     done ) &
   local sampler=$!
   local apply_rc=0
-  "$FLYWHEEL_BIN" swarm apply "$project" --patch "$pin.harness=pi" --json >>"$LOG" 2>&1 ||
+  "$FLYWHEEL_BIN" swarm apply "$project" --patch "$pin.harness=pi" --yes --json >>"$LOG" 2>&1 ||
     apply_rc=$?
   kill "$sampler" 2>/dev/null
   wait "$sampler" 2>/dev/null
