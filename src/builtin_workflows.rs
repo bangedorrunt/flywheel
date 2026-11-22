@@ -11,13 +11,13 @@
 //!   reduce via the ce-brainstorm stage (fail_run on reduce).
 //! - `ce-plan` — dispatch @planner stage:ce-plan (task carries
 //!   {{inputs.goal}}; fail_run on decompose) → request_approval gate.
-//! - `beads` — dispatch @planner stage:ce-execute (spec.plan carries
+//! - `beads` — dispatch @planner stage:ce-plan (spec.plan carries
 //!   the plan; fail_run on create).
 //! - `debate` — graph: parallel dispatch @reviewer (over 2) → @oracle decide
 //!   (task consumes {{steps.briefs}}; fail_run on decide).
 //! - `goal` — meta: call_workflow ce-brainstorm→plan→beads→dispatch @coder
-//!   stage:ce-execute→@reviewer stage:ce-review→@housekeeper
-//!   stage:commit-and-push; each dispatch carries the prior step's output via
+//!   stage:ce-work→@reviewer stage:ce-review→@housekeeper hand-off to
+//!   the captain; each dispatch carries the prior step's output via
 //!   spec.plan, each fails the run on error.
 //! - `triage` — the canonical message_posted reactive workflow (payload
 //!   fields only: {{trigger.content}} / {{trigger.id}} — no subject).
@@ -89,7 +89,7 @@ steps:
     assignee: x
     spec:
       profile: "@housekeeper"
-      task: 'SWEEP recorded chiebukuro lessons: PROMOTE each durable one, FORGET each expired/untrue one, REINFORCE each re-verified one. Classify Keep / Update / Consolidate / Replace / Forget. Reply with ONLY a JSON array [{lesson, verdict}].'
+      task: 'SWEEP recorded chiebukuro lessons: PROMOTE each durable one with `chie memory promote`, FORGET each expired or untrue one with `chie memory forget`, REINFORCE each re-verified one by re-recording it with `flywheel memory record-lesson`, stamped reinforced: <today>. Classify Keep / Update / Consolidate / Replace / Forget. Reply with ONLY a JSON array [{lesson, verdict}].'
     on_error: continue
   - name: reflect
     action: dispatch_job
@@ -165,7 +165,7 @@ steps:
         assignee: x
         spec:
           profile: "@planner"
-          stage: "plan-polish"
+          stage: "ce-plan"
           task: 'Polish round for {{inputs.objective}}.'
         on_error: fail_run
       - name: coverage
@@ -177,7 +177,7 @@ steps:
     assignee: x
     spec:
       profile: "@reviewer"
-      stage: "plan-polish"
+      stage: "ce-plan"
       context: fresh
       plan: "{{steps.plan}}"
       task: 'AUDIT MODE for {{inputs.objective}}: read-only, do NOT edit beads, return findings JSON only.'
@@ -192,7 +192,7 @@ steps:
     assignee: x
     spec:
       profile: "@planner"
-      stage: "ce-execute"
+      stage: "ce-plan"
       task: 'Create the tracked beads for: {{steps.plan}}.'
     on_error: fail_run
   - name: implement-wave
@@ -203,8 +203,8 @@ steps:
       assignee: x
       spec:
         profile: "@coder"
-        stage: "ce-execute"
-        task: 'Wave bead {{item}} for {{inputs.objective}}: claim, build with TDD, commit with the bead id, verify and close.'
+        stage: "ce-work"
+        task: 'Wave bead {{item}} for {{inputs.objective}}: claim, build with TDD, commit with the bead id, and report the sha; the captain lands it.'
       on_error: fail_run
   - name: execute-exit
     action: verify
@@ -215,7 +215,7 @@ steps:
     assignee: x
     spec:
       profile: "@coder"
-      stage: "ce-execute"
+      stage: "ce-work"
       task: 'Implement {{inputs.objective}}. TDD first.'
     on_error: fail_run
   - name: review
@@ -239,8 +239,7 @@ steps:
     assignee: x
     spec:
       profile: "@housekeeper"
-      stage: "commit-and-push"
-      task: 'Ship {{inputs.objective}}: commit with bead ids, push, report shas.'
+      task: 'Hand {{inputs.objective}} to the captain: list each commit sha with its bead id and verify result. The captain proves, installs and lands with ship land; do not close beads or push.'
     on_error: fail_run
 "#,
     ),

@@ -1032,10 +1032,10 @@ impl Archetype {
     /// W6's affinity resolution dispatches each to its default role).
     pub fn default_parts(self) -> &'static [&'static str] {
         match self {
-            Self::ScoutFanout => &["fresh-eyes-explore"],
-            Self::VerifyFence => &["repro-baseline", "tdd-red", "minimal-fix", "prove-verify"],
-            Self::Debate => &["judge-arms"],
-            Self::Hillclimb => &["baseline-measure", "measure-keep-or-discard"],
+            Self::ScoutFanout => &["ce-explore"],
+            Self::VerifyFence => &["ce-debug", "ce-work", "ce-verify"],
+            Self::Debate => &["ce-review"],
+            Self::Hillclimb => &["ce-verify", "ce-work", "ce-verify"],
             Self::Review => &["ce-review"],
         }
     }

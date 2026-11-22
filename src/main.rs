@@ -565,6 +565,9 @@ pub(crate) fn stage_prompt_with_params_project(
         stages::StageLibrary::load()?
     };
     let stage = lib.get_stage(name).ok_or_else(|| {
+        if let Some(pointer) = stages::retired_stage(name) {
+            return anyhow!("stage {name} is retired: {pointer}");
+        }
         anyhow!(
             "unknown stage: {name} (known: {})",
             lib.list()

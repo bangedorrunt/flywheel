@@ -4534,7 +4534,7 @@ mod acceptance6_audit_binding {
         let Action::DispatchJob { spec, .. } = &audit.action else {
             panic!("audit is a dispatch_job: {:?}", audit.action.type_name());
         };
-        assert_eq!(spec.stage.as_deref(), Some("plan-polish"));
+        assert_eq!(spec.stage.as_deref(), Some("ce-plan"));
         assert_eq!(
             spec.profile.as_deref(),
             Some("@reviewer"),

@@ -188,8 +188,9 @@ pub fn cites_bead_id(text: &str) -> bool {
     false
 }
 
-/// §4 implement: a commit whose message cites the bead id, and the bead's
-/// named gate command exited 0 with output recorded.
+/// §4 implement: a commit, and the named gate command exited 0 with output
+/// recorded. Work is bead-optional: when the report names a bound `bead`,
+/// the commit message must cite that id.
 pub fn implement_contract(report: &serde_json::Value) -> PhaseContractReport {
     let Some(commit) = report.get("commit_sha").and_then(|v| non_empty_str(v)) else {
         return PhaseContractReport::fail("implement", "no commit_sha in the report".into());
@@ -198,10 +199,16 @@ pub fn implement_contract(report: &serde_json::Value) -> PhaseContractReport {
         .get("commit_message")
         .and_then(|v| non_empty_str(v))
         .unwrap_or("");
-    if !cites_bead_id(message) {
+    let bead = report
+        .get("bead")
+        .and_then(|v| non_empty_str(v))
+        .filter(|b| cites_bead_id(b));
+    if let Some(bead) = bead
+        && !message.contains(bead)
+    {
         return PhaseContractReport::fail(
             "implement",
-            format!("commit_message does not cite a bead id (bd-…): {message:?}"),
+            format!("commit_message does not cite the bound bead {bead}: {message:?}"),
         );
     }
     let gate_ok = report.get("gate").is_some_and(|g| {
@@ -216,26 +223,26 @@ pub fn implement_contract(report: &serde_json::Value) -> PhaseContractReport {
                 .into(),
         );
     }
-    PhaseContractReport::ok(
-        "implement",
-        format!("commit {commit} cites a bead id; gate exit 0"),
-    )
+    let cited = bead.map_or(String::new(), |b| format!(" cites {b};"));
+    PhaseContractReport::ok("implement", format!("commit {commit}{cited} gate exit 0"))
 }
 
-/// §4 review: findings posted (non-empty) and a verdict from the closed
-/// vocabulary recorded.
+/// §4 review: a findings array and a verdict from the closed vocabulary. A
+/// sound change has no findings, so an empty array passes only with AGREE;
+/// any other verdict must be backed by at least one finding.
 pub fn review_contract(report: &serde_json::Value) -> PhaseContractReport {
-    let findings_ok = report
-        .get("findings")
-        .is_some_and(|f| f.as_array().is_some_and(|a| !a.is_empty()));
-    if !findings_ok {
-        return PhaseContractReport::fail("review", "no findings array (or empty)".into());
-    }
+    let Some(findings) = report.get("findings").and_then(serde_json::Value::as_array) else {
+        return PhaseContractReport::fail("review", "no findings array".into());
+    };
     let verdict = report.get("verdict").and_then(|v| non_empty_str(v));
     match verdict {
-        Some(v) if REVIEW_VERDICTS.contains(&v) => {
-            PhaseContractReport::ok("review", format!("findings posted; verdict {v}"))
+        Some(v) if REVIEW_VERDICTS.contains(&v) && findings.is_empty() && v != "AGREE" => {
+            PhaseContractReport::fail("review", format!("verdict {v} needs at least one finding"))
         }
+        Some(v) if REVIEW_VERDICTS.contains(&v) => PhaseContractReport::ok(
+            "review",
+            format!("{} finding(s); verdict {v}", findings.len()),
+        ),
         Some(other) => PhaseContractReport::fail(
             "review",
             format!("verdict {other:?} not in {:?}", REVIEW_VERDICTS),
@@ -504,13 +511,27 @@ mod tests {
     }
 
     #[test]
+    fn implement_contract_is_bead_optional_but_cites_a_bound_bead() {
+        let unbound = implement_contract(&json!({
+            "commit_sha": "abc123", "commit_message": "fix the thing", "bead": null,
+            "gate": { "command": "true", "exit": 0, "output": "" }
+        }));
+        assert!(unbound.ok, "{}", unbound.evidence);
+        let cited = implement_contract(&json!({
+            "commit_sha": "abc123", "commit_message": "fix the thing (bd-abc1)", "bead": "bd-abc1",
+            "gate": { "command": "true", "exit": 0, "output": "" }
+        }));
+        assert!(cited.ok, "{}", cited.evidence);
+    }
+
+    #[test]
     fn implement_contract_failing_witnesses() {
         let r = implement_contract(&json!({
-            "commit_sha": "abc123", "commit_message": "fix the thing",
+            "commit_sha": "abc123", "commit_message": "fix (bd-other)", "bead": "bd-abc1",
             "gate": { "command": "true", "exit": 0, "output": "" }
         }));
         assert!(
-            !r.ok && r.evidence.contains("does not cite"),
+            !r.ok && r.evidence.contains("does not cite the bound bead bd-abc1"),
             "{}",
             r.evidence
         );
@@ -554,6 +575,18 @@ mod tests {
 
         let no_findings = review_contract(&json!({ "verdict": "AGREE" }));
         assert!(!no_findings.ok && no_findings.evidence.contains("findings"));
+    }
+
+    #[test]
+    fn a_clean_review_passes_only_with_agree() {
+        let clean = review_contract(&json!({ "findings": [], "verdict": "AGREE" }));
+        assert!(clean.ok, "{}", clean.evidence);
+        let unbacked = review_contract(&json!({ "findings": [], "verdict": "REJECT" }));
+        assert!(
+            !unbacked.ok && unbacked.evidence.contains("needs at least one finding"),
+            "{}",
+            unbacked.evidence
+        );
     }
 
     #[test]
