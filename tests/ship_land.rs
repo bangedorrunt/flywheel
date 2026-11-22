@@ -70,6 +70,10 @@ elif cmd == "gate" and argv[1] == "list":
     print(json.dumps({"history": gates()}))
 elif cmd == "gate" and argv[1] == "report":
     bead = argv[2]
+    status_path = os.path.join(state, "status")
+    if os.path.exists(os.path.join(state, "strict_closed_gate")) and os.path.exists(status_path) and open(status_path, encoding="utf-8").read().strip() == "closed":
+        print("workflow does not require gate unit-test-verified for transition closed -> closed", file=sys.stderr)
+        sys.exit(1)
     rest = argv[3:]
     opts = {}
     i = 0
@@ -341,6 +345,62 @@ fn land_runs_the_whole_ceremony_and_a_rerun_is_a_no_op() {
     );
     assert_eq!(f.head_count(), after_first, "rerun makes no second commit");
     assert_eq!(f.gate_rows(), 1, "rerun does not duplicate the gate row");
+}
+
+#[test]
+fn land_on_an_already_closed_bead_at_the_same_sha_is_already_landed() {
+    let f = fixture();
+    std::fs::write(f.state.join("strict_closed_gate"), "1").expect("strict flag");
+    let first = f.land(&[]);
+    assert!(
+        first.status.success(),
+        "first land: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let head = f.head_count();
+
+    let again = f.land(&[]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&again.stdout),
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert!(
+        again.status.success(),
+        "already-landed rerun must exit 0: {text}"
+    );
+    assert!(
+        text.contains("already landed"),
+        "must say already landed: {text}"
+    );
+    assert_eq!(f.head_count(), head, "no second commit on a no-op rerun");
+}
+
+#[test]
+fn land_on_an_already_closed_bead_at_a_different_sha_refuses() {
+    let f = fixture();
+    let first = f.land(&[]);
+    assert!(
+        first.status.success(),
+        "first land: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let other = "1234567890abcdef1234567890abcdef12345678";
+    let _ = std::fs::remove_file(f.state.join("receipt.json"));
+    let again = f.land_with(other, &[]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&again.stdout),
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert!(
+        !again.status.success(),
+        "a closed bead at a different sha must refuse: {text}"
+    );
+    assert!(
+        text.contains("different sha"),
+        "typed error names the mismatch: {text}"
+    );
 }
 
 #[test]

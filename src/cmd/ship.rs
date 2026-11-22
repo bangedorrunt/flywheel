@@ -441,6 +441,11 @@ fn gate_bound(dir: &Path, plan: &LandPlan) -> Result<bool> {
     Ok(passed && out.contains(&format!("sha={}", plan.sha)))
 }
 
+fn bead_closed(dir: &Path, bead: &str) -> Result<bool> {
+    let out = run_tool(dir, "br", &["show", bead, "--json"])?;
+    Ok(status_of(&out).as_deref() == Some("closed"))
+}
+
 fn bead_is_closed(dir: &Path, plan: &LandPlan) -> Result<bool> {
     let out = run_tool(dir, "br", &["show", &plan.bead, "--json"])?;
     // bd-pgfqg: a SUBSTRING match said "closed" for an epic whose payload
@@ -1053,16 +1058,39 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
     if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
         bail!("--sha must be the bare 40-hex commit sha (got {sha:?})");
     }
+    let dir = match dir {
+        Some(d) => d.to_path_buf(),
+        None => std::env::current_dir().map_err(|err| anyhow!("current directory: {err}"))?,
+    };
+    // bd-j7hod: decide replay BEFORE receipt/commit validation, so the resume
+    // line printed after a successful land always exits 0 as already landed.
+    // A bead closed at a different sha is a typed mismatch, never "landed".
+    if bead_closed(&dir, bead)? && bead_rows_committed(&dir, bead)? {
+        let bound = run_tool(&dir, "br", &["gate", "list", bead, "--json"])
+            .unwrap_or_default()
+            .contains(&format!("sha={sha}"));
+        if bound {
+            if json {
+                print_json(&json!({
+                    "schema": "flywheel-ship-land.v1",
+                    "bead": bead,
+                    "sha": sha,
+                    "ok": true,
+                    "status": "already_landed",
+                }));
+            } else {
+                println!("ship land: {bead} already landed at {sha}");
+            }
+            return Ok(());
+        }
+        bail!("ship land: {bead} is already closed at a different sha than {sha}");
+    }
     if !receipt.is_file() {
         bail!(
             "proof receipt missing: {} (it becomes the gate tail=)",
             receipt.display()
         );
     }
-    let dir = match dir {
-        Some(d) => d.to_path_buf(),
-        None => std::env::current_dir().map_err(|err| anyhow!("current directory: {err}"))?,
-    };
     // The proof and the citing commit belong to the WORK repo when one is
     // named; the tracker rows, the gate and the commit stay in `dir`.
     let proof_root = repo.unwrap_or(&dir);
@@ -1139,7 +1167,7 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
         })?;
     }
 
-    // 2. close.
+    // 2. close. (A closed bead was already short-circuited above.)
     let was_closed = bead_is_closed(&dir, &plan)?;
     if was_closed {
         eprintln!("ship land: {} already closed", plan.bead);
