@@ -73,6 +73,57 @@ pub fn lease_path(path: &str, workspace: &str) -> String {
     path.to_string()
 }
 
+/// The project a pin is seated in, so a commit can free that pin's pre-edit
+/// leases on the paths it just committed (bd-lk0kt gap 4).
+pub fn project_for_pin(pin: &str) -> Option<String> {
+    crate::state::find_seat_by_pin(pin).map(|(project, _)| project)
+}
+
+/// Release only the named paths for this pin — the commit is the moment its
+/// edit is done, so those leases must not block the next lane.
+pub fn release_paths(project: &str, pin: &str, paths: &[String]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let status = Command::new("toron")
+        .args([
+            "reserve",
+            "release",
+            "--project",
+            project,
+            "--as",
+            pin,
+            "--paths",
+            &paths.join(","),
+            "--json",
+        ])
+        .status()?;
+    if !status.success() {
+        bail!("release pre-edit leases for {pin} failed");
+    }
+    Ok(())
+}
+
+/// `crew done` frees any leases left under the fallback reason.
+pub fn release_all_fallback(project: &str, pin: &str) -> Result<()> {
+    let status = Command::new("toron")
+        .args([
+            "reserve",
+            "release-by-reason",
+            "--project",
+            project,
+            "--as",
+            pin,
+            "--no-notify",
+            &format!("pre-edit:{pin}"),
+        ])
+        .status()?;
+    if !status.success() {
+        bail!("release fallback pre-edit leases for {pin} failed");
+    }
+    Ok(())
+}
+
 /// The seat's live brief bead, or a stable fallback that `crew done` and
 /// `ship land release-by-reason` also know how to free (bd-lk0kt rework).
 pub fn lease_reason(project: &str, pin: &str) -> String {

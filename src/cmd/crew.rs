@@ -1162,6 +1162,13 @@ fn cmd_crew_done(
             "next: flywheel crew land {brief} --proof-receipt <proof.json> --project {project}"
         );
     }
+    // bd-lk0kt: a seat without a brief leases paths under the fallback reason;
+    // the close is the only moment that can free those remaining leases.
+    if let Some(pin) = book.get(brief).map(|b| b.pin.clone())
+        && let Err(e) = crate::pre_edit::release_all_fallback(project, &pin)
+    {
+        eprintln!("flywheel: fallback pre-edit lease release failed: {e}");
+    }
     Ok(())
 }
 

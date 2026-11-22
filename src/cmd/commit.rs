@@ -1021,12 +1021,46 @@ pub(crate) fn cmd_commit(
         &ctx,
     )?;
     println!("commit {}", &sha[..sha.len().min(12)]);
+    // bd-lk0kt: the pre-edit hook leased these exact paths under a fallback
+    // reason when the seat had no brief; the commit is the end of the edit.
+    if let Ok(pin) = std::env::var("AGENT_NAME")
+        && !pin.is_empty()
+        && let Some(project) = crate::pre_edit::project_for_pin(&pin)
+        && let Err(e) = crate::pre_edit::release_paths(&project, &pin, paths)
+    {
+        eprintln!("flywheel: pre-edit lease release after commit failed: {e}");
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-lk0kt: commit must free the pre-edit fallback leases on its paths.
+    #[test]
+    fn commit_releases_pre_edit_leases_on_committed_paths() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/commit.rs"),
+        )
+        .unwrap();
+        assert!(
+            src.contains("crate::pre_edit::release_paths(&project, &pin, paths)"),
+            "a committed path must free its fallback lease"
+        );
+    }
+
+    #[test]
+    fn crew_done_releases_remaining_fallback_leases() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/crew.rs"),
+        )
+        .unwrap();
+        assert!(
+            src.contains("crate::pre_edit::release_all_fallback(project, &pin)"),
+            "close must free any remaining fallback lease"
+        );
+    }
     use std::process::Command as StdCommand;
 
     fn git(dir: &Path, args: &[&str]) -> String {
