@@ -3882,7 +3882,7 @@ mod spawn_profile_plan_tests {
             ("pub(crate) fn cmd_spawn(", "\nfn poll_child_exit("),
             (
                 "pub(crate) fn cmd_spawn_rex(",
-                "\nfn doorbell_project_workspaces(",
+                "\npub(crate) fn doorbell_project_workspaces(",
             ),
         ] {
             let start = src
