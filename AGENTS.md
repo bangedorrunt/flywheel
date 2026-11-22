@@ -32,6 +32,7 @@ bash scripts/fence.sh --sha <sha>         # needles, -Dwarnings build, no-run, c
 bash scripts/fence.sh --paths a.rs,b.rs --test cmd::spawn::  # targeted tests in a clean export (bd-8jakq)
 
 flywheel captain watch <project> [--as <pin>] [--stall] [--preflight] [--stream]  # --stream: one line per event, never exits; default one-shot re-arms
+flywheel deadlock <project> [--wait-minutes N]  # lease wait-for cycles + overdue collab asks page the captain once each (bd-v4dcv)
 
 # captain: prove, install, land
 bash scripts/clean-proof.sh --sha <rev> --mutations changed --keep --receipt /tmp/<dir>/r.json

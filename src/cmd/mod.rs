@@ -15,6 +15,7 @@ pub(crate) mod crew;
 pub(crate) mod cron;
 #[cfg(feature = "serve")]
 pub(crate) mod daemon;
+pub(crate) mod deadlock;
 pub(crate) mod debate;
 pub(crate) mod doorbell;
 pub(crate) mod history;

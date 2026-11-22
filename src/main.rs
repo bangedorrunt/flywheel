@@ -40,6 +40,7 @@ mod crew_menu;
 mod crew_receipt;
 mod cron;
 mod daemon;
+mod deadlock;
 mod decide;
 mod dispatch_bindings;
 mod doorbell;
@@ -1476,6 +1477,15 @@ enum Commands {
         /// to the old holder instead of an error (bd-vk0do)
         #[arg(long)]
         reassign: bool,
+    },
+    /// Deadlock watch: page the captain once per wait-for cycle and once
+    /// per wait older than the threshold (bd-v4dcv)
+    Deadlock {
+        /// Project to scan.
+        project: String,
+        /// Age in minutes that makes a single wait worth paging about.
+        #[arg(long, default_value_t = 15)]
+        wait_minutes: u64,
     },
     /// toron mail coordination surfaces
     Mail {
@@ -3228,6 +3238,7 @@ fn main() {
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
+        "deadlock <project> [--wait-minutes N] (bd-v4dcv: wait-for graph over live leases + open collab asks; pages the captain once per pin cycle and once per wait older than N minutes, naming pins and resources)",
             "snapshot <project> (fleet snapshot flywheel-snapshot.v1 as robot JSON)",
             "status <project> + progress [<project>] [--json] (bd-swarm-cockpit-pczs cockpit reads: status rows carry pin/npub/pane/verdict/bead/reservations/last_active_ts_us and print JSON when not a TTY; progress groups beads by wave-N label — closed/in_progress/ready/blocked/unknown — and names dispatching_wave, the lowest ready/in-progress wave; project defaults to the workspace cwd)",
             "agent tail <pin> [--project <p>] [--json] [--n N] (bd-swarm-cockpit-pczs: the pin's recent actions — tool calls / commands — from the session the pane reports on agent_session; path sessions read the pi JSONL, id sessions read the opencode store; no newest-file guessing. hc 0.1.16 reports no agent_session, so on hc it bails loud — use `flywheel output` or `hc read`)",
@@ -3846,6 +3857,9 @@ fn main() {
             msg,
             reassign,
         }) => cmd_assign(&cfg, project, to, beads, msg.as_deref(), *reassign),
+        Some(Commands::Deadlock { project, wait_minutes }) => {
+            crate::cmd::deadlock::cmd_deadlock_check(project, *wait_minutes)
+        }
         Some(Commands::Mail { cmd }) => cmd_mail(&cfg, cmd),
         Some(Commands::HookTrampoline { event, agent }) => {
             let pin = std::env::var("AGENT_NAME").unwrap_or_default();
