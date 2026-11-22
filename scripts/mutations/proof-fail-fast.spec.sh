@@ -26,7 +26,7 @@ mutation "N3  the lint accepts a needle that matches nothing" \
     file=$NEEDLES \
     expect=the_needle_lint_fails_and_names_spec_and_id_when_a_needle_is_gone \
     find='    if occurrences != 1:' \
-    replace='    if occurrences < 1:'
+    replace='    if occurrences > 1:'
 
 mutation "N4  the lint accepts a needle that occurs twice" \
     file=$NEEDLES \
