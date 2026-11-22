@@ -465,7 +465,7 @@ pub(crate) struct ReservationCtx {
 }
 
 impl ReservationCtx {
-    fn from_env() -> Self {
+    pub(crate) fn from_env() -> Self {
         let pin = std::env::var("AGENT_NAME").ok().filter(|p| !p.is_empty());
         let project = std::env::var("FLYWHEEL_PROJECT")
             .ok()
