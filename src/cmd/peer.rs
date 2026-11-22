@@ -185,6 +185,7 @@ fn defer_busy_p2p_wake(
         pin,
         line,
         Some(crate::doorbell::now_micros()),
+        Some(directive.verb),
     )
     .map_err(|e| anyhow::anyhow!("record the deferred p2p wake: {e}"))?;
     eprintln!("peer: pane busy; the doorbell rings this directive at the next prompt");

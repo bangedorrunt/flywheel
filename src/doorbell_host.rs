@@ -3374,6 +3374,7 @@ mod off_runtime_tests {
             pin,
             &crate::doorbell::deferred_wake_line(),
             Some(wm),
+            None,
         )
         .expect("queue the deferral");
         // The recipient pulled mail AFTER the ring was queued.
@@ -3474,6 +3475,7 @@ mod off_runtime_tests {
             pin,
             &crate::doorbell::deferred_wake_line(),
             Some(future_wm),
+            None,
         )
         .expect("queue the deferral");
         let mut st = crate::doorbell::WakeState::default();

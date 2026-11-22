@@ -785,8 +785,9 @@ print(json.load(sys.stdin)["seats"][0]["pin"])')"
     --paths src/asked.rs --exclusive --reason e2e-l3 --json >>"$LOG" 2>&1 || true
   "$FLYWHEEL_BIN" peer request-release --project "$project" --path src/asked.rs \
     --bead e2e-l3 --as CobaltRidge "$seat" >>"$LOG" 2>&1 || true
-  if [ -f "$deferred" ] && grep -qF "$seat" "$deferred" &&
-    grep -qF "p2p:request-release" "$deferred"; then
+  # bd-5b8ak: assert the STRUCTURED verb, never the agent-facing wake wording.
+  if [ -f "$deferred" ] && jq -e --arg pin "$seat" \
+    'select(.pin == $pin and .verb == "request-release")' "$deferred" >/dev/null 2>&1; then
     echo "  PASS  L3 busy holder (request-release to $seat deferred into the handoff, not dropped)" | tee -a "$LOG"
   else
     live_fail "L3 the ask to $seat was neither delivered nor deferred (row: $(cat "$deferred" 2>/dev/null | head -2))"

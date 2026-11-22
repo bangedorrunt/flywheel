@@ -725,6 +725,7 @@ fn defer_busy_wake(project: &str, pin: &str) -> Result<()> {
         pin,
         &crate::doorbell::deferred_wake_line(),
         Some(crate::doorbell::now_micros()),
+        None,
     )
     .map_err(|e| anyhow!("record the deferred wake: {e}"))
 }

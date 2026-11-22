@@ -1036,7 +1036,7 @@ pub fn append_deferred_wake(
     pin: &str,
     line: &str,
 ) -> std::io::Result<()> {
-    append_deferred_wake_with_wm(state_dir, project, pin, line, None)
+    append_deferred_wake_with_wm(state_dir, project, pin, line, None, None)
 }
 
 /// bd-fwt8r: same handoff, but records the watermark the ring is about. A
@@ -1047,12 +1047,14 @@ pub fn append_deferred_wake_with_wm(
     pin: &str,
     line: &str,
     wm: Option<u64>,
+    verb: Option<&str>,
 ) -> std::io::Result<()> {
     let path = deferred_wakes_path(state_dir, project);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut row = serde_json::json!({ "pin": pin, "line": line, "wm": wm }).to_string();
+    let mut row =
+        serde_json::json!({ "pin": pin, "line": line, "wm": wm, "verb": verb }).to_string();
     row.push('\n');
     let store = doorbell_rt::FileStore::new(state_dir);
     store.with_file_lock(&path, |_| -> std::io::Result<()> {
@@ -2930,6 +2932,7 @@ mod tests {
             "BlueRidge",
             &deferred_wake_line(),
             Some(10),
+            None,
         )
         .expect("record");
         // The recipient pulled past the ring's watermark before it rang.
@@ -2945,6 +2948,29 @@ mod tests {
             "{raw}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-5b8ak: the verb must be a field, not a substring of the wake text.
+    #[test]
+    fn a_deferred_request_release_carries_its_verb() {
+        let dir = std::env::temp_dir().join(format!("fw-deferred-verb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        super::append_deferred_wake_with_wm(
+            &dir,
+            "flywheel",
+            "IvoryHarbor",
+            &deferred_wake_line(),
+            Some(11),
+            Some("request-release"),
+        )
+        .expect("record");
+        let rows = std::fs::read_to_string(super::deferred_wakes_path(&dir, "flywheel"))
+            .expect("deferred file");
+        let row: serde_json::Value = serde_json::from_str(rows.lines().next().unwrap()).unwrap();
+        assert_eq!(row["verb"], "request-release");
+        assert_eq!(row["pin"], "IvoryHarbor");
+        assert!(row["line"].as_str().is_some_and(|line| !line.is_empty()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
