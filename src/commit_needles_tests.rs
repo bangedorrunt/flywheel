@@ -69,7 +69,7 @@ fn commit_needles_read_the_index_tree() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let fence = std::fs::read_to_string(root.join("scripts/fence.sh")).unwrap();
     assert!(
-        fence.contains("verify-needles.sh\" --repo \"$DEST\""),
+        fence.contains("bash scripts/verify-needles.sh --repo \"$DEST\""),
         "the fence must lint the exported commit tree, not the working copy"
     );
 
