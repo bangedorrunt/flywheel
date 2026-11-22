@@ -1080,10 +1080,10 @@ pub struct DoorbellModel {
     /// never produces one, so the entry would sit in RAM forever and die
     /// with the process. `route_or_queue` sends them to the digest instead.
     pub unroutable: BTreeSet<String>,
-    /// Per-pin plane-P pull cursor, in unix micros — the one notion of
-    /// consumed (bd-yc6jf). Fed from the host's `WakeState.since_by_pin`. A
-    /// mail wake whose event time is at or below this cursor was already
-    /// pulled by `toron next` and must not ring an empty wake.
+    /// The doorbell's OWN inbox-fetch high-water per pin (from the host's
+    /// `WakeState.since_by_pin`), in unix micros. This is NOT proof the crew
+    /// read the mail: consumption is decided by `toron_cursor` only
+    /// (bd-ba4nl). Kept for the legacy `already_pulled` helper.
     #[serde(default)]
     pub pulled_us: BTreeMap<String, i64>,
     /// Pins with an unanswered toron-cursor read (bd-yc6jf): a burst of
@@ -1114,7 +1114,27 @@ pub fn already_pulled(pulled_us: &BTreeMap<String, i64>, pin: &str, created_us: 
 /// never dropped by a pull cursor.
 #[must_use]
 pub fn mail_consumed(model: &DoorbellModel, pin: &str, created_us: Option<i64>) -> bool {
-    created_us.is_some_and(|us| already_pulled(&model.pulled_us, pin, us))
+    let Some(us) = created_us else {
+        return false;
+    };
+    let created_secs = (us / 1_000_000).max(0) as u64;
+    next_toron_cursor_consumed(model, pin, us, created_secs).unwrap_or(false)
+}
+
+/// The toron per-pin read cursor decides consumption. `None` means no fresh
+/// read yet: the caller must park and ask (or fail toward delivery) rather
+/// than treating the doorbell's own fetch high-water as a read.
+fn next_toron_cursor_consumed(
+    model: &DoorbellModel,
+    pin: &str,
+    created_us: i64,
+    created_secs: u64,
+) -> Option<bool> {
+    let read = model.toron_cursor.get(pin)?;
+    if !toron_read_is_fresh(read, created_secs) {
+        return None;
+    }
+    Some(read.cursor_us.is_some_and(|cursor| created_us <= cursor))
 }
 
 /// One answered toron pull-cursor read (bd-yc6jf). `cursor_us` is None
@@ -1347,14 +1367,8 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 // mail event at or below it was already pulled by toron next —
                 // no wake for an empty inbox. Ack-SLA and other urgent kinds
                 // have no inbox row and are never skipped here.
-                if mail && mail_consumed(&next, &pin, created_us) {
-                    actions.push(DoorbellAction::Audit {
-                        kind: "already-pulled".into(),
-                        pin: pin.clone(),
-                        detail: format!("mail at {created_us:?} is at or below the pull cursor"),
-                    });
-                    continue;
-                }
+                // bd-ba4nl: only toron's per-pin READ cursor says the crew
+                // consumed this mail; since_by_pin is our own fetch high-water.
                 // bd-yc6jf: the toron cursor is the second half of the one
                 // notion. A fresh read decides by max(host, toron); a
                 // missing or stale read parks the candidate and asks toron
@@ -1543,18 +1557,40 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 // never dropped here.
                 let mut deferred = Vec::new();
                 for wake in taken {
-                    if is_mail_wake(&wake.line) && mail_consumed(&next, pin, wake.created_us) {
-                        actions.push(DoorbellAction::Audit {
-                            kind: "already-pulled".into(),
-                            pin: pin.clone(),
-                            detail: format!(
-                                "drained mail at {:?} is at or below the pull cursor",
-                                wake.created_us
-                            ),
+                    if wake.created_us.is_some() && is_mail_wake(&wake.line) {
+                        let decided = wake.created_us.and_then(|us| {
+                            next_toron_cursor_consumed(
+                                &next,
+                                pin,
+                                us,
+                                (us / 1_000_000).max(0) as u64,
+                            )
                         });
-                    } else {
-                        deferred.push(wake);
+                        match decided {
+                            Some(true) => {
+                                actions.push(DoorbellAction::Audit {
+                                    kind: "already-pulled".into(),
+                                    pin: pin.clone(),
+                                    detail: format!(
+                                        "drained mail at {:?} is at or below the toron read cursor",
+                                        wake.created_us
+                                    ),
+                                });
+                                continue;
+                            }
+                            None => {
+                                // No fresh toron read: fail toward delivery.
+                                actions.push(DoorbellAction::Audit {
+                                    kind: "toron-cursor-unavailable".into(),
+                                    pin: pin.clone(),
+                                    detail: "toron could not answer; ringing toward delivery"
+                                        .into(),
+                                });
+                            }
+                            Some(false) => {}
+                        }
                     }
+                    deferred.push(wake);
                 }
                 let total: u32 = deferred.iter().map(|w| w.count).sum();
                 if deferred.is_empty() {
@@ -1848,9 +1884,13 @@ mod tests {
         let mut pulled = fresh.clone();
         // created_at 1700000000 secs -> 1700000000000000 micros; the pull
         // cursor at or past that time means the mail was already consumed.
-        pulled
-            .pulled_us
-            .insert("BlueRidge".into(), 1_700_000_000_000_000);
+        pulled.toron_cursor.insert(
+            "BlueRidge".into(),
+            super::ToronRead {
+                cursor_us: Some(1_700_000_000_000_000),
+                read_at_secs: 1_700_000_000,
+            },
+        );
         let (_, pulled_actions) = tick(&pulled, &DoorbellMsg::WatchNdjson { line: watch });
         assert!(
             !pulled_actions
@@ -2164,7 +2204,13 @@ mod tests {
     fn an_inbox_row_below_the_cursor_queues_nothing() {
         let mut model = model_with("BlueRidge");
         model.statuses.insert("BlueRidge".into(), "working".into());
-        model.pulled_us.insert("BlueRidge".into(), 2_000_000);
+        model.toron_cursor.insert(
+            "BlueRidge".into(),
+            super::ToronRead {
+                cursor_us: Some(2_000_000),
+                read_at_secs: 1,
+            },
+        );
         let row = serde_json::json!({
             "created_ts_us": 1_000_000_i64,
             "importance": "normal",
@@ -2217,7 +2263,13 @@ mod tests {
         );
         assert!(!queued.queues.get("BlueRidge").unwrap().is_empty());
         let mut pulled = queued.clone();
-        pulled.pulled_us.insert("BlueRidge".into(), 2_000_000);
+        pulled.toron_cursor.insert(
+            "BlueRidge".into(),
+            super::ToronRead {
+                cursor_us: Some(2_000_000),
+                read_at_secs: 1,
+            },
+        );
         let (_, drained) = tick(
             &pulled,
             &DoorbellMsg::PlaneStatus {
@@ -2244,7 +2296,13 @@ mod tests {
     fn an_urgent_non_mail_kind_survives_the_cursor_check() {
         let mut model = model_with("BlueRidge");
         model.statuses.insert("BlueRidge".into(), "working".into());
-        model.pulled_us.insert("BlueRidge".into(), 2_000_000);
+        model.toron_cursor.insert(
+            "BlueRidge".into(),
+            super::ToronRead {
+                cursor_us: Some(2_000_000),
+                read_at_secs: 1,
+            },
+        );
         let row = serde_json::json!({
             "created_ts_us": 1_000_000_i64,
             "importance": "urgent",

@@ -8,5 +8,5 @@ TEST_FILTER=(an_inbox_row_below_the_cursor_queues_nothing)
 mutation "C1  pulled inbox mail still rings" \
     file=crates/doorbell-core/src/lib.rs \
     expect=an_inbox_row_below_the_cursor_queues_nothing \
-    find='    created_us.is_some_and(|us| already_pulled(&model.pulled_us, pin, us))' \
+    find='    next_toron_cursor_consumed(model, pin, us, created_secs).unwrap_or(false)' \
     replace='    false'

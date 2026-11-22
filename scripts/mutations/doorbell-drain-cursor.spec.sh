@@ -8,5 +8,5 @@ TEST_FILTER=(a_mail_pulled_after_queueing_is_dropped_at_drain)
 mutation "D1  the idle drain rings already-pulled mail" \
     file=crates/doorbell-core/src/lib.rs \
     expect=a_mail_pulled_after_queueing_is_dropped_at_drain \
-    find='                    if is_mail_wake(&wake.line) && mail_consumed(&next, pin, wake.created_us) {' \
-    replace='                    if false {'
+    find='    Some(read.cursor_us.is_some_and(|cursor| created_us <= cursor))' \
+    replace='    Some(false)'
