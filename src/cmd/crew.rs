@@ -1370,12 +1370,15 @@ pub(crate) fn cmd_crew_prompt(
     let (brief, superseded) =
         open_brief(project, pin, prompt.lines().next().unwrap_or(prompt), bead)?;
     let project_dir = crate::project_dir(cfg, project);
-    let traps = if project_dir.is_dir() {
-        crate::cmd::memory::briefing_traps(prompt, Some(project), bead, Some(&project_dir))
+    let traps_block = if project_dir.is_dir() {
+        crate::cmd::memory::render_traps_section(&crate::cmd::memory::briefing_traps(
+            prompt,
+            bead,
+            Some(&project_dir),
+        ))
     } else {
-        Vec::new()
+        String::new()
     };
-    let traps_block = crate::cmd::memory::render_traps_section(&traps);
     let traps_suffix = if traps_block.is_empty() {
         String::new()
     } else {

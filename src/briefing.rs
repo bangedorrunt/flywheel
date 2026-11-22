@@ -170,6 +170,10 @@ pub struct Briefing {
     /// Known traps/invariants from Chie Memory preflight (offline => empty).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub memory_traps: Vec<String>,
+    /// Set when the memory preflight was partial or did not run, so an empty
+    /// `memory_traps` is never mistaken for a clean check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_trap_note: Option<String>,
     /// One mode line plus the one skill to read. Open or captain, never both.
     #[serde(default)]
     pub mode_text: String,
@@ -628,6 +632,7 @@ pub fn assemble_with_catalog(
         stale_build: None,
         harness_ranking: None,
         memory_traps: Vec::new(),
+        memory_trap_note: None,
         mode_text: mode_text(mode_of(&topology)).to_string(),
         required_skills: required_skills(mode_of(&topology)),
         plan: None,
@@ -1307,6 +1312,7 @@ mod tests {
             stale_build: None,
             harness_ranking: None,
             memory_traps: Vec::new(),
+            memory_trap_note: None,
             mode_text: "MODE swarm".into(),
             required_skills: Vec::new(),
             plan: None,

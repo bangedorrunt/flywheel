@@ -3,7 +3,7 @@
 # backtick anywhere — code identifiers in the rule text would collide.
 
 CARGO_ARGS=(--test memory_loop)
-TEST_FILTER=(distinct_code_lessons_both_surface recalled_lessons_are_deduplicated)
+TEST_FILTER=(distinct_code_lessons_both_surface repeated_lessons_are_deduplicated)
 
 mutation "D1  the core is cut at the first backtick instead of the trap boundary" \
     file=src/cmd/memory.rs \

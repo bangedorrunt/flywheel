@@ -11669,12 +11669,11 @@ fn cmd_briefing(
     briefing::apply_answers(&mut b, topology, crew, model).map_err(|e| anyhow!(e))?;
     briefing::attach_consent_plan(&mut b, cfg.crew_max(), &cfg.consent_policy());
     let project_dir = project_dir(cfg, project);
-    b.memory_traps = crate::cmd::memory::briefing_traps(
-        objective,
-        Some(project),
-        None,
-        Some(project_dir.as_path()),
-    );
+    let trap_check =
+        crate::cmd::memory::briefing_traps(objective, None, Some(project_dir.as_path()));
+    b.memory_trap_note =
+        crate::cmd::memory::trap_status_note(trap_check.status, trap_check.detail.as_deref());
+    b.memory_traps = trap_check.traps.clone();
     if json {
         print_json(&serde_json::to_value(&b)?);
     } else {
@@ -11696,7 +11695,7 @@ fn cmd_briefing(
                 .map(|q| q.default.as_str())
                 .unwrap_or(crate::models::HARNESS_DEFAULT)
         );
-        let traps_section = crate::cmd::memory::render_traps_section(&b.memory_traps);
+        let traps_section = crate::cmd::memory::render_traps_section(&trap_check);
         if !traps_section.is_empty() {
             print!("\n{traps_section}");
         }

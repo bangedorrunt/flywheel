@@ -155,20 +155,35 @@ fn cmd_check_trap(
     json: bool,
 ) -> Result<()> {
     let project_dir = project.map(|p| crate::project_dir(cfg, p));
-    let traps = check_trap_queries_strict(&[query.to_string()], project_dir.as_deref())?;
+    let check = check_trap(query, project_dir.as_deref());
+    if check.status == TrapStatus::Failed {
+        bail!(
+            "memory check-trap failed: {}",
+            check.detail.as_deref().unwrap_or("unknown chie error")
+        );
+    }
     if json {
         print_json(&serde_json::json!({
             "ok": true,
+            "status": check.status,
+            "detail": check.detail,
             "query": query,
-            "traps": traps,
-            "count": traps.len(),
+            "traps": check.traps,
+            "count": check.traps.len(),
         }));
-    } else if traps.is_empty() {
-        println!("no traps");
-    } else {
-        for t in &traps {
-            println!("- {t}");
-        }
+        return Ok(());
+    }
+    for t in &check.traps {
+        println!("- {t}");
+    }
+    match check.status {
+        TrapStatus::Ok if check.traps.is_empty() => println!("no traps"),
+        TrapStatus::Ok => {}
+        TrapStatus::Offline => println!("no traps found (chie offline)"),
+        TrapStatus::Timeout | TrapStatus::Failed => println!(
+            "memory check incomplete: {}",
+            check.detail.as_deref().unwrap_or("chie timed out")
+        ),
     }
     Ok(())
 }
@@ -198,109 +213,170 @@ fn cmd_record_lesson(
     Ok(())
 }
 
-/// Collect trap/invariant lines for briefing preflight. Queries are matched
-/// against chie memory traps (commands/paths/text) and modified paths when a
-/// project dir is provided. Offline => empty.
+const MAX_TRAPS: usize = 20;
+const MAX_QUERY_CHARS: usize = 600;
+const MAX_PATH_CHECKS: usize = 12;
+
+/// How complete a trap check is. Ordered by severity: a fold keeps the worst
+/// call's status, so one timed-out call marks the whole result partial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrapStatus {
+    Ok,
+    Offline,
+    Timeout,
+    Failed,
+}
+
+/// Traps found plus how far the check got. Callers render the status so a
+/// partial or failed check never reads as "no traps".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrapCheck {
+    pub traps: Vec<String>,
+    pub status: TrapStatus,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug)]
+enum CallOutcome {
+    Found(Vec<String>),
+    Offline,
+    Timeout(String),
+    Failed(String),
+}
+
+#[derive(Debug, Default)]
+struct TrapCall {
+    query: Option<String>,
+    command: Option<String>,
+    path: Option<String>,
+}
+
+impl TrapCall {
+    fn argv(&self) -> Vec<String> {
+        let mut argv = Vec::new();
+        for (flag, value) in [
+            ("--query", &self.query),
+            ("--command", &self.command),
+            ("--path", &self.path),
+        ] {
+            if let Some(v) = value {
+                argv.push(flag.to_string());
+                argv.push(v.clone());
+            }
+        }
+        argv.push("--json".to_string());
+        argv
+    }
+}
+
+fn path_like(q: &str) -> bool {
+    q.contains('/') || q.ends_with(".rs") || q.ends_with(".toml") || q.ends_with(".md")
+}
+
+/// Briefing preflight: the objective, bead and modified paths go to chie as
+/// ONE free-text query; each modified path also gets its own glob check, all
+/// calls in parallel.
 pub fn briefing_traps(
     objective: &str,
-    project: Option<&str>,
     bead: Option<&str>,
     project_dir: Option<&Path>,
-) -> Vec<String> {
-    let mut queries: Vec<String> = Vec::new();
-    let obj = objective.trim();
-    if !obj.is_empty() {
-        queries.push(obj.to_string());
-        for tok in obj.split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_') {
-            if tok.starts_with("bd-") {
-                queries.push(tok.to_string());
+) -> TrapCheck {
+    let paths: Vec<String> = project_dir
+        .map(modified_paths)
+        .unwrap_or_default()
+        .into_iter()
+        .take(MAX_PATH_CHECKS)
+        .collect();
+    let mut terms: Vec<&str> = vec![objective.trim()];
+    terms.extend(bead.map(str::trim));
+    terms.extend(paths.iter().map(String::as_str));
+    let query: String = terms
+        .into_iter()
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(MAX_QUERY_CHARS)
+        .collect();
+    let mut calls = Vec::new();
+    if !query.is_empty() {
+        calls.push(TrapCall {
+            query: Some(query),
+            ..TrapCall::default()
+        });
+    }
+    calls.extend(paths.into_iter().map(|p| TrapCall {
+        path: Some(p),
+        ..TrapCall::default()
+    }));
+    run_trap_calls(&calls, project_dir)
+}
+
+/// `flywheel memory check-trap`: one chie call that reads the query as text,
+/// as a command, and (when it looks like one) as a path.
+pub fn check_trap(query: &str, project_dir: Option<&Path>) -> TrapCheck {
+    let q = query.trim();
+    if q.is_empty() {
+        return fold_outcomes(Vec::new());
+    }
+    let call = TrapCall {
+        query: Some(q.to_string()),
+        command: Some(q.to_string()),
+        path: path_like(q).then(|| q.to_string()),
+    };
+    run_trap_calls(&[call], project_dir)
+}
+
+fn run_trap_calls(calls: &[TrapCall], project_dir: Option<&Path>) -> TrapCheck {
+    let outcomes = std::thread::scope(|s| {
+        let handles: Vec<_> = calls
+            .iter()
+            .map(|call| s.spawn(move || run_check_trap(&call.argv(), project_dir)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| CallOutcome::Failed("check-trap worker panicked".into()))
+            })
+            .collect()
+    });
+    fold_outcomes(outcomes)
+}
+
+fn fold_outcomes(outcomes: Vec<CallOutcome>) -> TrapCheck {
+    let mut seen = BTreeSet::new();
+    let mut traps = Vec::new();
+    let mut status = TrapStatus::Ok;
+    let mut details = Vec::new();
+    for outcome in outcomes {
+        match outcome {
+            CallOutcome::Found(lines) => {
+                for line in lines {
+                    let line = normalize_line(&line);
+                    if !line.is_empty() && insert_lesson_once(&mut seen, &line) {
+                        traps.push(line);
+                    }
+                }
+            }
+            CallOutcome::Offline => status = status.max(TrapStatus::Offline),
+            CallOutcome::Timeout(d) => {
+                status = status.max(TrapStatus::Timeout);
+                details.push(d);
+            }
+            CallOutcome::Failed(d) => {
+                status = status.max(TrapStatus::Failed);
+                details.push(d);
             }
         }
     }
-    if let Some(b) = bead.map(str::trim).filter(|s| !s.is_empty()) {
-        queries.push(b.to_string());
-    }
-    let _ = project; // reserved for future scoping; dir carries the scope today.
-    if let Some(dir) = project_dir {
-        for p in modified_paths(dir).into_iter().take(12) {
-            queries.push(p);
-        }
-    }
-    queries.sort();
-    queries.dedup();
-    check_trap_queries(&queries, project_dir)
-}
-
-/// Briefing preflight view. An unreachable chie is clean; a usage error is
-/// logged and downgraded here so a briefing never fails on a broken tool.
-pub fn check_trap_queries(queries: &[String], project_dir: Option<&Path>) -> Vec<String> {
-    check_trap_queries_strict(queries, project_dir).unwrap_or_else(|e| {
-        eprintln!("flywheel: memory trap check unavailable: {e}");
-        Vec::new()
-    })
-}
-
-/// The strict check used by `flywheel memory check-trap`: a chie usage error is
-/// a loud failure, never a silent "no traps".
-pub fn check_trap_queries_strict(
-    queries: &[String],
-    project_dir: Option<&Path>,
-) -> Result<Vec<String>> {
-    let mut out: BTreeSet<String> = BTreeSet::new();
-    for q in queries {
-        let q = q.trim();
-        if q.is_empty() {
-            continue;
-        }
-        let path_like =
-            q.contains('/') || q.ends_with(".rs") || q.ends_with(".toml") || q.ends_with(".md");
-        if path_like {
-            merge_lines(
-                &mut out,
-                run_check_trap(&["--path", q, "--json"], project_dir)?,
-            );
-        }
-        merge_lines(
-            &mut out,
-            run_check_trap_with_query_fallback(q, project_dir)?,
-        );
-        // The trap guard matches exact argv/path tokens; migrated lessons name
-        // their file slug, so natural prose queries never hit. Recall over the
-        // same Rule/Trap lessons is the general read path (bd-ndbnv).
-        for line in lesson_recall(q, project_dir)? {
-            let line = normalize_line(&line);
-            if !line.is_empty() {
-                out.insert(line.chars().take(240).collect());
-            }
-        }
-    }
-    if !queries.is_empty() {
-        let joined = queries.join(" ");
-        let clipped: String = joined.chars().take(400).collect();
-        merge_lines(
-            &mut out,
-            run_check_trap_with_query_fallback(&clipped, project_dir)?,
-        );
-    }
-    // Both the trap guard and recall can surface the same lesson several
-    // times (re-records, derived conclusions). Canonicalize once at the edge.
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut rows = Vec::new();
-    for line in out {
-        if insert_lesson_once(&mut seen, &line) {
-            rows.push(line);
-        }
-    }
-    Ok(rows.into_iter().take(20).collect())
-}
-
-fn merge_lines(out: &mut BTreeSet<String>, raw: Option<String>) {
-    let Some(raw) = raw else { return };
-    for line in extract_trap_lines(&raw) {
-        let line = normalize_line(&line);
-        if !line.is_empty() {
-            out.insert(line);
-        }
+    traps.truncate(MAX_TRAPS);
+    details.dedup();
+    TrapCheck {
+        traps,
+        status,
+        detail: (!details.is_empty()).then(|| details.join("; ")),
     }
 }
 
@@ -385,118 +461,40 @@ fn chie_unreachable(err: &str) -> bool {
         || low.contains("daemon")
 }
 
-fn run_check_trap_with_query_fallback(
-    query: &str,
-    project_dir: Option<&Path>,
-) -> Result<Option<String>> {
-    match run_check_trap(
-        &["--command", query, "--query", query, "--json"],
-        project_dir,
-    ) {
-        Ok(res) => Ok(res),
-        Err(err) => {
-            let msg = err.to_string();
-            if msg.contains("unexpected argument") && msg.contains("--query") {
-                run_check_trap(&["--command", query, "--json"], project_dir)
-            } else {
-                Err(err)
-            }
-        }
-    }
-}
-
-fn run_check_trap(args: &[&str], project_dir: Option<&Path>) -> Result<Option<String>> {
+fn run_check_trap(argv: &[String], project_dir: Option<&Path>) -> CallOutcome {
     let mut cmd = Command::new(chie_bin());
     cmd.args(["memory", "check-trap"]);
     if let Some(dir) = chie_project(project_dir) {
         cmd.args(["--project", &dir]);
     }
-    cmd.args(args);
+    cmd.args(argv);
     let out = match run_chie_bounded(&mut cmd, CHIE_SUBPROCESS_TIMEOUT) {
         Ok(out) => out,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => bail!("cannot run chie check-trap: {e}"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CallOutcome::Offline,
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            return CallOutcome::Timeout(e.to_string());
+        }
+        Err(e) => return CallOutcome::Failed(format!("cannot run chie check-trap: {e}")),
     };
     if out.status.success() {
-        return Ok(Some(
-            String::from_utf8_lossy(&out.stdout).trim().to_string(),
-        ));
+        return match serde_json::from_slice::<serde_json::Value>(&out.stdout) {
+            Ok(doc) => CallOutcome::Found(extract_trap_lines_json(&doc)),
+            Err(e) => CallOutcome::Failed(format!("chie check-trap returned invalid JSON: {e}")),
+        };
     }
     let err_text = String::from_utf8_lossy(&out.stderr).trim().to_string();
     if chie_unreachable(&err_text) {
-        return Ok(None);
+        return CallOutcome::Offline;
     }
     let detail = if err_text.is_empty() {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     } else {
         err_text
     };
-    bail!(
-        "chie memory check-trap failed ({}): {}",
-        args.join(" "),
-        detail
-    )
-}
-
-/// Recall Rule/Trap lessons by text — the read path for lessons whose trap
-/// matcher is a slug rather than the natural phrase a preflight query uses.
-fn lesson_recall(query: &str, project_dir: Option<&Path>) -> Result<Vec<String>> {
-    let mut cmd = Command::new(chie_bin());
-    cmd.args(["memory", "recall", query, "--json"]);
-    if let Some(dir) = chie_project(project_dir) {
-        cmd.args(["--project", &dir]);
-    }
-    let out = match run_chie_bounded(&mut cmd, CHIE_SUBPROCESS_TIMEOUT) {
-        Ok(out) => out,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => bail!("cannot run chie recall: {e}"),
-    };
-    if !out.status.success() {
-        let err_text = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if chie_unreachable(&err_text) {
-            return Ok(Vec::new());
-        }
-        bail!("chie memory recall failed ({query}): {err_text}");
-    }
-    let doc: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| anyhow::anyhow!("chie recall returned invalid JSON: {e}"))?;
-    let mut rows = Vec::new();
-    let mut seen = BTreeSet::new();
-    for key in ["conclusions", "events"] {
-        if let Some(arr) = doc.get(key).and_then(serde_json::Value::as_array) {
-            for item in arr {
-                if let Some(content) = item.get("content").and_then(serde_json::Value::as_str)
-                    && (content.contains("Rule:") || content.contains("Trap:"))
-                {
-                    // Re-recorded lessons leave duplicate events; the preflight
-                    // view must show each lesson once (bd-ndbnv review point 4).
-                    if insert_lesson_once(&mut seen, content) {
-                        rows.push(content.to_string());
-                    }
-                }
-            }
-        }
-    }
-    Ok(rows)
-}
-
-fn extract_trap_lines(raw: &str) -> Vec<String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Vec::new();
-    }
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-        return extract_trap_lines_json(&v);
-    }
-    raw.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .filter(|l| {
-            let low = l.to_ascii_lowercase();
-            !(low == "no traps" || low == "clean" || low == "ok" || low == "none")
-        })
-        .map(|l| l.trim_start_matches('-').trim().to_string())
-        .collect()
+    CallOutcome::Failed(format!(
+        "chie memory check-trap failed ({}): {detail}",
+        argv.join(" ")
+    ))
 }
 
 fn extract_trap_lines_json(v: &serde_json::Value) -> Vec<String> {
@@ -632,8 +630,7 @@ pub fn record_lesson_with_pin(
         .unwrap_or("error");
     cmd.args(["--kind", kind]);
     if let Some(p) = pin.map(str::trim).filter(|s| !s.is_empty()) {
-        // chie record has --peer, not --pin (bd-97uwg).
-        cmd.args(["--peer", &format!("agent:{p}")]);
+        cmd.args(["--pin", p]);
     }
     cmd.arg(rule_lesson_event(content));
     match run_chie_bounded(&mut cmd, CHIE_SUBPROCESS_TIMEOUT) {
@@ -646,7 +643,7 @@ fn modified_paths(dir: &Path) -> Vec<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--untracked-files=all"])
         .output();
     let Ok(out) = out else { return Vec::new() };
     if !out.status.success() {
@@ -669,15 +666,36 @@ fn modified_paths(dir: &Path) -> Vec<String> {
     paths
 }
 
-/// Render the briefing memory-traps section (markdown). Empty => empty string.
-pub fn render_traps_section(traps: &[String]) -> String {
-    if traps.is_empty() {
+/// One line naming why a check is incomplete; `None` when it ran clean.
+pub fn trap_status_note(status: TrapStatus, detail: Option<&str>) -> Option<String> {
+    let why = match status {
+        TrapStatus::Ok => return None,
+        TrapStatus::Offline => "chie is offline",
+        TrapStatus::Timeout => "chie timed out",
+        TrapStatus::Failed => "chie failed",
+    };
+    Some(match detail {
+        Some(d) => format!("Memory check incomplete ({why}: {d}); known traps may be missing."),
+        None => format!("Memory check incomplete ({why}); known traps may be missing."),
+    })
+}
+
+/// Render the briefing memory-traps section (markdown). A clean check with no
+/// traps renders nothing; an incomplete one always says so.
+pub fn render_traps_section(check: &TrapCheck) -> String {
+    let note = trap_status_note(check.status, check.detail.as_deref());
+    if check.traps.is_empty() && note.is_none() {
         return String::new();
     }
     let mut s = String::from("### Chie Memory Traps & Invariants\n");
-    for t in traps {
+    for t in &check.traps {
         s.push_str("- ");
         s.push_str(t);
+        s.push('\n');
+    }
+    if let Some(note) = note {
+        s.push_str("- ");
+        s.push_str(&note);
         s.push('\n');
     }
     s
@@ -759,26 +777,128 @@ mod tests {
         assert!(!event.contains("Rule: Rule:"), "{event}");
     }
 
-    #[test]
-    fn check_trap_offline_missing_chie_is_clean() {
-        let dir = tmpdir("offline");
-        let missing = dir.join("chie-missing");
-        let traps = with_chie_bin(&missing, || {
-            check_trap_queries(&["cargo test".to_string()], None)
-        });
-        assert!(traps.is_empty(), "offline check must be clean: {traps:?}");
+    fn argv_logging_chie(dir: &Path, body: &str) -> (PathBuf, PathBuf) {
+        let log = dir.join("argv.log");
+        let fake = write_fake_chie(
+            dir,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{body}\n",
+                log.display()
+            ),
+        );
+        (fake, log)
+    }
+
+    fn git_dir_with_change(name: &str, file: &str) -> PathBuf {
+        let dir = tmpdir(name);
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init");
+        let path = dir.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "x").unwrap();
+        dir
     }
 
     #[test]
-    fn check_trap_daemon_unreachable_is_clean() {
+    fn check_trap_offline_missing_chie_says_offline() {
+        let dir = tmpdir("offline");
+        let missing = dir.join("chie-missing");
+        let check = with_chie_bin(&missing, || check_trap("cargo test", None));
+        assert!(check.traps.is_empty(), "{check:?}");
+        assert_eq!(check.status, TrapStatus::Offline);
+    }
+
+    #[test]
+    fn check_trap_daemon_unreachable_says_offline() {
         let dir = tmpdir("unreachable");
         let fake = write_fake_chie(&dir, "#!/bin/sh\necho 'connect refused' >&2\nexit 1\n");
-        let traps = with_chie_bin(&fake, || {
-            check_trap_queries(&["cargo test".to_string()], None)
+        let check = with_chie_bin(&fake, || check_trap("cargo test", None));
+        assert!(check.traps.is_empty(), "{check:?}");
+        assert_eq!(check.status, TrapStatus::Offline);
+    }
+
+    #[test]
+    fn check_trap_is_one_call_with_query_command_and_path() {
+        let dir = tmpdir("one-call");
+        let (fake, log) = argv_logging_chie(
+            &dir,
+            r#"printf '[{"rule_id":"e-1","warning":"keep leases exact"}]'"#,
+        );
+        let check = with_chie_bin(&fake, || check_trap("src/cmd/spawn.rs", None));
+        assert_eq!(check.traps, vec!["keep leases exact".to_string()]);
+        assert_eq!(check.status, TrapStatus::Ok);
+        let argv = fs::read_to_string(log).unwrap();
+        let calls: Vec<&str> = argv.lines().collect();
+        assert_eq!(
+            calls,
+            vec![
+                "memory check-trap --query src/cmd/spawn.rs --command src/cmd/spawn.rs --path src/cmd/spawn.rs --json"
+            ]
+        );
+    }
+
+    #[test]
+    fn briefing_sends_one_query_and_one_check_per_path_and_never_recalls() {
+        let dir = git_dir_with_change("brief-calls", "src/lease.rs");
+        let (fake, log) = argv_logging_chie(&tmpdir("brief-calls-bin"), "printf '[]'");
+        let check = with_chie_bin(&fake, || {
+            briefing_traps("fix the lease drain", Some("bd-123"), Some(&dir))
         });
+        assert_eq!(check.status, TrapStatus::Ok, "{check:?}");
+        let argv = fs::read_to_string(log).unwrap();
+        assert!(!argv.contains("recall"), "no recall in preflight: {argv}");
+        assert_eq!(argv.lines().count(), 2, "one query + one path: {argv}");
         assert!(
-            traps.is_empty(),
-            "daemon-unreachable check must be clean: {traps:?}"
+            argv.lines()
+                .any(|l| l.ends_with("--query fix the lease drain bd-123 src/lease.rs --json")),
+            "{argv}"
+        );
+        assert!(
+            argv.lines()
+                .any(|l| l.ends_with("--path src/lease.rs --json")),
+            "{argv}"
+        );
+    }
+
+    #[test]
+    fn a_hung_path_check_keeps_the_query_hits_and_says_timeout() {
+        let dir = git_dir_with_change("brief-partial", "src/slow.rs");
+        let fake = write_fake_chie(
+            &tmpdir("brief-partial-bin"),
+            r#"#!/bin/sh
+case "$*" in
+  *--path*) exec sleep 5 ;;
+esac
+printf '[{"rule_id":"e-1","warning":"drain parks are bounded"}]'
+"#,
+        );
+        let check = with_chie_bin(&fake, || briefing_traps("drain", None, Some(&dir)));
+        assert_eq!(check.traps, vec!["drain parks are bounded".to_string()]);
+        assert_eq!(check.status, TrapStatus::Timeout);
+        let section = render_traps_section(&check);
+        assert!(section.contains("drain parks are bounded"), "{section}");
+        assert!(section.contains("Memory check incomplete"), "{section}");
+    }
+
+    #[test]
+    fn invalid_check_trap_json_is_a_failure_not_clean() {
+        let dir = tmpdir("bad-json");
+        let fake = write_fake_chie(&dir, "#!/bin/sh\nprintf 'not json'\n");
+        let check = with_chie_bin(&fake, || check_trap("cargo test", None));
+        assert_eq!(check.status, TrapStatus::Failed);
+        assert!(
+            check
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("invalid JSON"),
+            "{check:?}"
         );
     }
 
@@ -794,31 +914,67 @@ mod tests {
 
     #[test]
     fn extract_trap_lines_json_shapes() {
-        assert!(extract_trap_lines(r#"{"traps":[]}"#).is_empty());
-        assert!(extract_trap_lines(r#"{"matches":[]}"#).is_empty());
-        assert!(extract_trap_lines("no traps").is_empty());
-        let a = extract_trap_lines(r#"{"traps":[{"message":"do not rm -rf"}]}"#);
-        assert_eq!(a, vec!["do not rm -rf".to_string()]);
-        let b = extract_trap_lines(r#"{"matches":["watch the lease"]}"#);
-        assert_eq!(b, vec!["watch the lease".to_string()]);
-        let c = extract_trap_lines(r#"["alpha","beta"]"#);
-        assert_eq!(c, vec!["alpha".to_string(), "beta".to_string()]);
-        let d = extract_trap_lines(
-            r#"[{"rule_id":"e-1","warning":"Strip TMPDIR trailing slash","proof":"proof46"}]"#,
+        let lines = |raw: &str| extract_trap_lines_json(&serde_json::from_str(raw).unwrap());
+        assert!(lines(r#"{"traps":[]}"#).is_empty());
+        assert!(lines(r#"{"matches":[]}"#).is_empty());
+        assert_eq!(
+            lines(r#"{"traps":[{"message":"do not rm -rf"}]}"#),
+            vec!["do not rm -rf".to_string()]
         );
         assert_eq!(
-            d,
+            lines(r#"{"matches":["watch the lease"]}"#),
+            vec!["watch the lease".to_string()]
+        );
+        assert_eq!(
+            lines(r#"["alpha","beta"]"#),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+        assert_eq!(
+            lines(
+                r#"[{"rule_id":"e-1","warning":"Strip TMPDIR trailing slash","proof":"proof46"}]"#
+            ),
             vec!["Strip TMPDIR trailing slash (proof: proof46)".to_string()]
         );
     }
 
+    fn check_of(traps: &[&str], status: TrapStatus) -> TrapCheck {
+        TrapCheck {
+            traps: traps.iter().map(|t| t.to_string()).collect(),
+            status,
+            detail: None,
+        }
+    }
+
     #[test]
     fn render_traps_section_formats_markdown() {
-        assert_eq!(render_traps_section(&[]), "");
-        let s = render_traps_section(&["x".to_string(), "y".to_string()]);
+        assert_eq!(render_traps_section(&check_of(&[], TrapStatus::Ok)), "");
+        let s = render_traps_section(&check_of(&["x", "y"], TrapStatus::Ok));
         assert!(s.starts_with("### Chie Memory Traps & Invariants\n"));
         assert!(s.contains("- x\n"));
         assert!(s.contains("- y\n"));
+        assert!(!s.contains("incomplete"), "{s}");
+    }
+
+    #[test]
+    fn an_offline_check_never_renders_as_clean() {
+        let s = render_traps_section(&check_of(&[], TrapStatus::Offline));
+        assert!(
+            s.contains("Memory check incomplete (chie is offline)"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn the_worst_call_status_wins() {
+        let check = fold_outcomes(vec![
+            CallOutcome::Found(vec!["a".into()]),
+            CallOutcome::Offline,
+            CallOutcome::Timeout("slow".into()),
+            CallOutcome::Found(vec!["a".into(), "b".into()]),
+        ]);
+        assert_eq!(check.status, TrapStatus::Timeout);
+        assert_eq!(check.traps, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(check.detail.as_deref(), Some("slow"));
     }
 
     #[test]
@@ -828,44 +984,14 @@ mod tests {
     }
 
     #[test]
-    fn briefing_traps_offline_is_empty() {
+    fn briefing_traps_offline_is_empty_and_says_offline() {
         let dir = tmpdir("brief-offline");
         let missing = dir.join("chie-missing");
-        let traps = with_chie_bin(&missing, || {
-            briefing_traps(
-                "fix bd-123 in src/main.rs",
-                Some("flywheel"),
-                Some("bd-123"),
-                Some(&dir),
-            )
+        let check = with_chie_bin(&missing, || {
+            briefing_traps("fix bd-123 in src/main.rs", Some("bd-123"), Some(&dir))
         });
-        assert!(
-            traps.is_empty(),
-            "offline briefing preflight must be empty: {traps:?}"
-        );
-    }
-
-    #[test]
-    fn check_trap_falls_back_when_query_flag_rejected() {
-        let dir = tmpdir("query-fallback");
-        let fake = write_fake_chie(
-            &dir,
-            r#"#!/bin/sh
-if [ "$2" = "recall" ]; then
-  printf '{"conclusions":[],"events":[]}'
-  exit 0
-fi
-if echo "$*" | grep -q -- "--query"; then
-  echo "error: unexpected argument '--query' found" >&2
-  exit 2
-fi
-printf '[{"rule_id":"r-1","warning":"Strip TMPDIR slash"}]'
-"#,
-        );
-        let traps = with_chie_bin(&fake, || {
-            check_trap_queries_strict(&["proof46".to_string()], None).unwrap()
-        });
-        assert_eq!(traps, vec!["Strip TMPDIR slash".to_string()]);
+        assert!(check.traps.is_empty(), "{check:?}");
+        assert_eq!(check.status, TrapStatus::Offline);
     }
 
     #[test]
@@ -880,7 +1006,7 @@ printf '[{"rule_id":"r-1","warning":"Strip TMPDIR slash"}]'
     }
 
     #[test]
-    fn record_lesson_with_pin_forwards_peer_flag() {
+    fn record_lesson_with_pin_forwards_pin_flag() {
         let dir = tmpdir("record-pin");
         let log = dir.join("args.txt");
         let fake = write_fake_chie(
@@ -897,9 +1023,7 @@ printf '[{"rule_id":"r-1","warning":"Strip TMPDIR slash"}]'
         });
         assert!(ok);
         let recorded = fs::read_to_string(log).unwrap();
-        assert!(
-            recorded.contains("--peer agent:QuietLantern"),
-            "args: {recorded}"
-        );
+        assert!(recorded.contains("--pin QuietLantern"), "args: {recorded}");
+        assert!(!recorded.contains("--peer"), "args: {recorded}");
     }
 }

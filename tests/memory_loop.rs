@@ -13,8 +13,8 @@ fn run(sandbox: &TestSandbox, args: &[&str]) -> Output {
     if !fake.exists() {
         let store = sandbox.root().join("fake-chie-lessons.jsonl");
         let script = format!(
-            "#!/bin/sh\nSTORE='{}'\ncase \"$2\" in\n  record) for last; do :; done\n    printf '%s' \"$last\" | tr '\\n' ' ' >> \"$STORE\"\n    printf '\\n' >> \"$STORE\"\n    printf '{{\"recorded\":true}}\\n' ;;\n  recall)\n    printf '{{\"conclusions\":['\n    sep=''\n    while IFS= read -r line; do\n      
-        esc=$(printf '%s' \"$line\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n        printf '%s{{\"content\":\"%s\"}}' \"$sep\" \"$esc\"\n        sep=','\n    done < \"$STORE\" 2>/dev/null\n    printf '],\"events\":[]}}\\n' ;;\n  *) printf '[]\\n' ;;\nesac\nexit 0\n",
+            "#!/bin/sh\nSTORE='{}'\ncase \"$2\" in\n  record) for last; do :; done\n    printf '%s' \"$last\" | tr '\\n' ' ' >> \"$STORE\"\n    printf '\\n' >> \"$STORE\"\n    printf '{{\"recorded\":true}}\\n' ;;\n  check-trap)\n    printf '['\n    sep=''\n    while IFS= read -r line; do\n
+        esc=$(printf '%s' \"$line\" | sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/g')\n        printf '%s{{\"rule_id\":\"e\",\"warning\":\"%s\"}}' \"$sep\" \"$esc\"\n        sep=','\n    done < \"$STORE\" 2>/dev/null\n    printf ']\\n' ;;\n  *) echo \"fake chie: $2 is not part of the lesson loop\" >&2; exit 2 ;;\nesac\nexit 0\n",
             store.display()
         );
         std::fs::write(&fake, script).expect("write fake chie");
@@ -40,13 +40,13 @@ fn text(out: &Output) -> String {
     )
 }
 
-/// A fake chie: `record` succeeds, `recall` replays the two real trap shapes
-/// (old and new chiebukuro renderings) from a fixture, everything else is
-/// empty. The real installed chie is never spawned (bd-7szny).
+/// A fake chie: `record` succeeds, `check-trap` replays the two real trap
+/// shapes (old and new chiebukuro renderings) from a fixture, anything else is
+/// a usage error. The real installed chie is never spawned (bd-7szny).
 fn fake_chie_with_fixture(sandbox: &TestSandbox, fixture: &str) -> std::path::PathBuf {
     let fake = sandbox.bin_dir().join("fake-chie-traps");
     let script = format!(
-        "#!/bin/sh\ncase \"$2\" in\n  record) printf '{{\"recorded\":true}}\\n' ;;\n  recall) cat '{fixture}' ;;\n  *) printf '[]\\n' ;;\nesac\nexit 0\n"
+        "#!/bin/sh\ncase \"$2\" in\n  record) printf '{{\"recorded\":true}}\\n' ;;\n  check-trap) cat '{fixture}' ;;\n  *) echo \"fake chie: unexpected $2\" >&2; exit 2 ;;\nesac\nexit 0\n"
     );
     std::fs::write(&fake, script).expect("write fake chie");
     use std::os::unix::fs::PermissionsExt as _;
@@ -149,12 +149,12 @@ fn a_plain_lesson_is_retrievable_by_command_and_path() {
     );
 }
 
-/// `--as` must reach chie as --peer (chie has no --pin), and the lesson must
-/// still be retrievable (bd-97uwg).
+/// `--as` must reach chie as its owning `--pin`, and the lesson must still be
+/// retrievable.
 fn fake_chie_logger(sandbox: &TestSandbox, log: &std::path::Path) -> std::path::PathBuf {
     let fake = sandbox.bin_dir().join("fake-chie-logger");
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\ncase \"$2\" in\n  record) printf '{{\"recorded\":true}}\\n' ;;\n  recall) printf '%s\\n' '{{\"conclusions\":[{{\"content\":\"Rule: an unattributed lesson breaks when a pin cannot reach chie; do map --as to --peer\"}}],\"events\":[]}}' ;;\n  *) printf '[]\\n' ;;\nesac\nexit 0\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\ncase \"$2\" in\n  record) printf '{{\"recorded\":true}}\\n' ;;\n  check-trap) printf '%s\\n' '[{{\"rule_id\":\"e\",\"warning\":\"Rule: an unattributed lesson breaks when a pin cannot reach chie; do map --as to --pin\"}}]' ;;\n  *) echo \"fake chie: unexpected $2\" >&2; exit 2 ;;\nesac\nexit 0\n",
         log.display()
     );
     std::fs::write(&fake, script).expect("write fake chie logger");
@@ -176,7 +176,7 @@ fn recording_with_as_is_retrievable() {
         &[
             "memory",
             "record-lesson",
-            "an unattributed lesson breaks when a pin cannot reach chie; do map --as to --peer",
+            "an unattributed lesson breaks when a pin cannot reach chie; do map --as to --pin",
             "--as",
             "BoldCliff",
             "--project",
@@ -191,10 +191,13 @@ fn recording_with_as_is_retrievable() {
     );
     let argv = std::fs::read_to_string(&log).expect("chie argv log");
     assert!(
-        argv.contains("--peer agent:BoldCliff"),
-        "--as must map to chie's --peer agent:<pin>: {argv}"
+        argv.contains("--pin BoldCliff"),
+        "--as must map to chie's owning --pin: {argv}"
     );
-    assert!(!argv.contains("--pin"), "chie has no --pin flag: {argv}");
+    assert!(
+        !argv.contains("--peer"),
+        "the pin is not the authoring peer: {argv}"
+    );
     let found = run_with_chie(
         &sandbox,
         &fake,
@@ -215,10 +218,10 @@ fn recording_with_as_is_retrievable() {
 }
 
 /// bd-ndbnv: lessons recorded the migration way (decision kind, slug Trap
-/// line) must surface by natural preflight query — across DIFFERENT shapes,
-/// not one fitted phrase.
+/// line) come back through check-trap alone, with no recall pass. Matching a
+/// natural query to the slug lesson is chie's job and is tested there.
 #[test]
-fn migrated_lessons_are_check_trap_findable_by_natural_query() {
+fn migrated_lessons_come_back_through_check_trap_alone() {
     let sandbox = TestSandbox::new();
     let cases = [
         (
@@ -278,7 +281,7 @@ fn migrated_lessons_are_check_trap_findable_by_natural_query() {
 /// Review point 4: repeated records leave duplicate events, but preflight must
 /// show each lesson once.
 #[test]
-fn recalled_lessons_are_deduplicated() {
+fn repeated_lessons_are_deduplicated() {
     let sandbox = TestSandbox::new();
     let fake = fake_chie_with_traps(&sandbox);
     let lesson = "a zebra marker breaks when a dedup probe runs; do keep one lesson";
@@ -398,17 +401,14 @@ fn no_test_shells_the_real_chie() {
     assert!(bad.is_empty(), "tests invoking real chie: {bad:?}");
 }
 
-/// A chie that exits 0 with non-JSON recall output must make check-trap fail,
-/// not silently report "no traps" (bd-ndbnv review point a).
+/// A chie that exits 0 with non-JSON check-trap output must make check-trap
+/// fail, not silently report "no traps" (bd-ndbnv review point a).
 #[test]
-fn malformed_recall_output_is_a_loud_failure() {
+fn malformed_check_trap_output_is_a_loud_failure() {
     let sandbox = TestSandbox::new();
     let fake = sandbox.bin_dir().join("fake-chie-badjson");
-    std::fs::write(
-        &fake,
-        "#!/usr/bin/env bash\ncase \"$*\" in\n  *recall*) printf 'not json\\n' ;;\n  *) printf '[]\\n' ;;\nesac\nexit 0\n",
-    )
-    .expect("write fake chie");
+    std::fs::write(&fake, "#!/usr/bin/env bash\nprintf 'not json\\n'\nexit 0\n")
+        .expect("write fake chie");
     use std::os::unix::fs::PermissionsExt as _;
     let mut perms = std::fs::metadata(&fake).expect("meta").permissions();
     perms.set_mode(0o755);
@@ -422,12 +422,12 @@ fn malformed_recall_output_is_a_loud_failure() {
         .expect("check-trap");
     assert!(
         !out.status.success(),
-        "malformed recall JSON must not read clean: {}",
+        "malformed check-trap JSON must not read clean: {}",
         text(&out)
     );
     assert!(
-        text(&out).contains("recall") || text(&out).contains("JSON"),
-        "the refusal names the bad recall: {}",
+        text(&out).contains("invalid JSON"),
+        "the refusal names the bad output: {}",
         text(&out)
     );
 }
@@ -479,7 +479,8 @@ fn slug_and_directory_scopes_agree() {
     );
 }
 
-/// A chie usage error is loud; an unreachable daemon is still clean.
+/// A chie usage error is loud; an unreachable daemon exits 0 but says the
+/// check did not run, so "offline" never reads as "no traps".
 #[test]
 fn usage_errors_are_loud_but_unreachable_is_clean() {
     let sandbox = TestSandbox::new();
@@ -526,8 +527,9 @@ fn usage_errors_are_loud_but_unreachable_is_clean() {
         .expect("down check");
     assert!(
         unreachable.status.success()
-            && String::from_utf8_lossy(&unreachable.stdout).trim() == "no traps",
-        "an unreachable daemon is still clean: {}",
+            && String::from_utf8_lossy(&unreachable.stdout).trim()
+                == "no traps found (chie offline)",
+        "an unreachable daemon exits 0 and names itself offline: {}",
         text(&unreachable)
     );
 }
