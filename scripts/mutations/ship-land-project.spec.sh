@@ -34,7 +34,7 @@ mutation "L3  a receipt with no mutation witnesses lands" \
     file=$SHIP \
     expect=a_receipt_without_mutation_witnesses_cannot_land \
     find='    if rows_opt.is_none_or(Vec::is_empty) {' \
-    replace='    if false {'
+    replace='        if false {'
 
 mutation "L4  a mutation that stayed green still lands" \
     file=$SHIP \
@@ -45,20 +45,20 @@ mutation "L4  a mutation that stayed green still lands" \
 mutation "L5  a descendant proof no longer lands its ancestors" \
     file=$SHIP \
     expect=a_receipt_for_a_descendant_of_the_citing_commit_lands \
-    find='    if proved != sha && !is_ancestor(root, sha, proved) {' \
-    replace='    if proved != sha {'
+    find='        if !is_ancestor(&check_root, sha, &contained_by) {' \
+    replace='        if true {'
 
 mutation "L8  any receipt lands, even one for an earlier tree" \
     file=$SHIP \
     expect=a_receipt_for_a_descendant_of_the_citing_commit_lands \
-    find='    if proved != sha && !is_ancestor(root, sha, proved) {' \
-    replace='    if false {'
+    find='        if !is_ancestor(&check_root, sha, &contained_by) {' \
+    replace='        if false {'
 
 mutation "L9  the ancestry test runs the wrong way" \
     file=$SHIP \
     expect=a_receipt_for_a_descendant_of_the_citing_commit_lands \
-    find='    if proved != sha && !is_ancestor(root, sha, proved) {' \
-    replace='    if proved != sha && !is_ancestor(root, proved, sha) {'
+    find='        if !is_ancestor(&check_root, sha, &contained_by) {' \
+    replace='        if !is_ancestor(&check_root, &contained_by, sha) {'
 
 mutation "L10  the gate note leads with the proven sha" \
     file=$SHIP \
@@ -76,5 +76,5 @@ mutation "L7  a dirty-tree receipt lands a commit" \
     file=$SHIP \
     expect=a_receipt_is_bound_to_the_commit_it_proved \
     find='    if doc.get("mode").and_then(Value::as_str) == Some("dirty") {' \
-    replace='    if false {'
+    replace='        if false {'
 

@@ -769,7 +769,43 @@ fn cache_key_at(root: &Path, rev: &str, spec: &str, driver: &str) -> Result<Stri
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
+/// proof.toml spells a sibling as `"../name"` relative to the flywheel repo.
+fn sibling_toml_path(flywheel_root: &Path, sibling: &Path) -> String {
+    let parent = flywheel_root.parent().unwrap_or(flywheel_root);
+    match sibling.strip_prefix(parent) {
+        Ok(rel) => format!("../{}", rel.display()),
+        Err(_) => sibling.display().to_string(),
+    }
+}
+
+/// The sibling rev pinned by the PROVEN flywheel commit's proof.toml (bd-9i0e3).
+/// A proof only covers a sibling work at the rev it pinned, not whatever the
+/// sibling's own HEAD has moved to since.
+fn pinned_sibling_rev(flywheel_root: &Path, proved: &str, path: &str) -> Option<String> {
+    let toml = git(flywheel_root, &["show", &format!("{proved}:proof.toml")]).ok()?;
+    toml.split("[[sibling]]").skip(1).find_map(|block| {
+        let matches = block.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("path") && line.contains(path)
+        });
+        if !matches {
+            return None;
+        }
+        block.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("rev")
+                .and_then(|rest| rest.trim_start().strip_prefix('='))
+                .map(|v| v.trim().trim_matches('"').to_string())
+        })
+    })
+}
+
+fn receipt_is_landable(
+    root: &Path,
+    receipt: &Path,
+    sha: &str,
+    sibling: Option<&Path>,
+) -> Result<()> {
     let raw = std::fs::read_to_string(receipt)
         .map_err(|e| anyhow!("proof receipt unreadable: {}: {e}", receipt.display()))?;
     let doc: Value = serde_json::from_str(&raw)
@@ -792,12 +828,33 @@ fn receipt_is_landable(root: &Path, receipt: &Path, sha: &str) -> Result<()> {
     // may be an ANCESTOR of the proven sha: a later proof covers it. A receipt
     // that does not contain the citing commit still proves a different tree and
     // is refused.
-    if proved != sha && !is_ancestor(root, sha, proved) {
-        bail!(
-            "proof receipt proves {proved}, which does not contain {sha}: {} — re-prove at or after {sha} \
-             (`scripts/clean-proof.sh --sha {sha} --mutations changed`)",
-            receipt.display()
-        );
+    if proved != sha {
+        // bd-9i0e3: with --repo, the work lives in a sibling. Containment is
+        // asked in THAT repo, against the rev the proven flywheel commit pins.
+        let (check_root, contained_by, pinned_note) = match sibling {
+            Some(sib) => {
+                let rel = sibling_toml_path(root, sib);
+                let rev = pinned_sibling_rev(root, proved, &rel).ok_or_else(|| {
+                    anyhow!(
+                        "proof receipt proves {proved}, whose proof.toml does not pin sibling {rel} \
+                         — re-prove with that pin (`scripts/clean-proof.sh --sha {proved}`)"
+                    )
+                })?;
+                (
+                    sib.to_path_buf(),
+                    rev.clone(),
+                    format!(" pins sibling rev {rev}"),
+                )
+            }
+            None => (root.to_path_buf(), proved.to_string(), String::new()),
+        };
+        if !is_ancestor(&check_root, sha, &contained_by) {
+            bail!(
+                "proof receipt proves {proved}{pinned_note}, which does not contain {sha}: {} — re-prove at or after {sha} \
+                 (`scripts/clean-proof.sh --sha {sha} --mutations changed`)",
+                receipt.display()
+            );
+        }
     }
     if doc.get("mode").and_then(Value::as_str) == Some("dirty") {
         bail!(
@@ -1009,7 +1066,7 @@ pub(crate) fn ship_land(args: LandArgs<'_>) -> Result<()> {
     // The proof and the citing commit belong to the WORK repo when one is
     // named; the tracker rows, the gate and the commit stay in `dir`.
     let proof_root = repo.unwrap_or(&dir);
-    receipt_is_landable(proof_root, receipt, sha)?;
+    receipt_is_landable(&dir, receipt, sha, repo)?;
     git(&dir, &["rev-parse", "--git-dir"])?;
     let cited = git(proof_root, &["log", "--format=%B", "-n", "1", sha])?;
     if !cited.contains(bead) {
@@ -1396,7 +1453,7 @@ live-verified. Record one BEFORE closing."#;
         let none = receipt(&doc(true, &[]));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &none, &sha).unwrap_err()
+            receipt_is_landable(repo.path(), &none, &sha, None).unwrap_err()
         );
         assert!(
             err.contains("no mutation run"),
@@ -1408,14 +1465,14 @@ live-verified. Record one BEFORE closing."#;
         ));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &legacy, &sha).unwrap_err()
+            receipt_is_landable(repo.path(), &legacy, &sha, None).unwrap_err()
         );
         assert!(err.contains("legacy mutation row"), "{err}");
 
         let red_is_green = receipt(&doc(true, &[row("demo.spec.sh", "D1", "GREEN", false)]));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &red_is_green, &sha).unwrap_err()
+            receipt_is_landable(repo.path(), &red_is_green, &sha, None).unwrap_err()
         );
         assert!(
             err.contains("proved GREEN, expected RED"),
@@ -1425,7 +1482,7 @@ live-verified. Record one BEFORE closing."#;
         let dangling = receipt(&doc(true, &[row("demo.spec.sh", "D9", "RED", false)]));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &dangling, &sha).unwrap_err()
+            receipt_is_landable(repo.path(), &dangling, &sha, None).unwrap_err()
         );
         assert!(
             err.contains("no longer declares"),
@@ -1435,19 +1492,19 @@ live-verified. Record one BEFORE closing."#;
         let not_green = receipt(&doc(false, &[row("demo.spec.sh", "D1", "RED", false)]));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &not_green, &sha).unwrap_err()
+            receipt_is_landable(repo.path(), &not_green, &sha, None).unwrap_err()
         );
         assert!(err.contains("not green"), "{err}");
 
         let good = receipt(&doc(true, &[row("demo.spec.sh", "D1", "RED", false)]));
-        receipt_is_landable(repo.path(), &good, &sha).expect("a proving receipt lands");
+        receipt_is_landable(repo.path(), &good, &sha, None).expect("a proving receipt lands");
 
         // A guard expected dead is the other way round and is not a failure.
         let dead = receipt(&doc(
             true,
             &[row("demo.spec.sh", "D1", "DEAD-CONFIRMED", true)],
         ));
-        receipt_is_landable(repo.path(), &dead, &sha).expect("a dead-guard witness lands");
+        receipt_is_landable(repo.path(), &dead, &sha, None).expect("a dead-guard witness lands");
     }
 
     /// bd-m5afp review (captain re-verify): the receipt must prove the commit
@@ -1511,7 +1568,7 @@ live-verified. Record one BEFORE closing."#;
         ));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &wrong_tree, &sha).unwrap_err()
+            receipt_is_landable(repo.path(), &wrong_tree, &sha, None).unwrap_err()
         );
         assert!(
             err.contains("proves") && err.contains(&other[..7]),
@@ -1523,7 +1580,7 @@ live-verified. Record one BEFORE closing."#;
         ));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &dirty, &sha).unwrap_err()
+            receipt_is_landable(repo.path(), &dirty, &sha, None).unwrap_err()
         );
         assert!(err.contains("dirty tree"), "{err}");
 
@@ -1532,7 +1589,7 @@ live-verified. Record one BEFORE closing."#;
         let docs_only = receipt(&format!(
             r#"{{"ok":true,"sha":"{sha}","mode":"sha","mutations":[],"mutations_mode":"changed","mutations_base":"{base}","changed_paths":["docs/guide.mdx","src/uncovered.rs"]}}"#
         ));
-        receipt_is_landable(repo.path(), &docs_only, &sha)
+        receipt_is_landable(repo.path(), &docs_only, &sha, None)
             .expect("a diff that touches no spec target may land");
 
         // Same shape, but one changed path IS a spec target.
@@ -1541,7 +1598,7 @@ live-verified. Record one BEFORE closing."#;
         ));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &covered, &sha).unwrap_err()
+            receipt_is_landable(repo.path(), &covered, &sha, None).unwrap_err()
         );
         assert!(
             err.contains("demo.spec.sh"),
@@ -1554,7 +1611,7 @@ live-verified. Record one BEFORE closing."#;
         ));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &bare, &sha).unwrap_err()
+            receipt_is_landable(repo.path(), &bare, &sha, None).unwrap_err()
         );
         assert!(err.contains("no mutation run"), "{err}");
 
@@ -1564,7 +1621,7 @@ live-verified. Record one BEFORE closing."#;
         ));
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &bogus_base, &sha).unwrap_err()
+            receipt_is_landable(repo.path(), &bogus_base, &sha, None).unwrap_err()
         );
         assert!(err.contains("not a commit here"), "{err}");
     }
@@ -1673,12 +1730,12 @@ live-verified. Record one BEFORE closing."#;
             path
         };
 
-        receipt_is_landable(repo.path(), &receipt(&proven), &citing)
+        receipt_is_landable(repo.path(), &receipt(&proven), &citing, None)
             .expect("a receipt proving a descendant of the citing commit lands");
 
         let err = format!(
             "{:#}",
-            receipt_is_landable(repo.path(), &receipt(&citing), &proven).unwrap_err()
+            receipt_is_landable(repo.path(), &receipt(&citing), &proven, None).unwrap_err()
         );
         assert!(
             err.contains("does not contain") && err.contains(&citing[..7]),
@@ -2000,7 +2057,7 @@ live-verified. Record one BEFORE closing."#;
             .to_string(),
         )
         .expect("write receipt");
-        let landed = receipt_is_landable(dir.path(), &receipt, &sha);
+        let landed = receipt_is_landable(dir.path(), &receipt, &sha, None);
         assert!(
             landed.is_ok(),
             "a cached row with a bare spec must land: {landed:?}"
@@ -2014,7 +2071,7 @@ live-verified. Record one BEFORE closing."#;
         let sha = git_in(dir.path(), &["rev-parse", "HEAD"]);
         let receipt = dir.path().join("receipt.json");
         no_mutation_receipt_mode(&receipt, &sha, "witnesses");
-        let err = receipt_is_landable(dir.path(), &receipt, &sha)
+        let err = receipt_is_landable(dir.path(), &receipt, &sha, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("demo.spec.sh"), "without witnesses: {err}");
@@ -2023,7 +2080,7 @@ live-verified. Record one BEFORE closing."#;
             .expect("cache key");
         store_witness(&sha, &key);
         assert!(
-            receipt_is_landable(dir.path(), &receipt, &sha).is_ok(),
+            receipt_is_landable(dir.path(), &receipt, &sha, None).is_ok(),
             "a witness-mode proof with harness witnesses lands"
         );
     }
@@ -2038,7 +2095,7 @@ live-verified. Record one BEFORE closing."#;
         store_witness(&sha, &key);
         let receipt = dir.path().join("receipt.json");
         no_mutation_receipt(&receipt, &sha);
-        assert!(receipt_is_landable(dir.path(), &receipt, &sha).is_ok());
+        assert!(receipt_is_landable(dir.path(), &receipt, &sha, None).is_ok());
     }
 
     #[test]
@@ -2048,7 +2105,7 @@ live-verified. Record one BEFORE closing."#;
         let sha = git_in(dir.path(), &["rev-parse", "HEAD"]);
         let receipt = dir.path().join("receipt.json");
         no_mutation_receipt(&receipt, &sha);
-        let err = receipt_is_landable(dir.path(), &receipt, &sha)
+        let err = receipt_is_landable(dir.path(), &receipt, &sha, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -2069,7 +2126,7 @@ live-verified. Record one BEFORE closing."#;
         let sha = git_in(dir.path(), &["rev-parse", "HEAD"]);
         let receipt = dir.path().join("receipt.json");
         no_mutation_receipt(&receipt, &sha);
-        let err = receipt_is_landable(dir.path(), &receipt, &sha)
+        let err = receipt_is_landable(dir.path(), &receipt, &sha, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -2101,12 +2158,79 @@ live-verified. Record one BEFORE closing."#;
         let newer = git_in(dir.path(), &["rev-parse", "HEAD"]);
         let receipt = dir.path().join("receipt.json");
         no_mutation_receipt(&receipt, &newer);
-        let err = receipt_is_landable(dir.path(), &receipt, &newer)
+        let err = receipt_is_landable(dir.path(), &receipt, &newer, None)
             .unwrap_err()
             .to_string();
         assert!(
             err.contains("demo.spec.sh"),
             "the spec must be named: {err}"
         );
+    }
+
+    /// bd-9i0e3: with --repo, containment is about the sibling rev the proven
+    /// flywheel commit pinned, not about the flywheel repo's own history.
+    #[test]
+    fn sibling_containment_uses_the_pinned_sibling_rev() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let fly = workspace.path().join("flywheel");
+        let sib = workspace.path().join("sib");
+        std::fs::create_dir_all(&fly).unwrap();
+        std::fs::create_dir_all(&sib).unwrap();
+        let git_at = |dir: &std::path::Path, args: &[&str]| -> String {
+            let out = Command::new("git")
+                .current_dir(dir)
+                .args(["-c", "user.email=t@example.com", "-c", "user.name=T"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git_at(&sib, &["init", "-q"]);
+        git_at(&fly, &["init", "-q"]);
+
+        std::fs::write(sib.join("a"), "a").unwrap();
+        git_at(&sib, &["add", "a"]);
+        git_at(&sib, &["commit", "-qm", "sibling work"]);
+        let w = git_at(&sib, &["rev-parse", "HEAD"]);
+        std::fs::write(sib.join("b"), "b").unwrap();
+        git_at(&sib, &["add", "b"]);
+        git_at(&sib, &["commit", "-qm", "sibling pin"]);
+        let s = git_at(&sib, &["rev-parse", "HEAD"]);
+        // A commit on a side branch is NOT an ancestor of the pinned rev.
+        git_at(&sib, &["checkout", "-qb", "side", &w]);
+        std::fs::write(sib.join("c"), "c").unwrap();
+        git_at(&sib, &["add", "c"]);
+        git_at(&sib, &["commit", "-qm", "other work"]);
+        let x = git_at(&sib, &["rev-parse", "HEAD"]);
+
+        std::fs::write(
+            fly.join("proof.toml"),
+            format!("[[sibling]]\npath = \"../sib\"\nrev = \"{s}\"\n"),
+        )
+        .unwrap();
+        git_at(&fly, &["add", "proof.toml"]);
+        git_at(&fly, &["commit", "-qm", "pin sibling"]);
+        let p = git_at(&fly, &["rev-parse", "HEAD"]);
+
+        let receipt = workspace.path().join("receipt.json");
+        std::fs::write(
+            &receipt,
+            format!(
+                "{{\"ok\":true,\"sha\":\"{p}\",\"mutations\":[{{\"spec\":\"ad-hoc\",\"id\":\"D1\",\"verdict\":\"RED\",\"expect_test\":\"t\"}}]}}"
+            ),
+        )
+        .unwrap();
+
+        receipt_is_landable(&fly, &receipt, &w, Some(&sib))
+            .expect("a commit contained by the pinned sibling rev lands");
+        let err = receipt_is_landable(&fly, &receipt, &x, Some(&sib))
+            .expect_err("a commit outside the pinned rev is refused");
+        assert!(err.to_string().contains(&s), "names the pinned rev: {err}");
+        assert!(err.to_string().contains(&x), "names the refused sha: {err}");
     }
 }
