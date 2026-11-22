@@ -8,5 +8,5 @@ TEST_FILTER=(stack_check_fails_when_the_toron_address_refuses_connections)
 mutation "R1  stack check ignores daemon reachability" \
     file=src/cmd/stack.rs \
     expect=stack_check_fails_when_the_toron_address_refuses_connections \
-    find=$'        || toron_restart_required\n        || !toron_reachable_now;' \
-    replace=$'        || toron_restart_required\n        || false;'
+    find=$'        || toron_restart_required\n        || !toron_reachable_now\n        || logrotate_plist_invalid();' \
+    replace=$'        || toron_restart_required\n        || false\n        || logrotate_plist_invalid();'

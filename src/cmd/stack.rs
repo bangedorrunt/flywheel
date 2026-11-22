@@ -3,7 +3,7 @@
 //! installer script so there is still exactly one install authority.
 
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -243,6 +243,25 @@ fn toron_reachable(addr: &str) -> bool {
         .any(|sa| TcpStream::connect_timeout(&sa, Duration::from_millis(500)).is_ok())
 }
 
+/// bd-9zw9u: an invalid logrotate side plist survives an install that never
+/// calls `toron daemon install`, so the native status door must report it too.
+fn logrotate_plist_invalid_at(path: &Path) -> bool {
+    if !cfg!(target_os = "macos") || !path.is_file() {
+        return false;
+    }
+    Command::new("plutil")
+        .args(["-lint", path.to_str().unwrap_or_default()])
+        .output()
+        .map(|out| !out.status.success())
+        .unwrap_or(false)
+}
+
+fn logrotate_plist_invalid() -> bool {
+    dirs::home_dir()
+        .map(|home| home.join("Library/LaunchAgents/com.toron.logrotate.plist"))
+        .is_some_and(|path| logrotate_plist_invalid_at(&path))
+}
+
 fn binary_json(binary: &BinaryProbe) -> Value {
     json!({
         "name": binary.name,
@@ -396,7 +415,8 @@ fn stack_status(cfg: &Config, json_output: bool, check: bool) -> Result<()> {
         || !stale_pids.is_empty()
         || toron.is_none()
         || toron_restart_required
-        || !toron_reachable_now;
+        || !toron_reachable_now
+        || logrotate_plist_invalid();
 
     if json_output {
         print_json(&json!({
@@ -659,6 +679,22 @@ pub(crate) fn installed_flywheel_version() -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    #[test]
+    fn invalid_logrotate_plist_is_detected() {
+        let root = std::env::temp_dir().join(format!("fw-logrotate-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("com.toron.logrotate.plist");
+        std::fs::write(&path, "<string>cp a && b</string>").unwrap();
+        assert!(super::logrotate_plist_invalid_at(&path));
+        std::fs::write(
+            &path,
+            r#"<?xml version="1.0"?><plist version="1.0"><dict/></plist>"#,
+        )
+        .unwrap();
+        assert!(!super::logrotate_plist_invalid_at(&path));
+        std::fs::remove_dir_all(&root).ok();
+    }
 
     /// bd-4bxtl: health is the address the daemon answers on, not a build
     /// record. A stale build record alone must not make `stack: ok`.

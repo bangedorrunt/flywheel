@@ -46,6 +46,49 @@ die() {
   exit 2
 }
 
+# bd-9zw9u: the toron logrotate LaunchAgent is written by toron's own install,
+# which stack install does not call. A host installed by an older binary keeps
+# the invalid raw-&& plist forever, so rewrite it here when it fails plutil.
+LOGROTATE_PLIST="${HOME:-}/Library/LaunchAgents/com.toron.logrotate.plist"
+
+logrotate_plist_valid() {
+  [ -n "${HOME:-}" ] || return 0
+  [ -f "$LOGROTATE_PLIST" ] || return 0
+  command -v plutil >/dev/null 2>&1 || return 0
+  plutil -lint "$LOGROTATE_PLIST" >/dev/null 2>&1
+}
+
+rewrite_logrotate_plist() {
+  if logrotate_plist_valid; then
+    return 0
+  fi
+  [ -n "${HOME:-}" ] || return 0
+  if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'dry-run: rewrite %s\n' "$LOGROTATE_PLIST"
+    return 0
+  fi
+  mkdir -p "$(dirname "$LOGROTATE_PLIST")"
+  cat >"$LOGROTATE_PLIST" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.toron.logrotate</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>for f in "$HOME/.local/state/toron/serve.out.log" "$HOME/.local/state/toron/serve.err.log"; do [ -f "$f" ] || continue; sz=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f"); if [ "$sz" -gt 1048576 ]; then cp "$f" "$f.1" &amp;&amp; : > "$f"; fi; done</string>
+	</array>
+	<key>StartInterval</key>
+	<integer>3600</integer>
+</dict>
+</plist>
+PLIST
+  echo "rewrote invalid toron logrotate plist: $LOGROTATE_PLIST"
+}
+
 usage() {
   sed -n '2,25p' "$0"
   exit "${1:-0}"
@@ -269,6 +312,15 @@ show_status() {
     bad=1
   fi
 
+  if [ -n "${HOME:-}" ] && [ -f "$LOGROTATE_PLIST" ]; then
+    if command -v plutil >/dev/null 2>&1 && ! plutil -lint "$LOGROTATE_PLIST" >/dev/null 2>&1; then
+      echo "invalid plist: $LOGROTATE_PLIST" >&2
+      bad=1
+    else
+      echo "com.toron.logrotate.plist: ok"
+    fi
+  fi
+
   if [ "$CHECK" -eq 1 ] && [ "$bad" -ne 0 ]; then
     return 1
   fi
@@ -354,6 +406,8 @@ do_install() {
     run rm -rf "$ext_dir"
     run cp -R "$ext_src" "$ext_dir"
   fi
+
+  rewrite_logrotate_plist
 
   if [ "$(uname -s)" = "Darwin" ] && [ "$NO_CODESIGN" -eq 0 ]; then
     while IFS= read -r bin; do
