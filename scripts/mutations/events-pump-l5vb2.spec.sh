@@ -6,6 +6,7 @@ TEST_FILTER=(
     the_fetch_journal_lands_before_the_rpc_invoke
     a_poll_page_after_a_stream_failure_still_emits_one_hint
     flag_off_spawns_no_pump
+    events_pumps_are_armed_by_project_not_workspace
     the_same_bus_event_id_rings_once_across_wake_sock_and_events
     a_gap_collapses_to_one_digest_msg
 )
@@ -23,6 +24,15 @@ mutation "P1  a failed stream never falls back to poll" \
     expect=a_poll_page_after_a_stream_failure_still_emits_one_hint \
     find='                Ok(page_from_poll(&result))' \
     replace='                Err("poll fallback disabled".to_string())'
+
+mutation "A1  the daemon arms events pumps with the workspace, not the project" \
+    file=src/doorbell_host.rs \
+    expect=events_pumps_are_armed_by_project_not_workspace \
+    find='    // bd-rrlo2: the pump arms from the SPAWN REGISTRY, which is keyed by
+    // project — passing the workspace (session id) found no seats and left
+    // the events path inert even after the token mint was fixed.
+    spawn_events_pumps(&cfg, project, &tx);' \
+    replace='    spawn_events_pumps(&cfg, workspace, &tx);'
 
 mutation "F1  the flag-off guard is removed so a seat is spawned anyway" \
     file=src/events_source.rs \

@@ -1996,7 +1996,10 @@ async fn run_embedded_async(
         });
     let store = FileStore::new(config::state_dir());
     // bd-l5vb2: arm the opt-in toron events source alongside wake.sock.
-    spawn_events_pumps(&cfg, workspace, &tx);
+    // bd-rrlo2: the pump arms from the SPAWN REGISTRY, which is keyed by
+    // project — passing the workspace (session id) found no seats and left
+    // the events path inert even after the token mint was fixed.
+    spawn_events_pumps(&cfg, project, &tx);
     let watch_slot = host.wake_task.clone();
     let bus_fw = wake_forwarder(
         &tx,
@@ -4721,5 +4724,20 @@ mod bd_8uozb_rearm_tests {
         assert_eq!(push_rearm_backoff(0), Duration::from_secs(2));
         assert_eq!(push_rearm_backoff(3), Duration::from_secs(16));
         assert_eq!(push_rearm_backoff(99), Duration::from_secs(32));
+    }
+}
+
+#[cfg(test)]
+mod events_pump_arming_tests {
+    /// bd-rrlo2: the pump reads the spawn registry, which is keyed by PROJECT.
+    /// Arming it with the workspace (session id) finds no seats and leaves the
+    /// events path inert; the live witness cannot see a journal row then.
+    #[test]
+    fn events_pumps_are_armed_by_project_not_workspace() {
+        let src = crate::test_source::crate_source();
+        assert!(
+            src.contains("spawn_events_pumps(&cfg, project, &tx);"),
+            "the daemon must arm events pumps with the project key"
+        );
     }
 }
