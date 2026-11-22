@@ -473,6 +473,17 @@ mod tests {
 
     #[test]
     fn ship_routes_through_the_gated_chain_goal_direct_stays_plain() {
+        // bd-ihiqo.1: this chain writes project logs through state_dir(). A
+        // test must never leave a 900 KB project log in the operator's real
+        // state dir — scope every write through TestSandbox.
+        let _env = crate::config::lock_env();
+        let live_log = crate::config::state_dir().join("bd-cvv9-test.jsonl");
+        let live_before = std::fs::metadata(&live_log)
+            .ok()
+            .map(|m| (m.len(), m.modified().ok()));
+        let sandbox = flywheel_test_sandbox::TestSandbox::new();
+        let scope = sandbox.scope();
+
         let wfs = crate::builtin_workflows::builtin_workflows();
         let ship = wfs.get("ship").expect("ship builtin").clone();
         let goal_direct = wfs.get("goal-direct").expect("goal-direct").clone();
@@ -489,7 +500,7 @@ mod tests {
             Some(report_runner()),
         )
         .expect("local engine");
-        let tmp = std::env::temp_dir();
+        let tmp = sandbox.root().to_path_buf();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -545,5 +556,16 @@ mod tests {
             .expect("plain invoke completes")
         });
         assert!(out2.get("gates").is_none(), "no chain gates on plain runs");
+
+        drop(scope);
+        let live_after = std::fs::metadata(&live_log)
+            .ok()
+            .map(|m| (m.len(), m.modified().ok()));
+        assert_eq!(
+            live_before,
+            live_after,
+            "a test wrote to the real state dir ({})",
+            live_log.display()
+        );
     }
 }
