@@ -10,9 +10,7 @@ TEST_FILTER=(
     workflow_lowering_can_finish_names_stranded_state
     workflow_lowering_unbounded_back_edge_named
     workflow_lowering_approval_without_timeout_fails
-    stage_contract_judge_arms_without_arms_fails
     wave_swarm_missing_witness_fails_at_result_timeout
-    wave_swarm_no_marker_reads
     durable_body_witness_fail_goes_to_on_error
     durable_body_witness_missing_report_fails
 )
@@ -79,14 +77,6 @@ mutation "T1  an approval with no timeout is not recorded as unbounded" \
                 let _ = timeout_secs;
             }'
 
-# J1 — A1: the judge-arms stage stops declaring the read the lint exists to
-# demand, so a workflow dispatching it with no arms step lints clean.
-mutation "J1  judge-arms stops declaring its arms read" \
-    file=src/stages.rs \
-    expect=stage_contract_judge_arms_without_arms_fails \
-    find='    ("judge-arms", &["steps.arms"]),' \
-    replace='    ("judge-arms", &[]),'
-
 # X1 — A3: the graph node's own deadline is dropped, so a coder that never
 # writes a witness waits forever instead of failing at result_timeout.
 mutation "X1  a graph dispatch's await loses its deadline" \
@@ -108,13 +98,6 @@ mutation "X1  a graph dispatch's await loses its deadline" \
                         _ => (None, false),
                     };' \
     replace='                    let (deadline, claimed) = (None, false);'
-
-# M1 — A3/D4.4: a step reads a completion marker again.
-mutation "M1  the wave reads a .done marker again" \
-    file=src/builtin_workflows.rs \
-    expect=wave_swarm_no_marker_reads \
-    find="        task: 'Execute bead {{item.id}} ({{item.title}}) for {{inputs.objective}}." \
-    replace="        task: 'test -f .flywheel/.done && Execute bead {{item.id}} ({{item.title}}) for {{inputs.objective}}."
 
 # W1 — D4.2: a failing witness settles instead of failing through on_error.
 mutation "W1  a failing witness settles as success" \

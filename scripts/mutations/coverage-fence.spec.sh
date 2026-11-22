@@ -7,7 +7,6 @@
 CARGO_ARGS=(--bin flywheel)
 TEST_FILTER=(
     the_coverage_fence_seeds_once_and_never_shrinks
-    beads_lifecycle_plan_polish_loop
 )
 
 mutation "C1  a dropped requirement is not a coverage failure" \
@@ -19,9 +18,3 @@ mutation "C1  a dropped requirement is not a coverage failure" \
         .cloned()
         .collect();' \
     replace='    let mut missing: Vec<String> = Vec::new();'
-
-mutation "W1  the polish loop converges without the coverage fence" \
-    file=src/builtin_workflows.rs \
-    expect=beads_lifecycle_plan_polish_loop \
-    find="      until: 'steps_fence_ok == true && steps_converged_ok == true && steps_coverage_ok == true'" \
-    replace="      until: 'steps_fence_ok == true && steps_converged_ok == true'"

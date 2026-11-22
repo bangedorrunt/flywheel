@@ -299,7 +299,7 @@ owner = "src/builtin_workflows.rs"
 status = "proven"
 concurrent = false
 tests = [
-  "src/builtin_workflows.rs::triage_deep_crew_comes_from_the_workflow_not_a_seat",
+  "src/builtin_workflows.rs::purpose_named_workflows_are_crew_auto",
 ]
 mutations = [
   "scripts/mutations/triage-crew.spec.sh#S1",
@@ -338,11 +338,9 @@ concurrent = false
 tests = [
   "src/plan_fence.rs::coverage_shrink_names_every_dropped_requirement",
   "src/plan_fence.rs::the_coverage_fence_seeds_once_and_never_shrinks",
-  "src/builtin_workflows.rs::beads_lifecycle_plan_polish_loop",
 ]
 mutations = [
   "scripts/mutations/coverage-fence.spec.sh#C1",
-  "scripts/mutations/coverage-fence.spec.sh#W1",
 ]
 
 [[behavior]]
@@ -465,7 +463,6 @@ concurrent = false
 tests = [
   "src/builtin_workflows.rs::every_scheduled_catalog_workflow_opens_on_the_durable_models",
   "src/builtin_workflows.rs::every_published_workflow_is_durable_or_legacy_by_design",
-  "src/builtin_workflows.rs::weekly_review_is_scout_fanout_to_oracle",
   "src/builtin_workflows.rs::a_graph_parallel_node_is_refused_by_the_durable_models",
 ]
 mutations = [

@@ -175,7 +175,7 @@ pub struct RouteEntry {
 /// position, then longest needle — never first-match-wins.
 pub static ROUTING_TABLE: &[RouteEntry] = &[
     RouteEntry {
-        primitive: "captain-audit",
+        primitive: "ce-review",
         matchers: &["audit", "read-only", "analyze"],
         topology: "open",
         gate: RouteGate::NoImplement,
@@ -183,7 +183,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "read-only analysis — captain-audit headless",
     },
     RouteEntry {
-        primitive: "bug-fix",
+        primitive: "ce-debug",
         matchers: &["repro", "regression", "bug-fix"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -191,7 +191,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "repro/regression/bug-shaped fix — bug-fix workflow (repro first)",
     },
     RouteEntry {
-        primitive: "bug-fix",
+        primitive: "ce-debug",
         matchers: &[
             "bug", "crash", "panic", "leak", "broken", "failing", "error",
         ],
@@ -201,7 +201,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "repro/regression/bug-shaped fix — bug-fix workflow (repro first)",
     },
     RouteEntry {
-        primitive: "refactoring",
+        primitive: "ce-measure",
         matchers: &["refactor"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -209,7 +209,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "refactor — refactoring workflow (invariant stays green)",
     },
     RouteEntry {
-        primitive: "prototype",
+        primitive: "ce-bakeoff",
         matchers: &["prototype", "sketch", "mock"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -217,7 +217,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "prototype/sketch — prototype workflow (2-3 arms, oracle picks)",
     },
     RouteEntry {
-        primitive: "arena",
+        primitive: "ce-bakeoff",
         matchers: &["arena"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -225,7 +225,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "arena — model race on one brief (declared selection rule)",
     },
     RouteEntry {
-        primitive: "perf",
+        primitive: "ce-measure",
         matchers: &["perf", "p95", "slow"],
         topology: "swarm",
         gate: RouteGate::NoImplement,
@@ -233,7 +233,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "perf/p95/slow — perf workflow (metric + budget)",
     },
     RouteEntry {
-        primitive: "hillclimb",
+        primitive: "ce-measure",
         matchers: &[
             "hillclimb",
             "until it improves",
@@ -248,7 +248,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "hillclimb — hillclimb workflow (one commit per accepted win)",
     },
     RouteEntry {
-        primitive: "forensics",
+        primitive: "ce-debug",
         matchers: &[
             "forensic",
             "diagnose",
@@ -263,7 +263,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "forensics — diagnosis only, no fix step (bug-fix consumes Act-on)",
     },
     RouteEntry {
-        primitive: "babysit-bead",
+        primitive: "ce-resume",
         matchers: &["babysit"],
         topology: "open",
         gate: RouteGate::Babysit,
@@ -271,7 +271,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "babysit a bead — babysit-bead workflow (no new beads)",
     },
     RouteEntry {
-        primitive: "pickup",
+        primitive: "ce-resume",
         matchers: &["pickup", "resume session"],
         topology: "open",
         gate: RouteGate::Always,
@@ -279,7 +279,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "pickup / resume session — pickup workflow",
     },
     RouteEntry {
-        primitive: "pause",
+        primitive: "ce-resume",
         matchers: &["pause", "going offline"],
         topology: "open",
         gate: RouteGate::Always,
@@ -287,7 +287,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "pause / going offline — checkpoint + standing handoff",
     },
     RouteEntry {
-        primitive: "interrogate",
+        primitive: "ce-review",
         matchers: &["interrogate", "tear this apart", "adversarial review"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -303,7 +303,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "no matching playbook — planner compose, lint is the gate",
     },
     RouteEntry {
-        primitive: "ship-beads",
+        primitive: "ce-resume",
         matchers: &["ship beads", "land the beads"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -311,7 +311,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "ship beads — ledger-green then housekeeper commit",
     },
     RouteEntry {
-        primitive: "feature",
+        primitive: "ce-lfg",
         matchers: &["feature"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -319,7 +319,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "feature — feature workflow (shape -> build -> prove)",
     },
     RouteEntry {
-        primitive: "goal",
+        primitive: "ce-lfg",
         matchers: &["goal"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -327,7 +327,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "goal — meta-workflow (ce-brainstorm -> plan -> beads -> build)",
     },
     RouteEntry {
-        primitive: "triage-deep",
+        primitive: "ce-triage",
         matchers: &["triage-deep", "triage deep", "deep triage"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -335,7 +335,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "triage-deep — deep backlog triage (bv robot-triage -> spawn crew)",
     },
     RouteEntry {
-        primitive: "triage",
+        primitive: "ce-triage",
         matchers: &["triage"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -343,7 +343,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "triage — inbound message triage (ack + dispatch)",
     },
     RouteEntry {
-        primitive: "weekly-review",
+        primitive: "ce-retro",
         matchers: &["weekly-review", "weekly review"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -351,7 +351,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "weekly-review — weekly repo review (scout fanout -> oracle idea)",
     },
     RouteEntry {
-        primitive: "autonomous-work",
+        primitive: "ce-resume",
         matchers: &["autonomous-work", "autonomous work"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -359,7 +359,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "autonomous-work — autonomous overnight work (loop run --work then ship)",
     },
     RouteEntry {
-        primitive: "reflect",
+        primitive: "ce-compound",
         matchers: &["reflect"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -380,7 +380,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "ce-compound — run the compound gate over verified work (chiebukuro)",
     },
     RouteEntry {
-        primitive: "ce-sweep",
+        primitive: "ce-compound",
         matchers: &["sweep the learnings", "learning sweep", "compound-refresh"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -388,7 +388,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "ce-sweep — maintain chiebukuro lessons (keep/update/consolidate/forget)",
     },
     RouteEntry {
-        primitive: "awareness-digest",
+        primitive: "ce-retro",
         matchers: &["awareness-digest", "awareness digest"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -396,7 +396,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "awareness-digest — captain digest (presence + reservations + guard)",
     },
     RouteEntry {
-        primitive: "onboard",
+        primitive: "ce-lfg",
         matchers: &["onboard"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -427,7 +427,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "one pane — spawn --profile <role> --count 1, then send --to <full-name> --wait (never --oc)",
     },
     RouteEntry {
-        primitive: "wave-swarm",
+        primitive: "ce-lfg",
         matchers: &["wave-swarm", "wave swarm"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -437,7 +437,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "wave-swarm — composed wave swarm (GATE -> DISPATCH -> OBSERVE -> VERIFY -> SIGNOFF)",
     },
     RouteEntry {
-        primitive: "repair-until-verified",
+        primitive: "ce-debug",
         matchers: &[
             "repair-until-verified",
             "repair until verified",
@@ -456,7 +456,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "repair-until-verified — compose --parts repair-until-verified --run",
     },
     RouteEntry {
-        primitive: "beads-lifecycle",
+        primitive: "ce-lfg",
         matchers: &["beads-lifecycle", "beads lifecycle"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -466,7 +466,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "beads-lifecycle — compose --parts beads-lifecycle --run",
     },
     RouteEntry {
-        primitive: "debate",
+        primitive: "ce-review",
         matchers: &[
             "argue both sides",
             "devil's advocate",
@@ -479,7 +479,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "debate — adversarial briefs, oracle decides",
     },
     RouteEntry {
-        primitive: "ce-brainstorm",
+        primitive: "ce-lfg",
         matchers: &[
             "brainstorm",
             "sharpen the requirements",
@@ -492,7 +492,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "ce-brainstorm — requirements-first ideation (oracles diverge, planner reduces)",
     },
     RouteEntry {
-        primitive: "ce-plan",
+        primitive: "ce-lfg",
         matchers: &[
             "break this down",
             "bead-ready plan",
@@ -505,7 +505,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "ce-plan — goal to bead-ready plan, approval gate",
     },
     RouteEntry {
-        primitive: "ship",
+        primitive: "ce-lfg",
         matchers: &[
             "ship the chain",
             "run the ship",
@@ -518,7 +518,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "ship — resolve to verify gated chain",
     },
     RouteEntry {
-        primitive: "beads",
+        primitive: "ce-lfg",
         matchers: &[
             "convert to beads",
             "file these as beads",
@@ -596,25 +596,6 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
     },
 ];
 
-/// Phrases that mean "keep repairing until the check passes".
-const UNTIL_GREEN: &[&str] = &[
-    "until green",
-    "until it passes",
-    "until the tests pass",
-    "until verified",
-    "keep repairing",
-    "repair until",
-];
-
-/// Phrases that mean "repeat the measurement and keep only wins".
-const CLIMB: &[&str] = &[
-    "until it improves",
-    "keep only the wins",
-    "keep measuring",
-    "measured improvement",
-    "climb until",
-];
-
 /// Earliest match position, longest needle on ties: among the needles of
 /// one row that hit, the smallest index wins and the longest needle breaks
 /// index ties. Returns (pos, len).
@@ -630,12 +611,6 @@ impl RouteEntry {
     /// (empty goal, contention with no keyword) sort last so an explicit
     /// mention always beats world state.
     fn match_key(&self, t: &str, implement: bool, snap: &Snapshot) -> Option<(usize, usize)> {
-        if self.primitive == "bug-fix" && has(t, UNTIL_GREEN) {
-            return None;
-        }
-        if self.primitive == "perf" && has(t, CLIMB) {
-            return None;
-        }
         match self.gate {
             RouteGate::Always => earliest_hit(self.matchers, t),
             RouteGate::NoImplement => (!implement)
@@ -1220,9 +1195,9 @@ mod tests {
             "analyze the spawn backlog",
         ] {
             let d = decide(t, &with_beads(5));
-            assert_eq!(d.primitive, "captain-audit", "target: {t}");
+            assert_eq!(d.primitive, "ce-review", "target: {t}");
             assert!(
-                d.argv.contains(&"captain-audit".to_string()),
+                d.argv.contains(&"ce-review".to_string()),
                 "argv: {:?}",
                 d.argv
             );
@@ -1278,14 +1253,14 @@ mod tests {
             "diagnose flywheel x toron x beads friction: mid-session workflow use",
             &with_beads(3),
         );
-        assert_eq!(d.primitive, "forensics", "argv: {:?}", d.argv);
+        assert_eq!(d.primitive, "ce-debug", "argv: {:?}", d.argv);
         assert_eq!(d.topology, "open");
     }
 
     #[test]
     fn leftover_ready_beads_do_not_steal_beads_lifecycle_token() {
         let d = decide("beads-lifecycle for an existing open bead", &with_beads(3));
-        assert_eq!(d.primitive, "beads-lifecycle", "argv: {:?}", d.argv);
+        assert_eq!(d.primitive, "ce-lfg", "argv: {:?}", d.argv);
         assert!(
             d.argv
                 .windows(2)
@@ -1326,29 +1301,6 @@ mod tests {
     }
 
     #[test]
-    fn wave_swarm_with_2_crews_is_wave_swarm_with_crew_2() {
-        let d = decide("wave-swarm with 2 crews", &snap());
-        assert_eq!(d.primitive, "wave-swarm");
-        assert_eq!(d.topology, "swarm");
-        assert!(
-            d.argv.windows(2).any(|w| w == ["--crew", "2"]),
-            "argv: {:?}",
-            d.argv
-        );
-    }
-
-    #[test]
-    fn wave_swarm_3_crews_honors_n() {
-        let d = decide("wave-swarm 3 crews", &snap());
-        assert_eq!(d.primitive, "wave-swarm");
-        assert!(
-            d.argv.windows(2).any(|w| w == ["--crew", "3"]),
-            "{:?}",
-            d.argv
-        );
-    }
-
-    #[test]
     fn beadless_profile_only_is_not_wave_swarm() {
         for t in ["spawn --profile coder", "wave-swarm --profile coder"] {
             let d = decide(t, &with_beads(0));
@@ -1357,7 +1309,7 @@ mod tests {
         }
         let d = decide("wave-swarm --profile coder", &with_beads(3));
         assert_eq!(
-            d.primitive, "wave-swarm",
+            d.primitive, "ce-lfg",
             "declared trigger with beads still routes: {:?}",
             d.argv
         );
@@ -1437,14 +1389,12 @@ mod tests {
     fn repair_until_verified_routes_to_recipe() {
         for t in ["repair until verified", "repair-until-verified the panic"] {
             let d = decide(t, &snap());
-            assert_eq!(d.primitive, "repair-until-verified", "target: {t}");
+            assert_eq!(d.primitive, "ce-debug", "target: {t}");
             assert!(
                 d.argv.contains(&"compose".to_string()),
                 "argv: {:?}",
                 d.argv
             );
-            assert!(d.argv.contains(&"repair-until-verified".to_string()));
-            assert!(d.argv.contains(&"--run".to_string()));
         }
     }
 
@@ -1567,7 +1517,7 @@ mod tests {
     static SPEC8_CASES: &[Spec8Case] = &[
         Spec8Case {
             row: "row2",
-            primitive: Some("bug-fix"),
+            primitive: Some("ce-debug"),
             targets: &[
                 "repro the scroll drift",
                 "fix the repro",
@@ -1575,47 +1525,47 @@ mod tests {
                 "fix the memory leak",
             ],
             not_primitive: &[],
-            argv_has: &["bug-fix", "pane"],
+            argv_has: &["ce-debug", "pane"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row3",
-            primitive: Some("refactoring"),
+            primitive: Some("ce-measure"),
             targets: &["refactor the auth layer", "refactoring the loop dispatch"],
             not_primitive: &[],
-            argv_has: &["refactoring"],
+            argv_has: &["ce-measure"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row4",
-            primitive: Some("prototype"),
+            primitive: Some("ce-bakeoff"),
             targets: &[
                 "prototype the data shape",
                 "sketch the state machine",
                 "mock it up before we build",
             ],
             not_primitive: &[],
-            argv_has: &["prototype"],
+            argv_has: &["ce-bakeoff"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row5",
-            primitive: Some("arena"),
+            primitive: Some("ce-bakeoff"),
             targets: &["arena two models on this brief"],
             not_primitive: &[],
-            argv_has: &["arena"],
+            argv_has: &["ce-bakeoff"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row6",
-            primitive: Some("perf"),
+            primitive: Some("ce-measure"),
             targets: &[
                 "profile the p95 latency",
                 "dispatch is slow",
                 "perf the ingest path",
             ],
             not_primitive: &[],
-            argv_has: &["perf"],
+            argv_has: &["ce-measure"],
             argv_lacks: &[],
         },
         Spec8Case {
@@ -1628,15 +1578,15 @@ mod tests {
         },
         Spec8Case {
             row: "row7",
-            primitive: Some("hillclimb"),
+            primitive: Some("ce-measure"),
             targets: &["hillclimb the sharpe ratio"],
             not_primitive: &[],
-            argv_has: &["hillclimb"],
+            argv_has: &["ce-measure"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row8",
-            primitive: Some("forensics"),
+            primitive: Some("ce-debug"),
             targets: &[
                 "profile the idle cpu spin",
                 "forensic trace of the crash",
@@ -1644,12 +1594,12 @@ mod tests {
                 "spindump the hung pane",
             ],
             not_primitive: &[],
-            argv_has: &["forensics", "headless"],
+            argv_has: &["ce-debug", "headless"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row8-guard",
-            primitive: Some("bug-fix"),
+            primitive: Some("ce-debug"),
             targets: &["fix the memory leak"],
             not_primitive: &["forensics"],
             argv_has: &[],
@@ -1657,10 +1607,10 @@ mod tests {
         },
         Spec8Case {
             row: "row9",
-            primitive: Some("babysit-bead"),
+            primitive: Some("ce-resume"),
             targets: &["babysit the bd-w2-ops-szky bead"],
             not_primitive: &[],
-            argv_has: &["babysit-bead"],
+            argv_has: &["ce-resume"],
             argv_lacks: &[],
         },
         Spec8Case {
@@ -1673,33 +1623,33 @@ mod tests {
         },
         Spec8Case {
             row: "row10",
-            primitive: Some("pickup"),
+            primitive: Some("ce-resume"),
             targets: &[
                 "pickup the stranded session",
                 "resume session after the reboot",
             ],
             not_primitive: &[],
-            argv_has: &["pickup"],
+            argv_has: &["ce-resume"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row11",
-            primitive: Some("pause"),
+            primitive: Some("ce-resume"),
             targets: &["pause the swarm", "going offline for the night"],
             not_primitive: &[],
-            argv_has: &["pause"],
+            argv_has: &["ce-resume"],
             argv_lacks: &["--mode"],
         },
         Spec8Case {
             row: "row12",
-            primitive: Some("interrogate"),
+            primitive: Some("ce-review"),
             targets: &[
                 "interrogate this diff",
                 "tear this apart",
                 "adversarial review of the patch",
             ],
             not_primitive: &[],
-            argv_has: &["interrogate", "headless"],
+            argv_has: &["ce-review", "headless"],
             argv_lacks: &[],
         },
         Spec8Case {
@@ -1712,46 +1662,46 @@ mod tests {
         },
         Spec8Case {
             row: "row14",
-            primitive: Some("ship-beads"),
+            primitive: Some("ce-resume"),
             targets: &["ship beads now", "land the beads"],
             not_primitive: &[],
-            argv_has: &["ship-beads"],
+            argv_has: &["ce-resume"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row15",
-            primitive: Some("feature"),
+            primitive: Some("ce-lfg"),
             targets: &[
                 "feature: add domain type for ingest",
                 "implement the feature",
             ],
             not_primitive: &[],
-            argv_has: &["feature", "pane"],
+            argv_has: &["ce-lfg", "pane"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row16",
-            primitive: Some("goal"),
+            primitive: Some("ce-lfg"),
             targets: &["goal: ship the onboarding flow", "run the goal workflow"],
             not_primitive: &[],
-            argv_has: &["goal", "pane"],
+            argv_has: &["ce-lfg", "pane"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row17",
-            primitive: Some("triage-deep"),
+            primitive: Some("ce-triage"),
             targets: &[
                 "triage-deep the backlog",
                 "triage deep across 50 beads",
                 "deep triage for the repo",
             ],
             not_primitive: &[],
-            argv_has: &["triage-deep", "pane"],
+            argv_has: &["ce-triage", "pane"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row17-guard",
-            primitive: Some("triage-deep"),
+            primitive: Some("ce-triage"),
             targets: &["triage-deep backlog"],
             not_primitive: &[],
             argv_has: &[],
@@ -1759,93 +1709,93 @@ mod tests {
         },
         Spec8Case {
             row: "row18",
-            primitive: Some("triage"),
+            primitive: Some("ce-triage"),
             targets: &["triage the support inbox", "triage inbound messages"],
             not_primitive: &[],
-            argv_has: &["triage", "pane"],
+            argv_has: &["ce-triage", "pane"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row19",
-            primitive: Some("weekly-review"),
+            primitive: Some("ce-retro"),
             targets: &["weekly-review the repo", "weekly review on Sunday"],
             not_primitive: &[],
-            argv_has: &["weekly-review", "pane"],
+            argv_has: &["ce-retro", "pane"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row20",
-            primitive: Some("autonomous-work"),
+            primitive: Some("ce-resume"),
             targets: &["autonomous-work tonight", "autonomous work the backlog"],
             not_primitive: &[],
-            argv_has: &["autonomous-work", "pane"],
+            argv_has: &["ce-resume", "pane"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row21",
-            primitive: Some("reflect"),
+            primitive: Some("ce-compound"),
             targets: &["reflect on standing orders", "run reflect for the project"],
             not_primitive: &[],
-            argv_has: &["reflect", "pane"],
+            argv_has: &["ce-compound", "pane"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row22",
-            primitive: Some("awareness-digest"),
+            primitive: Some("ce-retro"),
             targets: &["awareness-digest for flywheel", "awareness digest check"],
             not_primitive: &[],
-            argv_has: &["awareness-digest", "headless"],
+            argv_has: &["ce-retro", "headless"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row23",
-            primitive: Some("onboard"),
+            primitive: Some("ce-lfg"),
             targets: &["onboard the newcomer", "run onboard for the repo"],
             not_primitive: &[],
-            argv_has: &["onboard", "pane"],
+            argv_has: &["ce-lfg", "pane"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row24c",
-            primitive: Some("debate"),
+            primitive: Some("ce-review"),
             targets: &["argue both sides of this", "play devil's advocate here"],
             not_primitive: &[],
-            argv_has: &["debate", "pane"],
+            argv_has: &["ce-review", "pane"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row24d",
-            primitive: Some("ce-brainstorm"),
+            primitive: Some("ce-lfg"),
             targets: &[
                 "brainstorm the retry design",
                 "sharpen the requirements first",
             ],
             not_primitive: &[],
-            argv_has: &["ce-brainstorm"],
+            argv_has: &["ce-lfg"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row24e",
-            primitive: Some("ce-plan"),
+            primitive: Some("ce-lfg"),
             targets: &["break this down into beads", "make a bead-ready plan"],
             not_primitive: &[],
-            argv_has: &["ce-plan"],
+            argv_has: &["ce-lfg"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row24f",
-            primitive: Some("ship"),
+            primitive: Some("ce-lfg"),
             targets: &["ship the chain", "run the ship workflow"],
             not_primitive: &[],
-            argv_has: &["ship"],
+            argv_has: &["ce-lfg"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row24g",
-            primitive: Some("beads"),
+            primitive: Some("ce-lfg"),
             targets: &["convert to beads", "file these as beads"],
             not_primitive: &[],
-            argv_has: &["beads"],
+            argv_has: &["ce-lfg"],
             argv_lacks: &[],
         },
     ];
@@ -1891,29 +1841,21 @@ mod tests {
 
     #[test]
     fn decide_trigger_for_maps_routed_and_unrouted() {
-        assert_eq!(decide_trigger_for("feature"), Some("feature"));
-        assert_eq!(decide_trigger_for("triage-deep"), Some("triage-deep"));
-        assert_eq!(decide_trigger_for("weekly-review"), Some("weekly-review"));
-        assert_eq!(
-            decide_trigger_for("awareness-digest"),
-            Some("awareness-digest")
-        );
-        assert_eq!(decide_trigger_for("debate"), Some("argue both sides"));
-        assert_eq!(decide_trigger_for("ce-brainstorm"), Some("brainstorm"));
-        assert_eq!(decide_trigger_for("ce-plan"), Some("break this down"));
-        assert_eq!(decide_trigger_for("ship"), Some("ship the chain"));
-        assert_eq!(decide_trigger_for("beads"), Some("convert to beads"));
+        assert_eq!(decide_trigger_for("ce-lfg"), Some("feature"));
+        assert_eq!(decide_trigger_for("ce-debug"), Some("repro"));
+        assert_eq!(decide_trigger_for("ce-bakeoff"), Some("prototype"));
+        assert_eq!(decide_trigger_for("ce-review"), Some("audit"));
+        assert_eq!(decide_trigger_for("ce-measure"), Some("refactor"));
+        assert_eq!(decide_trigger_for("ce-triage"), Some("triage-deep"));
+        assert_eq!(decide_trigger_for("ce-resume"), Some("babysit"));
+        assert_eq!(decide_trigger_for("ce-compound"), Some("reflect"));
+        assert_eq!(decide_trigger_for("ce-retro"), Some("weekly-review"));
+        assert_eq!(decide_trigger_for("mutation-full"), None);
         assert_eq!(decide_trigger_for("plan-review"), None);
         assert_eq!(decide_trigger_for("phase-resolve"), None);
-        assert_eq!(decide_trigger_for("wave-swarm"), Some("wave-swarm"));
-        assert_eq!(
-            decide_trigger_for("repair-until-verified"),
-            Some("repair-until-verified")
-        );
-        assert_eq!(
-            decide_trigger_for("beads-lifecycle"),
-            Some("beads-lifecycle")
-        );
+        assert_eq!(decide_trigger_for("wave-swarm"), None);
+        assert_eq!(decide_trigger_for("repair-until-verified"), None);
+        assert_eq!(decide_trigger_for("beads-lifecycle"), None);
     }
 
     #[test]
@@ -2022,17 +1964,12 @@ mod decide_router_tests {
             assert_ne!(d.primitive, "wave-swarm", "target: {t}");
         }
         let d = decide("wave-swarm with 2 crews", &snap());
-        assert_eq!(d.primitive, "wave-swarm", "declared trigger still routes");
-        assert!(
-            d.argv.windows(2).any(|w| w == ["--crew", "2"]),
-            "budget still honored on the declared trigger: {:?}",
-            d.argv
-        );
+        assert_eq!(d.primitive, "ce-lfg", "declared trigger still routes");
     }
 
     #[test]
     fn decide_router_topology_declared_no_silent_swarm() {
-        assert_eq!(topology_for_primitive("babysit-bead"), "open");
+        assert_eq!(topology_for_primitive("ce-resume"), "open");
         assert_eq!(
             topology_for_primitive("bogus-primitive-xyz"),
             "none",
@@ -2043,9 +1980,12 @@ mod decide_router_tests {
     #[test]
     fn decide_router_earliest_match_wins() {
         let d = decide("pause the arena", &snap());
-        assert_eq!(d.primitive, "pause", "fronted verb is the intent: {d:?}");
+        assert_eq!(
+            d.primitive, "ce-resume",
+            "fronted verb is the intent: {d:?}"
+        );
         let d = decide("goal: ship the onboarding flow", &snap());
-        assert_eq!(d.primitive, "goal", "fronted topic is the intent: {d:?}");
+        assert_eq!(d.primitive, "ce-lfg", "fronted topic is the intent: {d:?}");
     }
 
     #[test]
@@ -2209,7 +2149,7 @@ mod decide_router_tests {
             .into_keys()
             .collect();
         assert!(
-            known.len() > 20,
+            known.len() >= 10,
             "the builtin catalog is non-trivial: {known:?}"
         );
         check_workflow_routes(ROUTING_TABLE, &known)
@@ -2242,7 +2182,7 @@ mod decide_router_tests {
             );
         }
         assert!(
-            seen.len() >= 30,
+            seen.len() >= 8,
             "the table carries a real keyword-routed set: {}",
             seen.len()
         );
@@ -2251,39 +2191,15 @@ mod decide_router_tests {
     #[test]
     fn decide_router_trigger_phrase_is_first_matcher() {
         let pairs = [
-            ("captain-audit", "audit"),
-            ("bug-fix", "repro"),
-            ("refactoring", "refactor"),
-            ("prototype", "prototype"),
-            ("arena", "arena"),
-            ("perf", "perf"),
-            ("hillclimb", "hillclimb"),
-            ("forensics", "forensic"),
-            ("babysit-bead", "babysit"),
-            ("pickup", "pickup"),
-            ("pause", "pause"),
-            ("interrogate", "interrogate"),
-            ("figure-it-out", "figure it out"),
-            ("ship-beads", "ship beads"),
-            ("feature", "feature"),
-            ("goal", "goal"),
-            ("triage-deep", "triage-deep"),
-            ("triage", "triage"),
-            ("weekly-review", "weekly-review"),
-            ("autonomous-work", "autonomous-work"),
-            ("reflect", "reflect"),
-            ("awareness-digest", "awareness-digest"),
-            ("debate", "argue both sides"),
-            ("ce-brainstorm", "brainstorm"),
-            ("ce-plan", "break this down"),
-            ("ship", "ship the chain"),
-            ("beads", "convert to beads"),
-            ("onboard", "onboard"),
-            ("wave-swarm", "wave-swarm"),
-            ("repair-until-verified", "repair-until-verified"),
-            ("beads-lifecycle", "beads-lifecycle"),
-            ("ce-compound", "compound the learning"),
-            ("ce-sweep", "sweep the learnings"),
+            ("ce-lfg", "feature"),
+            ("ce-debug", "repro"),
+            ("ce-bakeoff", "prototype"),
+            ("ce-review", "audit"),
+            ("ce-measure", "refactor"),
+            ("ce-triage", "triage-deep"),
+            ("ce-resume", "babysit"),
+            ("ce-compound", "reflect"),
+            ("ce-retro", "weekly-review"),
         ];
         for (workflow, trigger) in pairs {
             assert_eq!(
@@ -2305,27 +2221,19 @@ mod decide_router_tests {
     #[test]
     fn loop_phrases_beat_the_one_shot_row() {
         let until = decide("fix the failing test until it passes", &snap());
-        assert_eq!(until.primitive, "repair-until-verified", "{until:?}");
-        assert!(
-            until
-                .argv
-                .windows(2)
-                .any(|w| w == ["--parts", "repair-until-verified"]),
-            "{:?}",
-            until.argv
-        );
+        assert_eq!(until.primitive, "ce-debug", "{until:?}");
         let plain = decide("keep going until the tests pass", &snap());
-        assert_eq!(plain.primitive, "repair-until-verified");
+        assert_eq!(plain.primitive, "ce-debug");
 
         let climb = decide(
             "the slow path should keep measuring until it improves",
             &snap(),
         );
-        assert_eq!(climb.primitive, "hillclimb", "{climb:?}");
+        assert_eq!(climb.primitive, "ce-measure", "{climb:?}");
         assert_ne!(climb.primitive, "perf");
 
         let one_shot = decide("dispatch is slow", &snap());
-        assert_eq!(one_shot.primitive, "perf");
+        assert_eq!(one_shot.primitive, "ce-measure");
         let implement_slow = decide("fix the slow dispatch", &snap());
         assert_eq!(implement_slow.primitive, "none");
     }

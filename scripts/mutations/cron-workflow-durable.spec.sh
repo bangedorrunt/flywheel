@@ -10,7 +10,5 @@ TEST_FILTER=(every_published_workflow every_scheduled_catalog_workflow)
 mutation "G1  a published workflow no longer opens on the durable models" \
     file=src/builtin_workflows.rs \
     expect=every_published_workflow_is_durable_or_legacy_by_design \
-    find='    over: "2"
-    each: { action: dispatch_job, assignee: x, spec: { profile: "@reviewer", harness: "opencode", task: "Brief on the proposal from your adversarial angle: {{inputs.proposal}}" } }' \
-    replace='    over: "not-a-count"
-    each: { action: dispatch_job, assignee: x, spec: { profile: "@reviewer", harness: "opencode", task: "Brief on the proposal from your adversarial angle: {{inputs.proposal}}" } }'
+    find='    over: "{{inputs.models}}"'
+    replace='    over: "not-a-count"'

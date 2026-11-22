@@ -477,6 +477,12 @@ pub fn pick_workflow(
     if let Some(found) = merged.get(name) {
         return Ok(found.clone());
     }
+    // Old names resolve via aliases (one-release deprecation).
+    if let Some(target) = crate::builtin_workflows::resolve_workflow_alias(name)
+        && let Some(found) = merged.get(target)
+    {
+        return Ok(found.clone());
+    }
     let mut hits: Vec<String> = merged
         .keys()
         .filter(|k| k.starts_with(name))
@@ -1348,7 +1354,7 @@ msg = "legacy triage"
         let dir = config_root("seed-entry-toml");
         seed_user_catalog_with(&dir, OverwriteScope::None, false).unwrap();
         assert!(dir.join("workflows/goal.yaml").is_file());
-        assert!(dir.join("stages/ce-execute.toml").is_file());
+        assert!(dir.join("stages/ce-work.toml").is_file());
         assert!(!dir.join("stages.toml").exists());
         assert!(!dir.join("workflows/goal.toml").exists());
 
@@ -1356,8 +1362,8 @@ msg = "legacy triage"
         assert!(catalog.workflows.contains_key("goal"));
         let stages = load_user_stages(&dir).unwrap();
         assert_eq!(
-            stages.get("ce-execute").map(|stage| stage.prompt.as_str()),
-            crate::stages::StageLibrary::compiled_in().resolve("ce-execute")
+            stages.get("ce-work").map(|stage| stage.prompt.as_str()),
+            crate::stages::StageLibrary::compiled_in().resolve("ce-work")
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1406,7 +1412,7 @@ msg = "legacy triage"
             "a no-op seed must not rewrite user stages.toml"
         );
 
-        let mut custom = crate::builtin_workflows::builtin_workflows()["goal"].clone();
+        let mut custom = crate::builtin_workflows::builtin_workflows()["ce-lfg"].clone();
         custom.description = Some("operator-owned copy".into());
         write_workflow_yaml(&dir.join("workflows"), &custom).unwrap();
         let mut stage = crate::stages::StageLibrary::compiled_in()
@@ -1414,7 +1420,7 @@ msg = "legacy triage"
             .unwrap()
             .clone();
         stage.prompt.push_str("\noperator override");
-        crate::stages::upsert_stage_entry(&dir.join("stages/ce-execute.toml"), &stage).unwrap();
+        crate::stages::upsert_stage_entry(&dir.join("stages/ce-work.toml"), &stage).unwrap();
 
         let after = catalog_drift(&dir).unwrap();
         assert!(
@@ -1425,7 +1431,7 @@ msg = "legacy triage"
         assert!(
             after
                 .iter()
-                .any(|row| row.name == "ce-execute" && row.status == "stale")
+                .any(|row| row.name == "ce-work" && row.status == "stale")
         );
         assert!(after.iter().all(|row| row.status != "missing"));
         let _ = fs::remove_dir_all(&dir);
@@ -1734,7 +1740,7 @@ mod bd_mvy4_stage_drift {
         let rows = catalog_drift(&root).expect("drift");
         let faithful = rows
             .iter()
-            .find(|r| r.kind == "stage" && r.name == "wave-verify")
+            .find(|r| r.kind == "stage" && r.name == "ce-verify")
             .expect("row");
         assert_eq!(
             faithful.status, "current",
@@ -1751,7 +1757,7 @@ mod bd_mvy4_stage_drift {
         let rows = catalog_drift(&root).expect("drift");
         let stale = rows
             .iter()
-            .find(|r| r.kind == "stage" && r.name == "wave-verify")
+            .find(|r| r.kind == "stage" && r.name == "ce-verify")
             .expect("row");
         assert_eq!(
             stale.status, "stale",
@@ -1809,8 +1815,8 @@ mod compose_token_data_tests {
     #[test]
     fn compose_token_project_tier_true_wins() {
         let (config, project) = roots("project-true");
-        let yaml = format!("{}\ncompose: true\n", builtin_yaml("beads"));
-        write(&project.join(".flywheel/workflows/beads.yaml"), &yaml);
+        let yaml = format!("{}\ncompose: true\n", builtin_yaml("ce-lfg"));
+        write(&project.join(".flywheel/workflows/ce-lfg.yaml"), &yaml);
         let catalog =
             WorkflowCatalog::load_layered_with(config.clone(), Some(&project)).expect("load");
         assert!(
@@ -1823,7 +1829,7 @@ mod compose_token_data_tests {
     #[test]
     fn compose_token_user_copy_without_key_stays_token() {
         let (config, project) = roots("inherit");
-        let yaml = without_compose_keys(&builtin_yaml("wave-swarm"));
+        let yaml = without_compose_keys(&builtin_yaml("ce-lfg"));
         assert!(
             !yaml.contains("compose:"),
             "fixture must carry no compose key"
@@ -1843,9 +1849,9 @@ mod compose_token_data_tests {
         let (config, project) = roots("disable");
         let yaml = format!(
             "{}\ncompose: false\n",
-            without_compose_keys(&builtin_yaml("wave-swarm"))
+            without_compose_keys(&builtin_yaml("ce-lfg"))
         );
-        write(&config.join("workflows/wave-swarm.yaml"), &yaml);
+        write(&config.join("workflows/ce-lfg.yaml"), &yaml);
         let catalog =
             WorkflowCatalog::load_layered_with(config.clone(), Some(&project)).expect("load");
         assert!(
@@ -1858,8 +1864,8 @@ mod compose_token_data_tests {
     #[test]
     fn compose_shape_declared_reads_back() {
         let (config, project) = roots("shape");
-        let yaml = format!("{}\nshape: polish\n", builtin_yaml("beads"));
-        write(&project.join(".flywheel/workflows/beads.yaml"), &yaml);
+        let yaml = format!("{}\nshape: polish\n", builtin_yaml("ce-lfg"));
+        write(&project.join(".flywheel/workflows/ce-lfg.yaml"), &yaml);
         let catalog =
             WorkflowCatalog::load_layered_with(config.clone(), Some(&project)).expect("load");
         assert_eq!(catalog.shape("beads"), Some(Shape::Polish));
