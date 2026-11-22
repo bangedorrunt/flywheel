@@ -2168,6 +2168,7 @@ fn project_workflow_names(root: &Path) -> BTreeSet<String> {
 fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> Result<()> {
     use crate::elm::brief_statechart::build_brief_machine;
     use crate::elm::captain_watch_statechart::build_captain_watch_machine;
+    use crate::elm::lease_dirty_statechart::build_dirty_lease_machine;
     use crate::elm::lease_waitlist_statechart::build_lease_waitlist_machine;
     use crate::elm::mail_queue_statechart::build_mail_queue_machine;
     use crate::elm::p2p_negotiation::{P2PNegotiationState, build_p2p_negotiation_machine};
@@ -2314,6 +2315,27 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         )
     }
 
+    fn verify_dirty_lease(export_tla: bool) -> WorkflowVerifyChartReport {
+        use toron_core::kernel::StateNodeType;
+        let machine = build_dirty_lease_machine();
+        let topology = machine.topology();
+        let is_final = |state: &_| {
+            topology
+                .nodes
+                .get(state)
+                .is_some_and(|node| node.node_type == StateNodeType::Final)
+        };
+        chart_report(
+            "DirtyLease",
+            &topology,
+            "a final state",
+            is_final,
+            export_tla.then(|| machine.to_tla_named("DirtyLease")),
+            None,
+            &ChartFindings::default(),
+        )
+    }
+
     fn verify_plan(export_tla: bool) -> WorkflowVerifyChartReport {
         use toron_core::kernel::StateNodeType;
         let machine = build_plan_machine();
@@ -2362,6 +2384,14 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         )
     {
         reports.push(verify_lease_waitlist(export_tla));
+    }
+    if want_all
+        || matches!(
+            want.as_str(),
+            "dirtylease" | "dirty-lease" | "dirty-lease-statechart"
+        )
+    {
+        reports.push(verify_dirty_lease(export_tla));
     }
     if want_all
         || matches!(
@@ -2429,7 +2459,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     }
     if reports.is_empty() {
         bail!(
-            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, LeaseWaitlist, Brief, ResultMail, CaptainWatch, or a workflow name)",
+            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, LeaseWaitlist, DirtyLease, Brief, ResultMail, CaptainWatch, or a workflow name)",
             name.unwrap_or("")
         );
     }
