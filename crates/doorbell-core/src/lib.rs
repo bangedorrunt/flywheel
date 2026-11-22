@@ -693,7 +693,18 @@ pub fn composed_ring(queue: &[QueuedWake]) -> String {
         .skip(1)
         .map(|w| format!("{} {}", w.count, w.kind.label()))
         .collect();
-    let pull = "Read it with: toron next --project <project> --as <pin>".to_string();
+    let lead = by_kind[0];
+    let project = if lead.project.is_empty() {
+        "<project>"
+    } else {
+        &lead.project
+    };
+    let pin = if lead.pin.is_empty() {
+        "<pin>"
+    } else {
+        &lead.pin
+    };
+    let pull = format!("Read it with: toron next --project {project} --as {pin}");
     if rest.is_empty() {
         return format!("{head}. {pull}");
     }
@@ -773,6 +784,17 @@ pub struct QueuedWake {
     pub thread: Option<String>,
     pub line: String,
     pub count: u32,
+    /// When the source row was created. The idle drain re-checks this against
+    /// the pull cursor, so a mail read between queueing and drain is dropped
+    /// instead of waking a crew to an empty inbox (bd-ba4nl).
+    #[serde(default)]
+    pub created_us: Option<i64>,
+    /// The pin and project this wake belongs to, so a composed ring can name
+    /// the real `toron next --project P --as PIN` door (bd-ba4nl).
+    #[serde(default)]
+    pub pin: String,
+    #[serde(default)]
+    pub project: String,
 }
 
 impl QueuedWake {
@@ -799,7 +821,28 @@ impl QueuedWake {
             line,
             event_id,
             count: 1,
+            created_us: None,
+            pin: String::new(),
+            project: String::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_source(mut self, pin: &str, project: &str, created_us: Option<i64>) -> Self {
+        self.pin = pin.to_string();
+        self.project = project.to_string();
+        self.created_us = created_us;
+        self
+    }
+}
+
+/// Stamp the source of a just-folded wake so the drain can re-check its pull
+/// cursor and the composed ring can name the real door (bd-ba4nl).
+fn tag_source(queue: &mut [QueuedWake], pin: &str, project: &str, created_us: Option<i64>) {
+    if let Some(wake) = queue.last_mut() {
+        wake.pin = pin.to_string();
+        wake.project = project.to_string();
+        wake.created_us = created_us;
     }
 }
 
@@ -1002,6 +1045,11 @@ pub enum DoorbellAction {
 /// round trip is exact. The reducer stays pure and untouched.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DoorbellModel {
+    /// Project this dispatcher belongs to; used to render the real pull door
+    /// in a composed ring (bd-ba4nl). Default empty until the host sets it.
+    #[serde(default)]
+    pub project: String,
+
     /// One entry per wake CLASS per pin (working panes hold their wake here).
     /// Coalescing is by class, never silent: a merge bumps `count` and journals
     /// `merged`, and the ring names every class it carries (bd-0uzrq.8).
@@ -1059,6 +1107,14 @@ pub fn already_pulled(pulled_us: &BTreeMap<String, i64>, pin: &str, created_us: 
     pulled_us
         .get(pin)
         .is_some_and(|cursor| created_us <= *cursor)
+}
+
+/// bd-ba4nl: the ONE 'already consumed' test for every arm that can ring —
+/// watch, inbox fetch, and the idle drain. Non-mail kinds pass `None` and are
+/// never dropped by a pull cursor.
+#[must_use]
+pub fn mail_consumed(model: &DoorbellModel, pin: &str, created_us: Option<i64>) -> bool {
+    created_us.is_some_and(|us| already_pulled(&model.pulled_us, pin, us))
 }
 
 /// One answered toron pull-cursor read (bd-yc6jf). `cursor_us` is None
@@ -1291,7 +1347,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 // mail event at or below it was already pulled by toron next —
                 // no wake for an empty inbox. Ack-SLA and other urgent kinds
                 // have no inbox row and are never skipped here.
-                if mail && created_us.is_some_and(|us| already_pulled(&next.pulled_us, &pin, us)) {
+                if mail && mail_consumed(&next, &pin, created_us) {
                     actions.push(DoorbellAction::Audit {
                         kind: "already-pulled".into(),
                         pin: pin.clone(),
@@ -1364,6 +1420,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                     queue_thread.clone(),
                     line_out.clone(),
                     watch_id(line),
+                    created_us,
                 );
             }
         }
@@ -1384,6 +1441,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 None,
                 line.clone(),
                 Some(event_id.clone()),
+                None,
             );
         }
         DoorbellMsg::EventsGap { pin } => {
@@ -1410,7 +1468,27 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 let line_out = doorbell_line(class, &hint);
                 let key = row_key(item, &line_out);
                 let thread = row_thread(item);
-                route_or_queue(&mut next, &mut actions, pin, key, thread, line_out, None);
+                let created_us = row_created_us(item);
+                if class == EventClass::PlanePMail && mail_consumed(&next, pin, created_us) {
+                    actions.push(DoorbellAction::Audit {
+                        kind: "already-pulled".into(),
+                        pin: pin.clone(),
+                        detail: format!(
+                            "inbox mail at {created_us:?} is at or below the pull cursor"
+                        ),
+                    });
+                    continue;
+                }
+                route_or_queue(
+                    &mut next,
+                    &mut actions,
+                    pin,
+                    key,
+                    thread,
+                    line_out,
+                    None,
+                    created_us,
+                );
             }
         }
         DoorbellMsg::InboxRows { rows, pin } => {
@@ -1421,7 +1499,27 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 let line_out = doorbell_line(class, &hint);
                 let key = row_key(item, &line_out);
                 let thread = row_thread(item);
-                route_or_queue(&mut next, &mut actions, pin, key, thread, line_out, None);
+                let created_us = row_created_us(item);
+                if class == EventClass::PlanePMail && mail_consumed(&next, pin, created_us) {
+                    actions.push(DoorbellAction::Audit {
+                        kind: "already-pulled".into(),
+                        pin: pin.clone(),
+                        detail: format!(
+                            "inbox mail at {created_us:?} is at or below the pull cursor"
+                        ),
+                    });
+                    continue;
+                }
+                route_or_queue(
+                    &mut next,
+                    &mut actions,
+                    pin,
+                    key,
+                    thread,
+                    line_out,
+                    None,
+                    created_us,
+                );
             }
         }
         DoorbellMsg::PlaneStatus { pin, status } => {
@@ -1434,11 +1532,30 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 next.blocked_episode.remove(pin);
             }
             if is_drain_transition(&from, status) {
-                let deferred = next
+                let taken = next
                     .queues
                     .get_mut(pin)
                     .map(std::mem::take)
                     .unwrap_or_default();
+                // bd-ba4nl: re-check at drain time. A pin may have pulled its
+                // mail after the wake was queued; ringing now wakes an empty
+                // inbox. Non-mail urgent kinds have no created time and are
+                // never dropped here.
+                let mut deferred = Vec::new();
+                for wake in taken {
+                    if is_mail_wake(&wake.line) && mail_consumed(&next, pin, wake.created_us) {
+                        actions.push(DoorbellAction::Audit {
+                            kind: "already-pulled".into(),
+                            pin: pin.clone(),
+                            detail: format!(
+                                "drained mail at {:?} is at or below the pull cursor",
+                                wake.created_us
+                            ),
+                        });
+                    } else {
+                        deferred.push(wake);
+                    }
+                }
                 let total: u32 = deferred.iter().map(|w| w.count).sum();
                 if deferred.is_empty() {
                     // bd-0uzrq.2: the pane is at a prompt and the queue knows
@@ -1545,6 +1662,10 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
 /// Idle/done panes get a Prompt now; blocked+act-now prompts while
 /// blocked+routine digests with a reason (bd-zawk G6); working panes queue
 /// (drained on the next working -> idle|done|blocked PlaneStatus).
+// The eight arguments are the fold's directed inputs (model, actions, pin,
+// key, thread, line, event id, created time); bundling them would allocate a
+// struct at every one of the eight call sites for no behavioural gain.
+#[allow(clippy::too_many_arguments)]
 fn route_or_queue(
     next: &mut DoorbellModel,
     actions: &mut Vec<DoorbellAction>,
@@ -1553,7 +1674,9 @@ fn route_or_queue(
     thread: Option<String>,
     line: String,
     event_id: Option<String>,
+    created_us: Option<i64>,
 ) {
+    let project = next.project.clone();
     let status = next
         .statuses
         .get(pin)
@@ -1604,6 +1727,7 @@ fn route_or_queue(
         }
         let queue = next.queues.entry(pin.to_string()).or_default();
         queue_line(queue, key, thread, line.clone(), event_id.clone());
+        tag_source(queue, pin, &project, created_us);
     } else if next.unroutable.contains(pin) {
         actions.push(DoorbellAction::Digest {
             pin: pin.to_string(),
@@ -1627,6 +1751,7 @@ fn route_or_queue(
         }
         let queue = next.queues.entry(pin.to_string()).or_default();
         let fold = queue_line(queue, key, thread, line.clone(), event_id.clone());
+        tag_source(queue, pin, &project, created_us);
         actions.push(DoorbellAction::Audit {
             kind: match fold {
                 Queued::Fresh => "queued",
@@ -1978,6 +2103,7 @@ mod tests {
             None,
             line.to_string(),
             None,
+            None,
         );
         let notices = |actions: &[DoorbellAction]| {
             actions
@@ -2005,6 +2131,7 @@ mod tests {
             None,
             "[wake] more mail".to_string(),
             None,
+            None,
         );
         assert_eq!(notices(&second), 0, "no notice on every ring: {second:?}");
 
@@ -2027,8 +2154,139 @@ mod tests {
             None,
             "[wake] new episode".to_string(),
             None,
+            None,
         );
         assert_eq!(notices(&third), 1, "a new episode notices again: {third:?}");
+    }
+
+    /// bd-ba4nl: the inbox arm must apply the SAME consumed rule as watch.
+    #[test]
+    fn an_inbox_row_below_the_cursor_queues_nothing() {
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        model.pulled_us.insert("BlueRidge".into(), 2_000_000);
+        let row = serde_json::json!({
+            "created_ts_us": 1_000_000_i64,
+            "importance": "normal",
+            "wake": "tasked",
+            "sender": "SlateHarbor",
+            "subject": "mail",
+            "body": "body",
+        });
+        let (next, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "a pulled inbox row must not ring: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                DoorbellAction::Audit { kind, .. } if kind == "already-pulled"
+            )),
+            "the skip must be audited: {actions:?}"
+        );
+        assert!(next.queues.get("BlueRidge").is_none_or(Vec::is_empty));
+    }
+
+    #[test]
+    fn a_mail_pulled_after_queueing_is_dropped_at_drain() {
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        let row = serde_json::json!({
+            "created_ts_us": 1_000_000_i64,
+            "importance": "normal",
+            "wake": "tasked",
+            "sender": "SlateHarbor",
+            "subject": "mail",
+            "body": "body",
+        });
+        let (queued, _actions) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(!queued.queues.get("BlueRidge").unwrap().is_empty());
+        let mut pulled = queued.clone();
+        pulled.pulled_us.insert("BlueRidge".into(), 2_000_000);
+        let (_, drained) = tick(
+            &pulled,
+            &DoorbellMsg::PlaneStatus {
+                pin: "BlueRidge".into(),
+                status: "idle".into(),
+            },
+        );
+        assert!(
+            !drained
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "a mail read between queue and drain must not ring: {drained:?}"
+        );
+        assert!(
+            drained.iter().any(|a| matches!(
+                a,
+                DoorbellAction::Audit { kind, .. } if kind == "already-pulled"
+            )),
+            "the drain drop must be audited: {drained:?}"
+        );
+    }
+
+    #[test]
+    fn an_urgent_non_mail_kind_survives_the_cursor_check() {
+        let mut model = model_with("BlueRidge");
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        model.pulled_us.insert("BlueRidge".into(), 2_000_000);
+        let row = serde_json::json!({
+            "created_ts_us": 1_000_000_i64,
+            "importance": "urgent",
+            "wake": "tasked",
+            "sender": "SlateHarbor",
+            "subject": "[bd-ba4nl] urgent",
+            "body": "body",
+        });
+        let (_, actions) = tick(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row],
+                pin: "BlueRidge".into(),
+            },
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { .. })),
+            "a non-mail urgent wake must never be dropped by a pull cursor: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_composed_ring_names_the_real_project_and_pin() {
+        let mut model = model_with("BlueRidge");
+        model.project = "flywheel".into();
+        model.statuses.insert("BlueRidge".into(), "working".into());
+        let line = "[wake] mail. toron next";
+        let mut actions = Vec::new();
+        route_or_queue(
+            &mut model,
+            &mut actions,
+            "BlueRidge",
+            wake_key(line),
+            None,
+            line.to_string(),
+            None,
+            None,
+        );
+        let ring = super::composed_ring(&model.queues["BlueRidge"]);
+        assert!(ring.contains("--project flywheel") && ring.contains("--as BlueRidge"));
     }
 
     #[test]
@@ -3131,6 +3389,7 @@ mod tests {
             None,
             "[wake] Urgent mail. Read it with: toron next".to_string(),
             None,
+            None,
         );
         assert!(
             matches!(&actions[..], [DoorbellAction::Prompt { pin, .. }] if pin == "BlueRidge"),
@@ -3162,6 +3421,7 @@ mod tests {
             None,
             "[wake] New message in the team room. Read it with: toron channel read".to_string(),
             None,
+            None,
         );
         assert!(
             actions
@@ -3185,6 +3445,7 @@ mod tests {
             None,
             "[wake] Urgent mail. Read it with: toron next".to_string(),
             None,
+            None,
         );
         assert!(
             !urgent
@@ -3204,6 +3465,7 @@ mod tests {
             ),
             None,
             "[wake] New message in the team room. Read it with: toron channel read".to_string(),
+            None,
             None,
         );
         assert!(

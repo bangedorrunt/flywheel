@@ -8,7 +8,7 @@ TEST_FILTER=(a_pulled_mail_event_never_re_rings a_cli_pull_at_or_after_created_a
 mutation "D1  the doorbell rings pulled mail again" \
     file=crates/doorbell-core/src/lib.rs \
     expect=a_pulled_mail_event_never_re_rings \
-    find='                if mail && created_us.is_some_and(|us| already_pulled(&next.pulled_us, &pin, us)) {' \
+    find='                if mail && mail_consumed(&next, &pin, created_us) {' \
     replace='                if false
                     && created_us.is_some_and(|us| already_pulled(&next.pulled_us, &pin, us))
                 {'
