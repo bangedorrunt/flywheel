@@ -119,7 +119,7 @@ pub(crate) fn cmd_stage(cfg: &Config, cmd: &StageCmd) -> Result<()> {
                 );
             }
             println!(
-                "ce- loop (ADR-0009): ce-brainstorm -> ce-plan -> ce-plan-review -> ce-execute -> ce-simplify -> ce-review -> verify -> ce-compound"
+                "ce- loop (bd-ihiqo.4): ce-brainstorm -> ce-plan -> ce-work -> ce-review -> ce-verify -> ce-compound"
             );
             println!("user override: {}", crate::override_display());
             println!("project tier: {}", project_stages.display());

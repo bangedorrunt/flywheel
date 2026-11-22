@@ -34,6 +34,10 @@ bash scripts/fence.sh --paths a.rs,b.rs --test cmd::spawn::  # targeted tests in
 flywheel captain watch <project> [--as <pin>] [--stall] [--preflight] [--stream]  # --stream: one line per event, never exits; default one-shot re-arms
 flywheel deadlock <project> [--wait-minutes N]  # lease wait-for cycles + overdue collab asks page the captain once each (bd-v4dcv)
 
+## Stages (bd-ihiqo.4)
+
+The 8 canonical stages: `ce-brainstorm`, `ce-plan`, `ce-work`, `ce-review`, `ce-verify`, `ce-compound`, `ce-debug`, `ce-explore`. Old names resolve as aliases with a one-line deprecation notice for one release.
+
 # captain: prove, install, land
 bash scripts/clean-proof.sh --sha <rev> --mutations changed --keep --receipt /tmp/<dir>/r.json
 AGENT_NAME=<captain> FLYWHEEL_SOURCE=<kept>/flywheel TORON_SOURCE=<kept>/toron \

@@ -211,27 +211,14 @@ pub struct StageLibrary {
 /// Seed role affinities (§3.8): the default `@profile` a bare-name compose
 /// part dispatches to. Data, not code — authored stages carry their own.
 const SEED_AFFINITY: &[(&str, &str)] = &[
-    ("fresh-eyes-explore", "scout"),
     ("ce-brainstorm", "planner"),
-    ("ce-review", "reviewer"),
-    ("ce-evaluate", "reviewer"),
     ("ce-plan", "planner"),
-    ("ce-plan-review", "planner"),
-    ("plan-polish", "planner"),
-    ("ce-execute", "coder"),
-    ("ce-simplify", "coder"),
+    ("ce-work", "coder"),
+    ("ce-review", "reviewer"),
+    ("ce-verify", "reviewer"),
     ("ce-compound", "housekeeper"),
-    ("repo-map", "scout"),
-    ("repro-baseline", "coder"),
-    ("tdd-red", "coder"),
-    ("minimal-fix", "coder"),
-    ("prove-verify", "reviewer"),
-    ("baseline-measure", "coder"),
-    ("measure-keep-or-discard", "coder"),
-    ("judge-arms", "oracle"),
-    ("diagnose-only", "scout"),
-    ("resume-pickup", "housekeeper"),
-    ("wave-verify", "reviewer"),
+    ("ce-debug", "scout"),
+    ("ce-explore", "scout"),
 ];
 
 /// Seed phase metadata for the compound-engineering loop stages (ADR-0009):
@@ -240,29 +227,12 @@ const SEED_AFFINITY: &[(&str, &str)] = &[
 const SEED_PHASE: &[(&str, &str)] = &[
     ("ce-brainstorm", "plan"),
     ("ce-plan", "plan"),
-    ("plan-polish", "plan"),
-    ("ce-plan-review", "review"),
-    ("ce-execute", "implement"),
-    ("ce-simplify", "implement"),
+    ("ce-work", "implement"),
     ("ce-review", "review"),
-    ("ce-evaluate", "verify"),
+    ("ce-verify", "verify"),
     ("ce-compound", "compound"),
-    ("fresh-eyes-explore", "resolve"),
-    ("commit-and-push", "compound"),
-    ("repo-map", "resolve"),
-    ("seed-first-task", "plan"),
-    ("bv-triage", "plan"),
-    ("prioritize-assign", "plan"),
-    ("repro-baseline", "resolve"),
-    ("tdd-red", "implement"),
-    ("minimal-fix", "implement"),
-    ("prove-verify", "verify"),
-    ("baseline-measure", "verify"),
-    ("measure-keep-or-discard", "verify"),
-    ("judge-arms", "review"),
-    ("diagnose-only", "resolve"),
-    ("resume-pickup", "resolve"),
-    ("wave-verify", "verify"),
+    ("ce-debug", "resolve"),
+    ("ce-explore", "resolve"),
 ];
 
 /// Seed witness contracts (ADR-0021 D4.2): the named contract checked at the
@@ -270,17 +240,15 @@ const SEED_PHASE: &[(&str, &str)] = &[
 /// enforces on every tier); a typo'd witness is a silent never-exit.
 const SEED_WITNESS: &[(&str, &str)] = &[
     ("ce-plan", "plan"),
-    ("plan-polish", "polish-round"),
-    ("ce-execute", "implement"),
+    ("ce-work", "implement"),
     ("ce-review", "review"),
-    ("wave-verify", "verify"),
-    ("prove-verify", "verify"),
+    ("ce-verify", "verify"),
 ];
 
 /// Seed one-line dispatch notes (ADR-0021 D6): when to use each stage.
 const SEED_USE_WHEN: &[(&str, &str)] = &[
     (
-        "fresh-eyes-explore",
+        "ce-explore",
         "a codebase needs a cold-start bug sweep with fresh eyes",
     ),
     (
@@ -292,116 +260,80 @@ const SEED_USE_WHEN: &[(&str, &str)] = &[
         "written code needs an independent defect review before verify",
     ),
     (
-        "ce-evaluate",
-        "a repair pass needs a fresh-context done-or-remaining verdict",
-    ),
-    (
         "ce-plan",
         "requirements need expanding into a buildable bead set",
     ),
     (
-        "ce-plan-review",
-        "a bead set needs a revise-in-place review pass",
-    ),
-    (
-        "plan-polish",
-        "a bead set exists and has not been polished yet",
-    ),
-    (
-        "ce-execute",
+        "ce-work",
         "an in-progress bead needs executing via its brief contract",
-    ),
-    (
-        "ce-simplify",
-        "freshly changed code needs behavior-preserving simplification",
     ),
     (
         "ce-compound",
         "a verified solution may hold a durable learning",
     ),
     (
-        "commit-and-push",
-        "finished work needs committing in logical groups and pushing",
-    ),
-    ("repo-map", "a newcomer needs a cold-start map of the repo"),
-    (
-        "seed-first-task",
-        "an onboarded newcomer needs one narrow first task",
-    ),
-    (
-        "bv-triage",
-        "the backlog needs a deep triage into counts and top actions",
-    ),
-    (
-        "prioritize-assign",
-        "triaged beads need ordering and owned assignment",
-    ),
-    (
-        "repro-baseline",
+        "ce-debug",
         "a reported symptom needs a failing repro baseline",
     ),
-    ("tdd-red", "a fix needs its failing test written first"),
     (
-        "minimal-fix",
-        "a failing test needs the minimal fix to green it",
-    ),
-    (
-        "prove-verify",
+        "ce-verify",
         "a change needs independent proof against its VERIFY",
-    ),
-    (
-        "baseline-measure",
-        "a change needs its baseline invariant stored",
-    ),
-    (
-        "measure-keep-or-discard",
-        "a measured change needs a keep-or-discard verdict",
-    ),
-    (
-        "judge-arms",
-        "prototype arms need one winner picked on named criteria",
-    ),
-    (
-        "diagnose-only",
-        "a symptom needs a read-only diagnosis with evidence",
-    ),
-    (
-        "resume-pickup",
-        "a session needs stranded beads and panes picked back up",
-    ),
-    (
-        "wave-verify",
-        "close claims need proving against receipts before landing",
     ),
 ];
 
-/// Seed typed reads (ADR-0021 D3): inputs/steps each stage needs.
 const SEED_READS: &[(&str, &[&str])] = &[
-    ("judge-arms", &["steps.arms"]),
-    ("plan-polish", &["inputs.objective"]),
+    ("ce-review", &["steps.arms"]),
+    ("ce-plan", &["inputs.objective"]),
 ];
 
 /// Seed effort knobs (ADR-0021 D3).
-const SEED_EFFORT: &[(&str, &str)] = &[("plan-polish", "max")];
+const SEED_EFFORT: &[(&str, &str)] = &[("ce-plan", "max")];
 
 /// Stages no shipped workflow dispatches, and HOW they are reached instead
 /// (ADR-0021 D6). Everything here must name a real seed stage; everything
 /// else unreferenced stays a dead stage `workflow verify` fails on.
 const SEED_REACH: &[(&str, StageReach)] = &[
-    // `scout:fresh-eyes-explore` is a crew compose token, not a workflow step.
-    ("fresh-eyes-explore", StageReach::Compose),
-    // Reached by hand (`flywheel send --stage`) as the loop's own steps.
-    ("ce-simplify", StageReach::Manual),
-    ("tdd-red", StageReach::Manual),
-    ("minimal-fix", StageReach::Manual),
-    ("repro-baseline", StageReach::Manual),
+    ("ce-explore", StageReach::Compose),
+    ("ce-review", StageReach::Manual),
+    ("ce-verify", StageReach::Manual),
+    ("ce-debug", StageReach::Manual),
+];
+
+/// bd-ihiqo.4: old stage names resolve to the 8 canonical ce- stages for one
+/// release. The notice is emitted at resolution time, once per lookup.
+const STAGE_ALIASES: &[(&str, &str)] = &[
+    ("fresh-eyes-explore", "ce-explore"),
+    ("repo-map", "ce-explore"),
+    ("resume-pickup", "ce-explore"),
+    ("diagnose-only", "ce-debug"),
+    ("repro-baseline", "ce-debug"),
+    ("ce-execute", "ce-work"),
+    ("ce-simplify", "ce-work"),
+    ("tdd-red", "ce-work"),
+    ("minimal-fix", "ce-work"),
+    ("commit-and-push", "ce-work"),
+    ("spawn-crew", "ce-work"),
+    ("ce-plan-review", "ce-review"),
+    ("ce-evaluate", "ce-review"),
+    ("judge-arms", "ce-review"),
+    ("wave-observe", "ce-review"),
+    ("plan-polish", "ce-plan"),
+    ("wave-dispatch", "ce-plan"),
+    ("wave-gate", "ce-plan"),
+    ("seed-first-task", "ce-plan"),
+    ("prioritize-assign", "ce-plan"),
+    ("bv-triage", "ce-plan"),
+    ("prove-verify", "ce-verify"),
+    ("wave-verify", "ce-verify"),
+    ("baseline-measure", "ce-verify"),
+    ("measure-keep-or-discard", "ce-verify"),
 ];
 
 /// Seed repetition contracts (min, max, until).
-const SEED_REPEAT: &[(&str, (u32, u32, &str))] = &[("plan-polish", (2, 5, "converged"))];
+const SEED_REPEAT: &[(&str, (u32, u32, &str))] = &[("ce-plan", (2, 5, "converged"))];
 
 /// Review + verify seats run fresh and read-only (ADR-0021 D3).
-const SEED_FRESH_READONLY: &[&str] = &["ce-review", "ce-evaluate", "prove-verify", "wave-verify"];
+const SEED_FRESH_READONLY: &[&str] = &["ce-review", "ce-verify"];
 
 /// bd-ceiling-report-template-vz8a: the stages that hit or carry a ceiling
 /// report gain [`CEILING_REPORT_TEMPLATE`]. `ce-execute` renders it (the
@@ -409,7 +341,7 @@ const SEED_FRESH_READONLY: &[&str] = &["ce-review", "ce-evaluate", "prove-verify
 /// accepts the amendment close that cites it. The retired wave-gate /
 /// wave-dispatch / wave-observe stages are engine steps now, so they have no
 /// prompt to carry it.
-const CEILING_TEMPLATE_STAGES: &[&str] = &["ce-execute", "wave-verify"];
+const CEILING_TEMPLATE_STAGES: &[&str] = &["ce-work", "ce-verify"];
 
 /// bd-ceiling-report-template-vz8a (encode-lessons-in-structure,
 /// minimize-reader-load): ONE ceiling shape for every pane, so the captain's
@@ -446,104 +378,36 @@ impl StageLibrary {
     pub fn compiled_in() -> Self {
         let defaults: &[(&str, &str)] = &[
             (
-                "fresh-eyes-explore",
-                "I want you to sort of randomly explore the code files in this project, choosing code files to deeply investigate and understand and trace their functionality and execution flows through the related code files which they import or which are imported by. Once you understand the purpose of the code in the larger context of the workflows, I want you to do a super careful, methodical, and critical check with \"fresh eyes\" to find any obvious bugs, problems, errors, issues, silly mistakes, etc. and then systematically and meticulously and intelligently correct them. Be sure to comply with ALL rules in AGENTS dot md.",
-            ),
-            (
                 "ce-brainstorm",
                 "Sharpen a rough objective into REQUIREMENTS before any bead exists (ADR-0009 ce-brainstorm). Ask ONE question at a time, and only questions whose answer changes the artifact — a decision the owner must make, never something the repo can answer. Ground first: read AGENTS.md, the relevant ADRs, and `chie memory recall \"<objective keywords>\"` — a prior learning in chiebukuro carries its constraints in. The output is REQUIREMENTS-ONLY (never implementation): one unified statement of what this must be, explicit non-goals, open questions each naming the decision it blocks, and a data-shape note (what exists to work with). A requirement you cannot test is a wish — every acceptance names its evidence. Post the artifact to the steer channel; reply with ONLY a JSON object {\"target\": \"...\", \"non_goals\": [\"...\"], \"open_questions\": [\"...\"], \"data_shape\": \"...\"}.",
             ),
             (
-                "ce-review",
-                "Review the code written by your fellow agents - issues, bugs, errors, problems, inefficiencies, security problems, reliability issues, etc. - and carefully diagnose their underlying root causes using first-principle analysis. Don't restrict yourself to the latest commits; cast a wider net and go super deep. Use ultrathink. Principles in force: prove-it-works (check the real artifact - run the change's VERIFY or the ledger proof, never a self-report), fix-root-causes (reproduce first; name the root, not the symptom), minimize-reader-load (count layers and hidden state; collapse one-caller wrappers). BLOCKER: a REPORT line that cites a PRINCIPLES name without its decision (`<name> - <the decision it changed>`) is a cargo-cult citation - reject it and require the decision the principle changed; on a non-trivial bead (priority <= 2) an empty PRINCIPLES field is an incomplete report (the loop's `principles` checker enforces the same rule: known name + decision clause, required on P0-P2). Review contract (ADR-0009): a finding exists only under a DETECTION CONDITION - the observable circumstance in the work under review, never a topic to opine on; HIGH confidence requires quoted evidence (file:line + the offending text), unquoted high confidence is a reject; INDEPENDENCE - two lenses reasoned in one pane are two perspectives, not two witnesses, so claim corroboration only across separately-dispatched contexts. Each finding carries severity (P0 breakage ... P3 advisory) and an AUTOFIX CLASS: gated_auto | manual | advisory. A finding that merely prefers a different approach than a `settled:` captain decision routes report-only (settled_conflict); a real defect inside a settled approach keeps full severity. Findings land as JSON {\"findings\": [{\"id\", \"severity\", \"condition\", \"evidence\", \"autofix\", \"confidence\"}]}. Review is REPORT-ONLY - applying fixes is a separate authorized pass. Ask-user authority (ADR-0010 D15): a review finding that asks the user a question (an ask-user finding) is never self-answered by the reviewer. Findings that merely restore accepted behavior note the restoration and its evidence. Findings that expand scope (new guarantee, threat model, architecture, destructive, security) escalate report-only with the five-element escalation (original criterion, proposed expansion, smallest compliant alternative, accept-vs-decline consequences, recommendation) and park in OPEN DECISIONS. Only an answer/--verdict closes the call.",
-            ),
-            (
-                "ce-evaluate",
-                "Evaluate a repair iteration from a FRESH context (pstack eval contract, ADR-0024). Read the actual artifact and ledger paths named by the plan, inspect the current repository state, and test the VERIFY command against the acceptance criteria. Do not trust a worker's done claim, transcript summary, or self-rated status. Return ONLY JSON {\"done\": <bool>, \"remaining_work\": [\"...\"], \"failures\": [{\"condition\": \"...\", \"evidence\": \"file:line or command output\", \"confidence\": \"high|medium|low\"}], \"validation_evidence\": [\"...\"]}. READ-ONLY: do not edit files, create or close beads, write verdicts, or promote worker metadata. `done` is advisory input to the following host VerifySink; it is never the pass/fail authority. Missing artifacts or unsupported claims are unknown, not success.",
-            ),
-            (
                 "ce-plan",
-                "OK so please take ALL of that and elaborate on it more and then create a comprehensive and granular set of beads for all this with tasks, subtasks, and dependency structure overlaid, with detailed comments so that the whole thing is totally self-contained and self-documenting (including relevant background, reasoning/justification, considerations, etc.-- anything we'd want our \"future self\" to know about the goals and intentions and thought process and how it serves the over-arching goals of the project.) Follow the beads-workflow discipline: check your beads N times before implementing, keep each bead self-contained (background, reasoning, acceptance criteria), and link dependencies with `br dep add`. Every bead description carries a ## VERIFY fence (the exact command that proves acceptance) — a bead without a verifiable gate is not implementation-ready (plan review re-checks this).",
+                "OK so please take ALL of that and elaborate on it more and then create a comprehensive and granular set of beads for all this with tasks, subtasks, and dependency structure overlaid, with detailed comments so that the whole thing is totally self-contained and self-documenting (including relevant background, reasoning/justification, considerations, etc.-- anything we'd want our \"future self\" to know about the goals and intentions and thought process and how it serves the over-arching goals of the project.) Follow the beads-workflow discipline: check your beads N times before implementing, keep each bead self-contained (background, reasoning, acceptance criteria), and link dependencies with `br dep add`. Every bead description carries a ## VERIFY fence (the exact command that proves acceptance) — a bead without a verifiable gate is not implementation-ready (plan review re-checks this). Absorbs plan-polish, wave-dispatch and wave-gate: polish the bead set in place and converge before dispatch. Do not lose any feature or functionality; keep every requirement in the coverage map. Every behaviour names its unit tests and an end-to-end check with structured logs; keep the requirement coverage map, a ## VERIFY fence and ## PRINCIPLES on every bead.",
             ),
             (
-                "ce-plan-review",
-                "Check over each bead super carefully-- are you sure it makes sense? Is it optimal? Could we change anything to make the system work better for users? If so, revise the beads. It's a lot easier and faster to operate in \"plan space\" before we start implementing these things! Every generated bead description MUST carry a ## VERIFY fence (the exact command that proves acceptance) — a bead without a verifiable gate is not implementation-ready.",
+                "ce-work",
+                "Execute the beads via the brief contract. Every dispatched bead carries a filled brief (GOAL / SCOPE / CONTEXT / LEARNINGS / ACCEPTANCE / VERIFY / TIMEBOX / FORBIDDEN / REPORT / PRINCIPLES / STANDING) — the brief IS the work contract, and the lifecycle lives in the standing-orders file named in its STANDING field (read it once before starting; never re-derive it from memory). LEARNINGS carries the chiebukuro lessons matching this scope — their constraints ride the brief; never re-derive a lesson already recorded. IDEMPOTENT RE-ENTRY: before starting a bead, run its VERIFY at HEAD — already green means already done: mark complete and skip (a resumed wave never redoes shipped work). SIMPLIFY AS YOU GO: after each green VERIFY, one behavior-preserving pass (delete weightless code, collapse one-caller wrappers), then re-run the VERIFY. For each bead: run the VERIFY command from the brief, write the receipt to `.flywheel/receipts/<bead-id>-<sha>.<kind>.txt`, then close only with a REPORT that states status, commit sha (commit BEFORE close; bead id IN the commit message), verdict kind, what you actually ran, deviations, and the PRINCIPLES cited (`<name> — <the decision it changed>`). Principles in force: prove-it-works (the close is not done without a legal ledger row — verify with `flywheel ledger check <bead-id>`; the receipt is evidence, the verdict is the proof), fix-root-causes (reproduce before diagnosing; no silencers), sequence-verifiable-units (each bead ends in a check before the next starts). Prefer delegating to the `beads` subagent when available. If another agent (peer) is working in this project, join its shared room and steer on plane S (ADR-0020): `toron channel join steer-<bead-id> --project <slug> --as \"$AGENT_NAME\"` then accept/claim jobs posted there via `toron job list --state open --project <slug> --as \"$AGENT_NAME\"` + `toron job claim <job-id> --project <slug> --as \"$AGENT_NAME\"` (first claimer wins; a second claimer exits 1). Keep shared work on the room; keep secrets on plane P (`toron mail`). COORDINATION (one board, whole stack): before editing, run `toron reserve conflicts --project <slug> --as \"$AGENT_NAME\" --paths '<file-glob>' --json`; a non-empty report means re-plan or split the file set, or run the one genuinely shared edit under `toron reserve with-lease` — never wait on a lease. Reserve narrow write paths (exclusive) under the captain's project, repo-prefixed when you edit a sibling repo (`toron/src/...`); leases are 180 s heartbeats the loop renews, so a dead lane frees its claim in under three minutes. Peer-first on a real overlap: mail the holder or `flywheel collab`; escalate to the captain only when the holder is silent or a shared build breaks (name the file and the error in the same message). Keep shared crates compiling: land compile-green slices and announce a red shared crate immediately. Release at close with `toron reserve release-by-reason <bead>`. No worktree. If the dispatch names no bead binding (no BEAD line), do NOT act on the TASK-ID: stop and ask the captain for the bead id. Ask-user authority (ADR-0010 D15): never self-answer an ask-user finding. Unambiguous restorations of accepted behavior auto-decide — Publish the corr (journaled) and proceed. Expansions (new guarantee, threat model, architecture, destructive, security) stop the stage, Publish the corr, and park on WaitCorr with the five-element escalation (original criterion, proposed expansion, smallest compliant alternative, accept-vs-decline consequences, recommendation) into OPEN DECISIONS. Only an answer/--verdict closes the call; worker-side auto-close is a LoudMiss. CLAIM/CLOSE CEREMONY for every bead: claim BEFORE work with `br update <id> --claim --actor <your pin>` (the PIN — a registered hc slug folds to its pin — and never a username-class assignee; without `--claim` the atomic guard does not run and a second lane overwrites the first), reserve the narrow files you touch, commit BEFORE close with the bead id IN the commit message, then `br gate report <id> --gate <verdict> --provider <pin> --status pass --to closed` and `br close <id> --commit-sha <sha>`. Absorbs ce-simplify, tdd-red and minimal-fix: simplify and self-review are part of the work, not separate stages.",
             ),
             (
-                "plan-polish",
-                "Polish round for the bead set. Check over each bead super carefully. Are you sure it makes sense? Is it optimal? Could we change anything to make the system work better for its users? If so, revise the beads now, in place (br update, br dep add, br create). It is far cheaper to fix the plan here than after implementation. Do not oversimplify. Do not lose any feature or functionality. The coverage map from the grill step lists every requirement; after your revisions each requirement must still map to at least one bead. A requirement may leave the map only by moving to non-goals with a stated reason. Every bead that changes behaviour names its tests: unit tests by file and case, each with what it proves and how it can fail; and an end-to-end check script with detailed, structured logging, so that each step records what it ran, its inputs, and what it observed, and a failure can be diagnosed from the log alone. End-to-end scripts follow the repo test sandbox (temp HOME/XDG, deny-shims, spare ports; never the live store). A large end-to-end suite is its own bead that depends on the feature beads. Every bead stays self-contained: background, reasoning, acceptance, a ## VERIFY fence with the exact command, and ## PRINCIPLES. Dependencies are explicit and acyclic. Look in particular for: missing steps; wrong order; a bead too large to verify in one pass (split it); a bead too small to stand alone (merge it); hidden coupling between beads that will touch the same files; acceptance that cannot fail; missing failure, rollback, or migration paths; missing docs and skill sync. Reply with only JSON: {\"revised\": [], \"added\": [], \"removed\": [], \"coverage\": {}, \"non_goals\": [{\"requirement\": \"<requirement>\", \"reason\": \"...\"}], \"open_risks\": []}. A requirement may leave coverage ONLY by appearing in non_goals with its reason - the coverage fence reads this reply and fails the round otherwise.",
+                "ce-review",
+                "Review the code written by your fellow agents - issues, bugs, errors, problems, inefficiencies, security problems, reliability issues, etc. - and carefully diagnose their underlying root causes using first-principle analysis. Don't restrict yourself to the latest commits; cast a wider net and go super deep. Use ultrathink. Principles in force: prove-it-works (check the real artifact - run the change's VERIFY or the ledger proof, never a self-report), fix-root-causes (reproduce first; name the root, not the symptom), minimize-reader-load (count layers and hidden state; collapse one-caller wrappers). BLOCKER: a REPORT line that cites a PRINCIPLES name without its decision (`<name> - <the decision it changed>`) is a cargo-cult citation - reject it and require the decision the principle changed; on a non-trivial bead (priority <= 2) an empty PRINCIPLES field is an incomplete report (the loop's `principles` checker enforces the same rule: known name + decision clause, required on P0-P2). Review contract (ADR-0009): a finding exists only under a DETECTION CONDITION - the observable circumstance in the work under review, never a topic to opine on; HIGH confidence requires quoted evidence (file:line + the offending text), unquoted high confidence is a reject; INDEPENDENCE - two lenses reasoned in one pane are two perspectives, not two witnesses, so claim corroboration only across separately-dispatched contexts. Each finding carries severity (P0 breakage ... P3 advisory) and an AUTOFIX CLASS: gated_auto | manual | advisory. A finding that merely prefers a different approach than a `settled:` captain decision routes report-only (settled_conflict); a real defect inside a settled approach keeps full severity. Findings land as JSON {\"findings\": [{\"id\", \"severity\", \"condition\", \"evidence\", \"autofix\", \"confidence\"}]}. Review is REPORT-ONLY - applying fixes is a separate authorized pass. Ask-user authority (ADR-0010 D15): a review finding that asks the user a question (an ask-user finding) is never self-answered by the reviewer. Findings that merely restore accepted behavior note the restoration and its evidence. Findings that expand scope (new guarantee, threat model, architecture, destructive, security) escalate report-only with the five-element escalation (original criterion, proposed expansion, smallest compliant alternative, accept-vs-decline consequences, recommendation) and park in OPEN DECISIONS. Only an answer/--verdict closes the call. Absorbs ce-plan-review, ce-evaluate, judge-arms and wave-observe. Reviewers are chosen by the diff's risk; review is report-only and an adequate change needs no findings. Consume ``{{steps.arms}}`` from the job spec when judging arms.",
             ),
             (
-                "ce-execute",
-                "Execute the beads via the brief contract. Every dispatched bead carries a filled brief (GOAL / SCOPE / CONTEXT / LEARNINGS / ACCEPTANCE / VERIFY / TIMEBOX / FORBIDDEN / REPORT / PRINCIPLES / STANDING) — the brief IS the work contract, and the lifecycle lives in the standing-orders file named in its STANDING field (read it once before starting; never re-derive it from memory). LEARNINGS carries the chiebukuro lessons matching this scope — their constraints ride the brief; never re-derive a lesson already recorded. IDEMPOTENT RE-ENTRY: before starting a bead, run its VERIFY at HEAD — already green means already done: mark complete and skip (a resumed wave never redoes shipped work). SIMPLIFY AS YOU GO: after each green VERIFY, one behavior-preserving pass (delete weightless code, collapse one-caller wrappers), then re-run the VERIFY. For each bead: run the VERIFY command from the brief, write the receipt to `.flywheel/receipts/<bead-id>-<sha>.<kind>.txt`, then close only with a REPORT that states status, commit sha (commit BEFORE close; bead id IN the commit message), verdict kind, what you actually ran, deviations, and the PRINCIPLES cited (`<name> — <the decision it changed>`). Principles in force: prove-it-works (the close is not done without a legal ledger row — verify with `flywheel ledger check <bead-id>`; the receipt is evidence, the verdict is the proof), fix-root-causes (reproduce before diagnosing; no silencers), sequence-verifiable-units (each bead ends in a check before the next starts). Prefer delegating to the `beads` subagent when available. If another agent (peer) is working in this project, join its shared room and steer on plane S (ADR-0020): `toron channel join steer-<bead-id> --project <slug> --as \"$AGENT_NAME\"` then accept/claim jobs posted there via `toron job list --state open --project <slug> --as \"$AGENT_NAME\"` + `toron job claim <job-id> --project <slug> --as \"$AGENT_NAME\"` (first claimer wins; a second claimer exits 1). Keep shared work on the room; keep secrets on plane P (`toron mail`). COORDINATION (one board, whole stack): before editing, run `toron reserve conflicts --project <slug> --as \"$AGENT_NAME\" --paths '<file-glob>' --json`; a non-empty report means re-plan or split the file set, or run the one genuinely shared edit under `toron reserve with-lease` — never wait on a lease. Reserve narrow write paths (exclusive) under the captain's project, repo-prefixed when you edit a sibling repo (`toron/src/...`); leases are 180 s heartbeats the loop renews, so a dead lane frees its claim in under three minutes. Peer-first on a real overlap: mail the holder or `flywheel collab`; escalate to the captain only when the holder is silent or a shared build breaks (name the file and the error in the same message). Keep shared crates compiling: land compile-green slices and announce a red shared crate immediately. Release at close with `toron reserve release-by-reason <bead>`. No worktree. If the dispatch names no bead binding (no BEAD line), do NOT act on the TASK-ID: stop and ask the captain for the bead id. Ask-user authority (ADR-0010 D15): never self-answer an ask-user finding. Unambiguous restorations of accepted behavior auto-decide — Publish the corr (journaled) and proceed. Expansions (new guarantee, threat model, architecture, destructive, security) stop the stage, Publish the corr, and park on WaitCorr with the five-element escalation (original criterion, proposed expansion, smallest compliant alternative, accept-vs-decline consequences, recommendation) into OPEN DECISIONS. Only an answer/--verdict closes the call; worker-side auto-close is a LoudMiss. CLAIM/CLOSE CEREMONY for every bead: claim BEFORE work with `br update <id> --claim --actor <your pin>` (the PIN — a registered hc slug folds to its pin — and never a username-class assignee; without `--claim` the atomic guard does not run and a second lane overwrites the first), reserve the narrow files you touch, commit BEFORE close with the bead id IN the commit message, then `br gate report <id> --gate <verdict> --provider <pin> --status pass --to closed` and `br close <id> --commit-sha <sha>`.",
-            ),
-            (
-                "ce-simplify",
-                "Behavior-preserving refinement of FRESHLY changed code (ADR-0009 ce-simplify) — run after a green VERIFY, before review. Delete weightless code; collapse one-caller wrappers and needless indirection; refuse new abstractions. VERIFY with the SAME command before and after — byte-identical behavior is the contract; any behavior change is a bug you introduced. Scope ONLY the change's own files (fix-owned files), never adjacent work-in-progress. If nothing improves by deletion, say so and stop — a no-op simplify is a clean skip (terminal: clean_skip), not a failure.",
+                "ce-verify",
+                "Independently prove the change (different model family, ADR-0019 Spec 4). VERIFY from the bead: test green + repro gone. Record unit-test-verified. Do not re-implement. Absorbs wave-verify, baseline-measure and measure-keep-or-discard. Evaluate from a FRESH context with a structured advisory contract: return remaining_work and validation_evidence, stay READ-ONLY, and remember VerifySink is advisory — never the pass/fail authority.",
             ),
             (
                 "ce-compound",
-                "Compound gate (ADR-0009, bd-t5f0v): after a VERIFIED solution, decide whether the work produced a durable learning, then capture it. The gate is three-part and ALL must hold: NON-OBVIOUS (the reasoning is not recoverable from the final code, tests, types, or comments), DURABLE (an invariant, root cause, rejected approach, or convention useful beyond this diff), MATERIAL (forgetting it would plausibly cause recurrence or substantial rediscovery). Counterfactual: if the learning vanished, would the next crew redo this investigation? If not, reply {\"terminal\": \"clean_skip\"} — completion alone never qualifies; effort and diff size are not evidence. ONE learning per run. RECALL FIRST (label each lane): [wiki] `chie qmd search \"<q>\" --agent`, [memory] `chie memory recall`, [traps] `flywheel memory check-trap \"<keywords>\"`. High overlap REINFORCES the existing lesson in place — re-record the updated line, stamped reinforced: <today> (ADR-0010 D12) — never a duplicate. Otherwise WRITE: `flywheel memory record-lesson` one \"X breaks when Y; do Z\" line — in every mode, bead or not — naming the bead and commit where they exist. Chiebukuro is the ONLY learning store: no repo-side corpus or perishable file is written. SELF-CHECK every claim: each sentence asserting a fact about the work must cite the commit, receipt, or command that proves it; an uncited claim is a draft, not a finding. NO human wait at write time — record and move on; maintenance is `chie memory promote` / `chie memory forget` at sweep time (ce-sweep). Reply with ONLY {\"terminal\": \"recorded|clean_skip\", \"lesson\": \"...\"}. A failed capture NEVER blocks the run — report and move on.",
+                "Compound gate (ADR-0009, bd-t5f0v): after a VERIFIED solution, decide whether the work produced a durable learning, then capture it. The gate is three-part and ALL must hold: NON-OBVIOUS (the reasoning is not recoverable from the final code, tests, types, or comments), DURABLE (an invariant, root cause, rejected approach, or convention useful beyond this diff), MATERIAL (forgetting it would plausibly cause recurrence or substantial rediscovery). Counterfactual: if the learning vanished, would the next crew redo this investigation? If not, reply {\"terminal\": \"clean_skip\"} — completion alone never qualifies; effort and diff size are not evidence. ONE learning per run. RECALL FIRST (label each lane): [wiki] `chie qmd search \"<q>\" --agent`, [memory] `chie memory recall`, [traps] `flywheel memory check-trap \"<keywords>\"`. High overlap REINFORCES the existing lesson in place — re-record the updated line, stamped reinforced: <today> (ADR-0010 D12) — never a duplicate. Otherwise WRITE: `flywheel memory record-lesson` one \"X breaks when Y; do Z\" line — in every mode, bead or not — naming the bead and commit where they exist. Chiebukuro is the ONLY learning store: no repo-side corpus or perishable file is written. SELF-CHECK every claim: each sentence asserting a fact about the work must cite the commit, receipt, or command that proves it; an uncited claim is a draft, not a finding. NO human wait at write time — record and move on; maintenance is `chie memory promote` / `chie memory forget` at sweep time (ce-sweep). Reply with ONLY {\"terminal\": \"recorded|clean_skip\", \"lesson\": \"...\"}. A failed capture NEVER blocks the run — report and move on. Use the cheapest durable form that prevents recurrence: a test or lint rule, then an AGENTS rule, then a chiebukuro lesson. At most one per run; skip when the work went as planned.",
             ),
             (
-                "commit-and-push",
-                "Now, based on your knowledge of the project, commit all changed files now in a series of logically connected groupings with super detailed commit messages for each and then push. Take your time to do it right. Don't edit the code at all. Don't commit obviously ephemeral files. Use ultrathink. ADR-0019 commit contract: put the bead id IN the commit message; stage ONLY your reserved paths (never `git add -A` — cross-sweep race); commit BEFORE closing the bead; the close reason carries the VERIFY tail (what you actually ran).",
+                "ce-debug",
+                "Diagnose the symptom — instrument the live surface or read the artifact; the deliverable is the DIAGNOSIS with the reproducing evidence, root cause, and confidence. Read-only: no mutations to the repo or the target. Absorbs repro-baseline: reproduce before diagnosing.",
             ),
             (
-                "repo-map",
-                "Cold-start mapping (onboard step 1): read AGENTS.md and the top-level docs in this repo, list the crate/module structure and the main entry points, and trace how the pieces connect (entry points, core modules, tests, build/lint commands). Produce a concise map the newcomer can act from — paths, responsibilities, conventions, and the exact commands to build, test, and lint.",
-            ),
-            (
-                "seed-first-task",
-                "Onboard step 2: from the repo map produced in the previous step, seed the newcomer's context — summarize the map, state the conventions they MUST follow (TDD, skills, code style), and propose ONE narrow first task with [paths] [change] [acceptance] so they can start immediately.",
-            ),
-            (
-                "bv-triage",
-                "Deep-triage step 1: run `bv --robot-triage` (and `br ready --json` for the actionable subset) over this project's beads, then produce a compact summary: counts by status/priority, the top actionable items, blockers, and any cycles or stale items worth attention.",
-            ),
-            (
-                "prioritize-assign",
-                "Deep-triage step 2: from the bv-triage summary, prioritize the actionable backlog in dependency order and assign each item to an owner (agent identity registered in the project). Output an ordered, owned list the crew can execute.",
-            ),
-            (
-                "repro-baseline",
-                "Run or write the repro for the reported symptom. ACCEPTANCE: the command exits non-zero (or visibly shows the bug). Record the exact failing output as the baseline.",
-            ),
-            (
-                "tdd-red",
-                "Write the FAILING test first (RED). VERIFY: the new test FAILS. Do not fix anything yet.",
-            ),
-            (
-                "minimal-fix",
-                "Apply the MINIMAL fix against the failing test. VERIFY: the test PASSES AND the original repro no longer reproduces.",
-            ),
-            (
-                "prove-verify",
-                "Independently prove the change (different model family, ADR-0019 Spec 4). VERIFY from the bead: test green + repro gone. Record unit-test-verified. Do not re-implement.",
-            ),
-            (
-                "baseline-measure",
-                "Run the baseline/invariant command and store the receipt — this is the baseline that must stay green.",
-            ),
-            (
-                "measure-keep-or-discard",
-                "Measure with the SAME command against the change. If improved: KEEP — the improved state becomes the new baseline. If NOT improved: DISCARD — a revert, never a leftover.",
-            ),
-            (
-                "judge-arms",
-                "Judge the arms for the question. Compare on the named criteria (fit to the question, design quality, feasibility, blast radius). Arms (branch envelope — the collected arm reports live under outputs.arm): {{steps.arms}}. Pick ONE; the others are DISCARDED. No merge of a bit-of-each unless a graft bead is written. Report: chosen arm + the comparison table.",
-            ),
-            (
-                "diagnose-only",
-                "Diagnose the symptom — instrument the live surface or read the artifact; the deliverable is the DIAGNOSIS with the reproducing evidence, root cause, and confidence. Read-only: no mutations to the repo or the target.",
-            ),
-            (
-                "resume-pickup",
-                "Session pickup (ADR-0019): read .flywheel/agent-state/, `br list --status in_progress --json` for stranded beads, ledger gaps, and the last-sent registry; respawn context-exhausted panes; resume briefs for stranded in_progress beads. Idempotent: a done pickup finds nothing to do. Keep SUMMARIES in your report, not raw dumps (guard-the-context-window).",
-            ),
-            (
-                "wave-verify",
-                "Wave verify (ADR-0006 D3): for each close claim confirm ALL of: (1) the receipt exists at the committed HEAD — `flywheel ledger check <bead-id>`; (2) the close reason carries its VERIFY tail (what was actually run + the result tail); (3) PRINCIPLES citations name decisions (`<name> — <decision>`, cargo-cult bare names are rejects). RESIDUAL GATE (ADR-0009): every finding from the REVIEW step is either FIXED (evidenced in the diff) or FILED — a `br create` bead id cited in the close; a finding that lives only in the session fails this gate. TERMINAL STATES (ADR-0009): report files carry `terminal: done|clean_skip|blocked|failed` — clean_skip is a SUCCESS outcome (the gate judged the work N/A); a MISSING report stays unknown, never assumed failed. A close missing any of these REOPENS: post `[verify] reopen <id>: <missing>` on the steer channel. Verify against the real artifact, never a self-report. DIRT POLICY: only dirt under source/, tests/, benches/, Cargo.toml, Cargo.lock, and pinned toolchain files blocks a receipt. Tracker state (.beads/), orchestrator bookkeeping (.flywheel/), and editor artifacts are always-allowed dirt — note them and proceed; never stall a receipt on them. Anything else dirty: post-and-stop. Settle with `toron job result <job-id> --status ok --project <slug> --as <pin> --witness <file.json>`; the witness file carries the gate record (command run, exit 0, recorded output). An unproven close settles as failed naming the gap.",
+                "ce-explore",
+                "I want you to sort of randomly explore the code files in this project, choosing code files to deeply investigate and understand and trace their functionality and execution flows through the related code files which they import or which are imported by. Once you understand the purpose of the code in the larger context of the workflows, I want you to do a super careful, methodical, and critical check with \"fresh eyes\" to find any obvious bugs, problems, errors, issues, silly mistakes, etc. and then systematically and meticulously and intelligently correct them. Be sure to comply with ALL rules in AGENTS dot md. Absorbs repo-map and resume-pickup: map the repo and resume from its existing pickup state.",
             ),
         ];
         let mut stages = BTreeMap::new();
@@ -725,12 +589,20 @@ impl StageLibrary {
 
     /// Canonical name (identity — ADR-0009 retired the alias indirection).
     fn canonical(&self, name: &str) -> String {
-        name.to_string()
+        STAGE_ALIASES
+            .iter()
+            .find(|(old, _)| *old == name)
+            .map(|(_, new)| (*new).to_string())
+            .unwrap_or_else(|| name.to_string())
     }
 
     /// The full stage record for a name.
     pub fn get_stage(&self, name: &str) -> Option<&Stage> {
-        self.stages.get(name)
+        let canonical = self.canonical(name);
+        if canonical != name {
+            eprintln!("flywheel: stage '{name}' is deprecated; use '{canonical}' (one release)");
+        }
+        self.stages.get(&canonical)
     }
 
     /// Build the durable-body witness seam from this catalog: unknown
@@ -784,7 +656,9 @@ impl StageLibrary {
 
     /// Resolve a stage name to its prompt.
     pub fn resolve(&self, name: &str) -> Option<&str> {
-        self.stages.get(name).map(|s| s.prompt.as_str())
+        self.stages
+            .get(&self.canonical(name))
+            .map(|s| s.prompt.as_str())
     }
 
     /// True when `name` resolves.
@@ -1029,13 +903,24 @@ pub fn unreferenced_stages(
     all: &[String],
     referenced: &std::collections::HashSet<String>,
 ) -> Vec<String> {
-    let mut out: Vec<String> = all
+    // bd-ihiqo.4: compare canonical names on both sides. Workflows still name
+    // the old stages for one release, and the operator's tiers still carry
+    // them; neither should make a live canonical stage look unused.
+    let canonical = |n: &str| {
+        STAGE_ALIASES
+            .iter()
+            .find(|(old, _)| *old == n)
+            .map(|(_, new)| (*new).to_string())
+            .unwrap_or_else(|| n.to_string())
+    };
+    let wanted: std::collections::HashSet<String> =
+        referenced.iter().map(|n| canonical(n)).collect();
+    let out: std::collections::BTreeSet<String> = all
         .iter()
-        .filter(|n| !referenced.contains(*n))
-        .cloned()
+        .map(|n| canonical(n))
+        .filter(|n| !wanted.contains(n))
         .collect();
-    out.sort();
-    out
+    out.into_iter().collect()
 }
 
 /// bd-jhz8x.4 (ADR-0021 D6): an unused stage fails `workflow verify`.
@@ -1327,6 +1212,18 @@ pub mod learning {
     }
 }
 
+/// bd-ihiqo.4: the 8-stage cutover keeps one release of old names as
+/// aliases, so a running workflow does not break mid-release.
+#[test]
+fn old_stage_names_resolve_as_aliases_for_one_release() {
+    let lib = StageLibrary::compiled_in();
+    assert_eq!(lib.stages.len(), 8, "the canonical seed has 8 stages");
+    assert_eq!(lib.canonical("ce-execute"), "ce-work");
+    assert_eq!(lib.canonical("prove-verify"), "ce-verify");
+    assert_eq!(lib.canonical("fresh-eyes-explore"), "ce-explore");
+    assert!(lib.has("ce-execute"), "the old name still resolves");
+    assert!(lib.get_stage("ce-execute").is_some());
+}
 #[cfg(test)]
 mod adr0010_d12_tests {
     // governed-by: ADR-0010 D12 (bd-fmya) — learnings tier/reinforced +
@@ -1613,50 +1510,50 @@ mod tests {
     }
 
     /// ADR-0009: the p-code aliases are RETIRED — `p6` no longer resolves;
-    /// `ce-execute` is the name (clean cutover, no shims).
+    /// `ce-work` is the name (clean cutover, no shims).
     #[test]
     fn stage_p_codes_retired_ce_names_resolve() {
         let lib = StageLibrary::compiled_in();
         for code in ["p1", "p2", "p4", "p5", "p6", "p8"] {
             assert!(lib.resolve(code).is_none(), "{code} must not resolve");
         }
-        assert!(lib.has("ce-execute"), "ce-execute resolves");
+        assert!(lib.has("ce-work"), "ce-work resolves");
     }
 
-    /// W3 (bd-w3-stages-o8lg), renamed by ADR-0009: ce-execute names the
+    /// W3 (bd-w3-stages-o8lg), renamed by ADR-0009: ce-work names the
     /// three verification principles + the `flywheel ledger` CLI; ce-review
     /// carries the cargo-cult BLOCKER language and the ADR-0009 review
     /// contract (detection condition, evidence quotes, independence).
     #[test]
     fn ce_stages_cite_verification_principles_and_ledger() {
         let lib = StageLibrary::compiled_in();
-        let execute = lib.resolve("ce-execute").expect("ce-execute resolves");
+        let execute = lib.resolve("ce-work").expect("ce-work resolves");
         for name in [
             "prove-it-works",
             "fix-root-causes",
             "sequence-verifiable-units",
         ] {
-            assert!(execute.contains(name), "ce-execute must name {name}");
+            assert!(execute.contains(name), "ce-work must name {name}");
         }
         assert!(
             execute.contains("flywheel ledger check"),
-            "ce-execute cites the ledger CLI"
+            "ce-work cites the ledger CLI"
         );
         assert!(
             execute.contains("IDEMPOTENT RE-ENTRY"),
-            "ce-execute carries the ADR-0009 idempotent re-entry rule"
+            "ce-work carries the ADR-0009 idempotent re-entry rule"
         );
         assert!(
             execute.contains("LEARNINGS"),
-            "ce-execute brief carries the LEARNINGS field"
+            "ce-work brief carries the LEARNINGS field"
         );
         assert!(
             execute.contains("COORDINATION (one board"),
-            "ce-execute carries the reservation conflict protocol"
+            "ce-work carries the reservation conflict protocol"
         );
         assert!(
             execute.contains("reserve conflicts"),
-            "ce-execute names the pre-edit conflict check"
+            "ce-work names the pre-edit conflict check"
         );
         let review = lib.resolve("ce-review").expect("ce-review resolves");
         for name in ["prove-it-works", "fix-root-causes", "minimize-reader-load"] {
@@ -1681,7 +1578,7 @@ mod tests {
     }
 
     /// bd-ceiling-report-template-vz8a: ONE ceiling shape, rendered into the
-    /// stages that hit (ce-execute) and carry (wave-verify accepts the
+    /// stages that hit (ce-work) and carry (ce-verify accepts the
     /// amendment close) a ceiling. Pinned on
     /// `compiled_in()` — the tier this change edits; a user-tier copy
     /// legitimately differs and `load()` would flake on machines holding one.
@@ -1716,20 +1613,20 @@ mod tests {
 
     /// ADR-0009: the compiled-in library exposes the ce- loop — brainstorm,
     /// plan, plan-review, execute, simplify, review, compound — plus
-    /// commit-and-push.
+    /// ce-work.
     #[test]
     fn compiled_in_exposes_ce_loop() {
         let lib = StageLibrary::compiled_in();
         for name in [
             "ce-brainstorm",
             "ce-plan",
-            "ce-plan-review",
-            "ce-execute",
-            "ce-simplify",
             "ce-review",
-            "ce-evaluate",
+            "ce-work",
+            "ce-work",
+            "ce-review",
+            "ce-verify",
             "ce-compound",
-            "commit-and-push",
+            "ce-work",
         ] {
             assert!(lib.has(name), "compiled-in stage {name} resolves");
         }
@@ -1753,15 +1650,15 @@ mod tests {
             Some("housekeeper")
         );
         assert_eq!(
-            lib.get_stage("ce-execute").unwrap().phase.as_deref(),
+            lib.get_stage("ce-work").unwrap().phase.as_deref(),
             Some("implement")
         );
         assert_eq!(
-            lib.get_stage("ce-evaluate").unwrap().phase.as_deref(),
+            lib.get_stage("ce-verify").unwrap().phase.as_deref(),
             Some("verify")
         );
         assert_eq!(
-            lib.get_stage("ce-evaluate").unwrap().role.as_deref(),
+            lib.get_stage("ce-verify").unwrap().role.as_deref(),
             Some("reviewer")
         );
     }
@@ -1770,7 +1667,7 @@ mod tests {
     #[test]
     fn ce_evaluate_is_fresh_context_advisory_contract() {
         let lib = StageLibrary::compiled_in();
-        let evaluate = lib.resolve("ce-evaluate").expect("ce-evaluate resolves");
+        let evaluate = lib.resolve("ce-verify").expect("ce-verify resolves");
         for needle in [
             "FRESH context",
             "remaining_work",
@@ -1779,7 +1676,7 @@ mod tests {
             "VerifySink",
             "never the pass/fail authority",
         ] {
-            assert!(evaluate.contains(needle), "ce-evaluate must name {needle}");
+            assert!(evaluate.contains(needle), "ce-verify must name {needle}");
         }
     }
 
@@ -1796,37 +1693,34 @@ mod tests {
     /// the bead.
     ///
     /// The coder seat is the remaining taught surface now that /beads-commit
-    /// and the wave-dispatch stage are gone.
+    /// and the ce-plan stage are gone.
     #[test]
     fn close_ceremony_contract_names_gate_sha_and_the_pin_claim() {
         let lib = StageLibrary::compiled_in();
-        let dispatch = lib.resolve("ce-execute").expect("ce-execute resolves");
+        let dispatch = lib.resolve("ce-work").expect("ce-work resolves");
         for needle in [
             "gate report",
             "--commit-sha",
             "--claim --actor",
             "commit BEFORE close",
         ] {
-            assert!(
-                dispatch.contains(needle),
-                "ce-execute must teach {needle:?}"
-            );
+            assert!(dispatch.contains(needle), "ce-work must teach {needle:?}");
         }
         assert!(
             !dispatch.contains("--assignee <hc-name>"),
-            "ce-execute must not teach the hc-slug assignee: the tracker stores a pin, \
+            "ce-work must not teach the hc-slug assignee: the tracker stores a pin, \
              and a slug the registry does not know makes the claim hard-fail"
         );
         assert!(
             !dispatch.contains("--status=in_progress --assignee"),
-            "ce-execute must not teach the unguarded claim: without --claim the atomic \
+            "ce-work must not teach the unguarded claim: without --claim the atomic \
              guard does not run and a second lane can overwrite the first lane's assignee"
         );
         let commit_pos = dispatch.find("commit BEFORE close").expect("order anchor");
         let close_pos = dispatch.find("br close").expect("close anchor");
         assert!(
             commit_pos < close_pos,
-            "ce-execute must order commit before close"
+            "ce-work must order commit before close"
         );
     }
 
@@ -1834,12 +1728,7 @@ mod tests {
     #[test]
     fn onboard_and_triage_deep_stages_resolve() {
         let lib = StageLibrary::compiled_in();
-        for semantic in [
-            "repo-map",
-            "seed-first-task",
-            "bv-triage",
-            "prioritize-assign",
-        ] {
+        for semantic in ["ce-explore", "ce-plan", "ce-plan", "ce-plan"] {
             assert!(
                 lib.resolve(semantic).is_some(),
                 "stage {semantic} resolves (bd-oj9o #2)"
@@ -1848,22 +1737,22 @@ mod tests {
     }
 
     /// bd-h9xn: the ADR-0019 playbook stages (extracted from the inline
-    /// task: strings) all resolve — repro-baseline, tdd-red, minimal-fix,
-    /// prove-verify, baseline-measure, measure-keep-or-discard, judge-arms,
-    /// diagnose-only, resume-pickup. Each is p-code-free (empty alias).
+    /// task: strings) all resolve — ce-debug, ce-work, ce-work,
+    /// ce-verify, ce-verify, ce-verify, ce-review,
+    /// ce-debug, ce-explore. Each is p-code-free (empty alias).
     #[test]
     fn playbook_stages_resolve() {
         let lib = StageLibrary::compiled_in();
         for semantic in [
-            "repro-baseline",
-            "tdd-red",
-            "minimal-fix",
-            "prove-verify",
-            "baseline-measure",
-            "measure-keep-or-discard",
-            "judge-arms",
-            "diagnose-only",
-            "resume-pickup",
+            "ce-debug",
+            "ce-work",
+            "ce-work",
+            "ce-verify",
+            "ce-verify",
+            "ce-verify",
+            "ce-review",
+            "ce-debug",
+            "ce-explore",
         ] {
             let stage = lib
                 .stages
@@ -1890,12 +1779,12 @@ mod tests {
         std::fs::create_dir_all(dir.join("flywheel")).unwrap();
         std::fs::write(
             dir.join("flywheel/stages.toml"),
-            "[stages.judge-arms]\nname = \"judge-arms\"\nprompt = \"MY JUDGE OVERRIDE\"\n",
+            "[stages.ce-review]\nname = \"ce-review\"\nprompt = \"MY JUDGE OVERRIDE\"\n",
         )
         .unwrap();
         let lib = StageLibrary::load().unwrap();
         assert_eq!(
-            lib.resolve("judge-arms"),
+            lib.resolve("ce-review"),
             Some("MY JUDGE OVERRIDE"),
             "toml override reaches the playbook stage"
         );
@@ -1903,24 +1792,24 @@ mod tests {
     }
 
     /// ADR-0009: a user `stages.toml` override replaces a compiled-in prompt
-    /// (the ce-execute rename survives overrides — the override keys the
+    /// (the ce-work rename survives overrides — the override keys the
     /// semantic name).
     #[test]
     fn user_override_replaces_prompt() {
         let _g = crate::config::lock_env();
         let lib = StageLibrary::compiled_in();
-        let old = lib.resolve("ce-execute").unwrap().to_string();
+        let old = lib.resolve("ce-work").unwrap().to_string();
         let dir = std::env::temp_dir().join(format!("fw-stages-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", &dir) };
         std::fs::create_dir_all(dir.join("flywheel")).unwrap();
         std::fs::write(
             dir.join("flywheel/stages.toml"),
-            "[stages.ce-execute]\nname = \"ce-execute\"\nprompt = \"MY OVERRIDE PROMPT\"\n",
+            "[stages.ce-work]\nname = \"ce-work\"\nprompt = \"MY OVERRIDE PROMPT\"\n",
         )
         .unwrap();
         let lib2 = StageLibrary::load().unwrap();
-        assert_eq!(lib2.resolve("ce-execute"), Some("MY OVERRIDE PROMPT"));
+        assert_eq!(lib2.resolve("ce-work"), Some("MY OVERRIDE PROMPT"));
         assert_ne!(old, "MY OVERRIDE PROMPT");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1931,11 +1820,11 @@ mod tests {
     fn w6_seed_affinities_present() {
         let lib = StageLibrary::compiled_in();
         assert_eq!(
-            lib.get_stage("fresh-eyes-explore").unwrap().role.as_deref(),
+            lib.get_stage("ce-explore").unwrap().role.as_deref(),
             Some("scout")
         );
         assert_eq!(
-            lib.get_stage("ce-execute").unwrap().role.as_deref(),
+            lib.get_stage("ce-work").unwrap().role.as_deref(),
             Some("coder")
         );
     }
@@ -1966,7 +1855,7 @@ mod tests {
         let lib_user_only = StageLibrary::load().unwrap();
         assert_eq!(lib_user_only.resolve("w6-layered"), Some("USER TIER"));
         assert_eq!(lib_user_only.tier_of("w6-layered"), Some(Tier::User));
-        assert_eq!(lib.tier_of("ce-execute"), Some(Tier::Seed));
+        assert_eq!(lib.tier_of("ce-work"), Some(Tier::Seed));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1976,15 +1865,15 @@ mod tests {
     fn cfgv_stage_override_field_level_merge() {
         let mut lib = StageLibrary::compiled_in();
         assert_eq!(
-            lib.get_stage("ce-execute").unwrap().role.as_deref(),
+            lib.get_stage("ce-work").unwrap().role.as_deref(),
             Some("coder")
         );
         lib.apply_toml(
-            "[stages.ce-execute]\nname = \"ce-execute\"\nprompt = \"USER PROMPT\"\n",
+            "[stages.ce-work]\nname = \"ce-work\"\nprompt = \"USER PROMPT\"\n",
             Tier::User,
         )
         .unwrap();
-        let s = lib.get_stage("ce-execute").unwrap();
+        let s = lib.get_stage("ce-work").unwrap();
         assert_eq!(s.prompt, "USER PROMPT", "override wins its own field");
         assert_eq!(
             s.role.as_deref(),
@@ -1993,16 +1882,16 @@ mod tests {
         );
         assert_eq!(s.phase.as_deref(), Some("implement"), "seed phase survives");
         assert_eq!(
-            lib.tier_of("ce-execute"),
+            lib.tier_of("ce-work"),
             Some(Tier::User),
             "tier tag reports the top tier"
         );
         lib.apply_toml(
-            "[stages.ce-execute]\nname = \"ce-execute\"\nprompt = \"P2\"\nrole = \"reviewer\"\nparams = [\"bead\"]\n",
+            "[stages.ce-work]\nname = \"ce-work\"\nprompt = \"P2\"\nrole = \"reviewer\"\nparams = [\"bead\"]\n",
             Tier::Project,
         )
         .unwrap();
-        let s = lib.get_stage("ce-execute").unwrap();
+        let s = lib.get_stage("ce-work").unwrap();
         assert_eq!(s.role.as_deref(), Some("reviewer"), "declared field wins");
         assert_eq!(s.params, vec!["bead".to_string()], "declared params win");
         assert_eq!(
@@ -2023,21 +1912,21 @@ mod tests {
     fn per_entry_stage_overrides_legacy_aggregate() {
         let mut lib = StageLibrary::compiled_in();
         lib.apply_toml(
-            "[stages.ce-execute]\nname = \"ce-execute\"\nprompt = \"legacy\"\n",
+            "[stages.ce-work]\nname = \"ce-work\"\nprompt = \"legacy\"\n",
             Tier::User,
         )
         .unwrap();
         let dir = std::env::temp_dir().join(format!("fw-stage-entry-{}", uuid::Uuid::new_v4()));
         let mut stage = StageLibrary::compiled_in()
-            .get_stage("ce-execute")
+            .get_stage("ce-work")
             .unwrap()
             .clone();
         stage.prompt = "per-entry".into();
-        let path = dir.join("ce-execute.toml");
+        let path = dir.join("ce-work.toml");
         upsert_stage_entry(&path, &stage).unwrap();
         lib.apply_stage_entry_path(&path, Tier::User).unwrap();
-        assert_eq!(lib.resolve("ce-execute"), Some("per-entry"));
-        assert_eq!(lib.tier_of("ce-execute"), Some(Tier::User));
+        assert_eq!(lib.resolve("ce-work"), Some("per-entry"));
+        assert_eq!(lib.tier_of("ce-work"), Some(Tier::User));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2118,21 +2007,24 @@ mod tests {
         assert!(check_repo_evidence(2, true));
     }
 
-    /// The one wave stage left: gate/dispatch/observe are ENGINE steps
-    /// (ADR-0021 D4.5), so their prompts are gone and must stay gone.
+    /// bd-ihiqo.4: the 8 canonical ce- stages are compiled in; the retired
+    /// wave engine steps resolve as aliases, not as seed entries.
     #[test]
     fn wave_swarm_stages_resolve_compiled_in() {
         let lib = StageLibrary::compiled_in();
-        assert!(
-            lib.has("wave-verify"),
-            "compiled-in stage wave-verify resolves"
-        );
-        for retired in ["wave-gate", "wave-dispatch", "wave-observe"] {
-            assert!(
-                !lib.has(retired),
-                "{retired} is an engine step now, not a stage: a prompt for it is dead config"
-            );
+        for name in [
+            "ce-brainstorm",
+            "ce-plan",
+            "ce-work",
+            "ce-review",
+            "ce-verify",
+            "ce-compound",
+            "ce-debug",
+            "ce-explore",
+        ] {
+            assert!(lib.has(name), "compiled-in stage {name} resolves");
         }
+        assert_eq!(lib.stages.len(), 8, "the seed has exactly 8 stages");
     }
 }
 
@@ -2191,37 +2083,37 @@ mod stage_contract_tests {
     }
 
     /// ADR-0021 D3/D6: every seed stage carries a phase + use_when; the
-    /// named seeds carry their contract data (judge-arms reads, plan-polish
+    /// named seeds carry their contract data (ce-review reads, ce-plan
     /// effort/reads/repeat, review + verify seats fresh/read-only).
     #[test]
     fn stage_contract_seed_phases_complete() {
         let lib = StageLibrary::compiled_in();
         let names = [
-            "fresh-eyes-explore",
+            "ce-explore",
             "ce-brainstorm",
             "ce-review",
-            "ce-evaluate",
+            "ce-verify",
             "ce-plan",
-            "ce-plan-review",
-            "plan-polish",
-            "ce-execute",
-            "ce-simplify",
+            "ce-review",
+            "ce-plan",
+            "ce-work",
+            "ce-work",
             "ce-compound",
-            "commit-and-push",
-            "repo-map",
-            "seed-first-task",
-            "bv-triage",
-            "prioritize-assign",
-            "repro-baseline",
-            "tdd-red",
-            "minimal-fix",
-            "prove-verify",
-            "baseline-measure",
-            "measure-keep-or-discard",
-            "judge-arms",
-            "diagnose-only",
-            "resume-pickup",
-            "wave-verify",
+            "ce-work",
+            "ce-explore",
+            "ce-plan",
+            "ce-plan",
+            "ce-plan",
+            "ce-debug",
+            "ce-work",
+            "ce-work",
+            "ce-verify",
+            "ce-verify",
+            "ce-verify",
+            "ce-review",
+            "ce-debug",
+            "ce-explore",
+            "ce-verify",
         ];
         assert_eq!(names.len(), 25, "all seeds enumerated");
         for name in names {
@@ -2237,9 +2129,9 @@ mod stage_contract_tests {
                 "{name} has a use_when line"
             );
         }
-        let judge = lib.get_stage("judge-arms").expect("judge-arms");
+        let judge = lib.get_stage("ce-review").expect("ce-review");
         assert_eq!(judge.reads, vec!["steps.arms".to_string()]);
-        let polish = lib.get_stage("plan-polish").expect("plan-polish");
+        let polish = lib.get_stage("ce-plan").expect("ce-plan");
         assert_eq!(polish.effort.as_deref(), Some("max"));
         assert_eq!(polish.reads, vec!["inputs.objective".to_string()]);
         assert_eq!(
@@ -2250,7 +2142,7 @@ mod stage_contract_tests {
                 until: "converged".to_string()
             })
         );
-        for name in ["ce-review", "ce-evaluate", "prove-verify", "wave-verify"] {
+        for name in ["ce-review", "ce-verify", "ce-verify", "ce-verify"] {
             let st = lib
                 .get_stage(name)
                 .unwrap_or_else(|| panic!("{name} seeded"));
@@ -2279,7 +2171,7 @@ mod stage_contract_tests {
             .expect("load stage");
 
         let mut wf = toron_workflow::schema::parse_workflow(
-            "name: stamp\nsteps:\n  - name: execute\n    action: dispatch_job\n    assignee: x\n    spec: { task: go, stage: ce-execute }\n    on_error: fail_run\n  - name: review\n    action: dispatch_job\n    assignee: x\n    spec: { task: check, stage: claim-review }\n    on_error: fail_run\n  - name: verify\n    action: dispatch_job\n    assignee: x\n    spec: { task: verify, stage: wave-verify }\n    on_error: fail_run\n",
+            "name: stamp\nsteps:\n  - name: execute\n    action: dispatch_job\n    assignee: x\n    spec: { task: go, stage: ce-work }\n    on_error: fail_run\n  - name: review\n    action: dispatch_job\n    assignee: x\n    spec: { task: check, stage: claim-review }\n    on_error: fail_run\n  - name: verify\n    action: dispatch_job\n    assignee: x\n    spec: { task: verify, stage: ce-verify }\n    on_error: fail_run\n",
         )
         .expect("parse workflow");
         assert_eq!(
@@ -2311,7 +2203,7 @@ mod stage_contract_tests {
         );
         assert!(
             !spec_of("verify").extra.contains_key("exclude_claimants_of"),
-            "wave-verify is not a review-witness step"
+            "ce-verify is not a review-witness step"
         );
 
         // Idempotent: re-stamping writes the same list, never a duplicate key.
@@ -2342,7 +2234,7 @@ mod stage_contract_tests {
     #[test]
     fn stage_contract_merge_keeps_seed_fields() {
         let lib = StageLibrary::compiled_in();
-        let base = lib.get_stage("judge-arms").expect("seed").clone();
+        let base = lib.get_stage("ce-review").expect("seed").clone();
         let over = Stage {
             name: base.name.clone(),
             prompt: "new prompt".to_string(),
@@ -2413,10 +2305,10 @@ mod stage_contract_tests {
         );
         let mut refs = std::collections::HashSet::new();
         collect_stage_refs(
-            &serde_json::json!({"spec": {"stage": "judge-arms"}}),
+            &serde_json::json!({"spec": {"stage": "ce-review"}}),
             &mut refs,
         );
-        assert!(refs.contains("judge-arms"));
+        assert!(refs.contains("ce-review"));
     }
 
     /// Missing phase is an ERROR on seed/repo tiers, a WARNING on
@@ -2454,7 +2346,7 @@ mod stage_contract_tests {
         st.context = Some(StageContext::Fresh);
         st.effort = Some("max".to_string());
         st.reads = vec!["inputs.objective".to_string()];
-        st.witness = Some("plan-polish.v1".to_string());
+        st.witness = Some("ce-plan.v1".to_string());
         st.repeat = Some(Repeat {
             min: 2,
             max: 5,
@@ -2549,11 +2441,10 @@ mod unused_stage_gate_tests {
         assert_eq!(
             declared,
             vec![
-                "ce-simplify".to_string(),
-                "fresh-eyes-explore".to_string(),
-                "minimal-fix".to_string(),
-                "repro-baseline".to_string(),
-                "tdd-red".to_string(),
+                "ce-debug".to_string(),
+                "ce-explore".to_string(),
+                "ce-review".to_string(),
+                "ce-verify".to_string(),
             ],
             "the declared manual/compose surface is explicit, not incidental"
         );
@@ -2561,10 +2452,9 @@ mod unused_stage_gate_tests {
             assert!(lib.has(&name), "{name} declares a reach, so it must exist");
         }
         assert_eq!(
-            lib.get_stage("fresh-eyes-explore")
-                .and_then(|s| s.reached_by),
+            lib.get_stage("ce-explore").and_then(|s| s.reached_by),
             Some(super::StageReach::Compose),
-            "fresh-eyes-explore is reached by a compose token"
+            "ce-explore is reached by a compose token"
         );
     }
 }

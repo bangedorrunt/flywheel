@@ -663,13 +663,10 @@ pub fn assemble_with_catalog(
 pub const JOIN_STAGES: &[&str] = &[
     "ce-brainstorm",
     "ce-plan",
-    "ce-plan-review",
-    "ce-execute",
-    "ce-simplify",
+    "ce-work",
     "ce-review",
-    "ce-evaluate",
+    "ce-verify",
     "ce-compound",
-    "commit-and-push",
 ];
 
 /// bd-mww6u: the sticky-open hold is a *provisional* anti-invent guard. A live
@@ -1143,7 +1140,7 @@ mod tests {
         assert!(!b.proposal.argv.is_empty(), "join carries an arrive argv");
         assert!(
             b.proposal.stages.len() == JOIN_STAGES.len()
-                && b.proposal.stages.contains(&"ce-execute".to_string()),
+                && b.proposal.stages.contains(&"ce-work".to_string()),
             "join carries the stage chain: {:?}",
             b.proposal.stages
         );
