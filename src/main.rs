@@ -104,6 +104,7 @@ mod phase_chain;
 mod phase_contracts;
 mod plan_fence;
 mod plane_route;
+mod pre_edit;
 mod preferences;
 mod preflight;
 mod principles;
@@ -3873,6 +3874,24 @@ fn main() {
             if crate::integration::hook_allowed(in_pane, &pin, agent, seat_harness.as_deref())
                 && let Some((project, _)) = seat
             {
+                if event == "PreToolUse" || event == "pre-edit" {
+                    use std::io::Read as _;
+                    let mut payload = String::new();
+                    let _ = std::io::stdin().read_to_string(&mut payload);
+                    if let Some(path) = crate::pre_edit::path_from_payload(&payload) {
+                        let root = crate::pre_edit::workspace_root();
+                        let lease = crate::pre_edit::lease_path(&path, &root.to_string_lossy());
+                        match crate::pre_edit::acquire(&project, &pin, &lease, None) {
+                            Ok(holder) if !holder.is_empty() => println!(
+                                "{}",
+                                crate::pre_edit::blocked_message(&lease, &holder)
+                            ),
+                            Ok(_) => {}
+                            Err(e) => eprintln!("flywheel: pre-edit lease: {e}"),
+                        }
+                    }
+                    return;
+                }
                 if event == "PreInvocation" {
                     use std::io::Read as _;
                     let mut payload = String::new();

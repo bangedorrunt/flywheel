@@ -116,6 +116,7 @@ pub fn status_of(existing: &Value, agent: &str, events: &[&str]) -> InstallStatu
 
 /// Claude's SessionStart event names used by the trampoline set.
 pub const CLAUDE_EVENTS: &[&str] = &[
+    "PreToolUse",
     "SessionStart",
     "UserPromptSubmit",
     "Stop",
@@ -124,7 +125,13 @@ pub const CLAUDE_EVENTS: &[&str] = &[
     "SubagentStop",
 ];
 /// Codex hook events (same names in ~/.codex/hooks.json).
-pub const CODEX_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "Stop", "PostToolUse"];
+pub const CODEX_EVENTS: &[&str] = &[
+    "PreToolUse",
+    "SessionStart",
+    "UserPromptSubmit",
+    "Stop",
+    "PostToolUse",
+];
 
 #[cfg(test)]
 mod tests {
