@@ -18544,20 +18544,10 @@ fn upsert_pi_toron(path: &std::path::Path, url: &str, dry: bool) -> Result<Strin
         .as_object_mut()
         .expect("mcpServers object ensured just above");
     let prev = servers.get("toron").cloned();
-    // bd-958by: pi-mcp-adapter defaults to `legacy` unless the entry pins a
-    // version. Merge into an existing entry so other server keys survive.
-    let want = match prev.as_ref().and_then(|v| v.as_object()) {
-        Some(existing) => {
-            let mut merged = existing.clone();
-            merged.insert("url".into(), serde_json::json!(url));
-            merged.insert("directTools".into(), serde_json::json!(true));
-            merged.insert("protocolVersion".into(), serde_json::json!("2026-07-28"));
-            serde_json::Value::Object(merged)
-        }
-        None => serde_json::json!({
-            "url":url, "directTools":true, "protocolVersion":"2026-07-28"
-        }),
-    };
+    // bd-958by: pi 1.6's built-in MCP client owns this file; `protocolVersion`
+    // and `directTools` belong to pi-mcp-adapter and are ignored here. pi
+    // negotiates down via bd-9te8e, so the entry stays plain and adapter-free.
+    let want = serde_json::json!({"url":url});
     let action = if prev.is_some() {
         if prev.as_ref() == Some(&want) {
             return Ok("pi unchanged".to_string());
@@ -18764,23 +18754,23 @@ mod setup_mcp_tests {
             .expect("dry run never fails");
     }
 
-    /// bd-958by: a new pi entry pins the draft protocol so pi-mcp-adapter does
-    /// not fall back to `legacy`, and an existing entry is upgraded in place.
+    /// bd-958by: pi 1.6's built-in client ignores adapter-only keys, so the
+    /// entry stays a plain url and other servers are untouched.
     #[test]
-    fn setup_mcp_pi_entry_pins_protocol_version() {
+    fn setup_mcp_pi_entry_is_adapter_free() {
         let path = std::env::temp_dir().join(format!("fw-setup-mcp-pi-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         upsert_pi_toron(&path, "http://127.0.0.1:18080/mcp", false).expect("new pi entry");
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("written")).unwrap();
         assert_eq!(
-            v["mcpServers"]["toron"]["protocolVersion"],
-            serde_json::json!("2026-07-28")
+            v["mcpServers"]["toron"],
+            serde_json::json!({"url": "http://127.0.0.1:18080/mcp"})
         );
 
         let existing = serde_json::json!({
             "mcpServers": {
-                "toron": {"url": "http://old/mcp", "directTools": true},
+                "toron": {"url": "http://old/mcp", "directTools": true, "protocolVersion": "2026-07-28"},
                 "other": {"url": "http://other/mcp"}
             }
         });
@@ -18789,8 +18779,8 @@ mod setup_mcp_tests {
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("written")).unwrap();
         assert_eq!(
-            v["mcpServers"]["toron"]["protocolVersion"],
-            serde_json::json!("2026-07-28")
+            v["mcpServers"]["toron"],
+            serde_json::json!({"url": "http://127.0.0.1:18080/mcp"})
         );
         assert_eq!(
             v["mcpServers"]["other"],
