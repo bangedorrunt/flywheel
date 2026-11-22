@@ -4735,8 +4735,14 @@ mod events_pump_arming_tests {
     #[test]
     fn events_pumps_are_armed_by_project_not_workspace() {
         let src = crate::test_source::crate_source();
+        let start = src
+            .find("async fn run_embedded_async(")
+            .expect("the embedded host runner");
+        let window = &src[start..start + 12_000];
+        // Built from pieces so this test's own source cannot satisfy it.
+        let expected = format!("spawn_events_pumps(&cfg, {}, &tx);", "project");
         assert!(
-            src.contains("spawn_events_pumps(&cfg, project, &tx);"),
+            window.contains(&expected),
             "the daemon must arm events pumps with the project key"
         );
     }
