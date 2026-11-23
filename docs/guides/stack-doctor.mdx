@@ -1,0 +1,29 @@
+---
+title: Stack install and doctor
+description: One install door for new and existing machines, and an end-to-end doctor that proves the stack works instead of trusting a build record.
+---
+
+`flywheel stack install` is the one entry point for setting up or repairing this machine. It is idempotent, works on a fresh machine with no prior state, and re-registers every launchd job from its plist — a replaced binary needs bootout+bootstrap, not `kickstart -k`. The operator (or captain) runs it; crews never install against the live stack.
+
+An install finishes by running `flywheel stack doctor`. If any probe fails, the install fails. `--dry-run` prints the plan and does not claim health.
+
+## Probes
+
+`flywheel stack doctor` prints one `PASS` or `FAIL` line per probe, with a one-line fix for each failure. `--json` emits `flywheel-stack-doctor.v1`. Every PASS means the probe actually looked at the host.
+
+| Probe | What it checks | Typical fix |
+|-------|----------------|-------------|
+| `binaries` | `flywheel` and `toron` are installed and answer `--version` | `flywheel stack install --operator` |
+| `jobs` | each `dev.flywheel.*` / `com.toron.*` job is loaded and `state = running` | `flywheel stack doctor --fix` |
+| `toron` | the effective toron address accepts a TCP connection | install, then check the toron daemon log |
+| `doorbell` | each seated project's dispatcher has a live pid | `flywheel doorbell start <project>` |
+| `events` | every events-door seat has an events token | install (mints missing tokens) |
+
+## What a failure means
+
+- **`jobs … spawn failed`**: launchd is still holding the old binary's signature. `doctor --fix` boots the job out and bootstraps it from its plist, then re-probes. This is the bd-i4edn failure that once left the stack down for 31 hours while `stack status --check` said ok.
+- **`doorbell … absent`**: no live dispatcher for a seated project; wakes will not reach that pane. Start the dispatcher or run install.
+- **`events … tokenless seats`**: an events-door harness has no minted token, so it falls back to the doorbell. Install again.
+- **`toron … refused`**: the daemon is down or the address is wrong. Check `FLYWHEEL_TORON_URL` and the daemon log.
+
+`doctor --fix` only performs repairs that are safe without the operator's install door: re-registering jobs from their plists. Everything else gets a fix hint, not a silent mutation.

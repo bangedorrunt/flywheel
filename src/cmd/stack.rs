@@ -70,7 +70,7 @@ pub(crate) fn cmd_stack(cfg: &Config, cmd: &StackCmd) -> Result<()> {
             if !dry_run {
                 crate::authority::guard_fleet_mutation(cfg, None, *operator, "stack install")?;
             }
-            stack_install(*dry_run, *no_codesign, *no_restart, *skip_toron)
+            stack_install(cfg, *dry_run, *no_codesign, *no_restart, *skip_toron)
         }
     }
 }
@@ -680,6 +680,7 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 fn stack_install(
+    cfg: &Config,
     dry_run: bool,
     no_codesign: bool,
     no_restart: bool,
@@ -721,6 +722,11 @@ fn stack_install(
     // A fleet-wide binary change is a digest fact: every other pane is now
     // running different code than it booted with (bd-0uzrq.6).
     broadcast_install();
+    // bd-rgs02: an install is not done until the installed stack proves it
+    // works. A failed probe fails the install; --dry-run never claims health.
+    if !dry_run {
+        crate::cmd::stack_doctor::cmd_stack_doctor(cfg, false, false)?;
+    }
     Ok(())
 }
 
