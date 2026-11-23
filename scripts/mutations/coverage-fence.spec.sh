@@ -7,7 +7,7 @@
 CARGO_ARGS=(--bin flywheel)
 TEST_FILTER=(
     the_coverage_fence_seeds_once_and_never_shrinks
-    ce_lfg_polish_requires_coverage
+    ce_wave_polish_requires_coverage
 )
 
 mutation "C1  a dropped requirement is not a coverage failure" \
@@ -20,8 +20,8 @@ mutation "C1  a dropped requirement is not a coverage failure" \
         .collect();' \
     replace='    let mut missing: Vec<String> = Vec::new();'
 
-mutation "W1  ce-lfg polish loop converges without coverage" \
+mutation "W1  ce-wave polish loop converges without coverage" \
     file=src/builtin_workflows.rs \
-    expect=ce_lfg_polish_requires_coverage \
+    expect=ce_wave_polish_requires_coverage \
     find='    until: steps_polish_ok == true && steps_coverage_ok == true' \
     replace='    until: steps_polish_ok == true'

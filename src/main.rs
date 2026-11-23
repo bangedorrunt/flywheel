@@ -5330,11 +5330,12 @@ mod steer_engine_tests {
     const STEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
     /// ADR-0022 W4: `flywheel steer` delegates to the durable Run arm —
-    /// execute=true, pane mode, goal/goal-direct. The Run arm owns the
-    /// engine.invoke door; steer must never grow a second execution path.
+    /// execute=true, pane mode; --direct runs the light ce-lfg loop and the
+    /// default runs the planned ce-wave. The Run arm owns the engine.invoke
+    /// door; steer must never grow a second execution path.
     #[test]
     fn steer_targets_durable_run_arm() {
-        for (direct, expected) in [(true, "ce-lfg"), (false, "ce-lfg")] {
+        for (direct, expected) in [(true, "ce-lfg"), (false, "ce-wave")] {
             let cmd = steer_run_cmd(
                 "fix the flake",
                 direct,
@@ -5363,7 +5364,10 @@ mod steer_engine_tests {
                 serde_json::from_str(inputs.as_deref().expect("inputs present"))
                     .expect("inputs JSON");
             assert_eq!(parsed["objective"], "fix the flake");
-            assert_eq!(parsed["direct"], direct);
+            assert!(
+                parsed.get("direct").is_none(),
+                "the workflow name carries the arm; no inert input"
+            );
             assert!(execute, "steer must execute, not record");
             assert_eq!(mode, "pane");
             assert!(!allow_worktree);
@@ -5418,11 +5422,10 @@ mod steer_engine_tests {
         else {
             panic!("expected a Run command");
         };
-        assert_eq!(name, "ce-lfg");
+        assert_eq!(name, "ce-wave");
         let parsed: serde_json::Value =
             serde_json::from_str(inputs.as_deref().expect("inputs present")).expect("inputs JSON");
         assert_eq!(parsed["objective"], "fix the flake");
-        assert_eq!(parsed["direct"], false);
         assert!(execute);
         assert_eq!(mode, "pane");
         assert!(!json);
@@ -11071,12 +11074,7 @@ fn cmd_decide(
     }
     let affinity: Vec<(&str, Option<String>)> = decide::ROUTING_TABLE
         .iter()
-        .filter(|e| {
-            matches!(
-                e.argv,
-                decide::RouteArgv::WorkflowRun { .. } | decide::RouteArgv::WorkflowRunNoMode
-            )
-        })
+        .filter(|e| e.argv.runs_workflow())
         .map(|e| {
             let role = merged
                 .get(e.primitive)
@@ -20115,10 +20113,8 @@ fn steer_run_cmd(
     role_model: &[String],
     role_harness: &[String],
 ) -> WorkflowCmd {
-    // bd-ihiqo.5: goal/goal-direct merged into ce-lfg; `direct` is now an
-    // input on that workflow, not a separate workflow name.
-    let wf_name = "ce-lfg";
-    let inputs = serde_json::json!({ "objective": objective, "direct": direct });
+    let wf_name = if direct { "ce-lfg" } else { "ce-wave" };
+    let inputs = serde_json::json!({ "objective": objective });
     WorkflowCmd::Run {
         name: wf_name.to_string(),
         inputs: Some(inputs.to_string()),
@@ -21519,8 +21515,8 @@ mod integration_tests {
         assert_eq!(crate::decide::topology_for_primitive("ce-lfg"), "swarm");
         assert_eq!(
             workflows.len(),
-            10,
-            "hermetic brief catalog is exactly the ten ce-* workflows: {:?}",
+            11,
+            "hermetic brief catalog is exactly the eleven builtins: {:?}",
             workflows
                 .iter()
                 .map(|r| r["name"].as_str().unwrap_or("?"))

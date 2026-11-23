@@ -38,6 +38,8 @@ flywheel deadlock <project> [--wait-minutes N]  # lease wait-for cycles + overdu
 
 The 8 canonical stages: `ce-brainstorm`, `ce-plan`, `ce-work`, `ce-review`, `ce-verify`, `ce-compound`, `ce-debug`, `ce-explore`. Old names resolve as aliases with a one-line deprecation notice for one release.
 
+Delivery runs one of two workflows. `ce-lfg` is the light loop (build, review, verify, hand-off; `explore: true` ideates first). `ce-wave` is the planned path (plan through track, one bead at a time, then an exit that checks only `wave_label`). `steer --direct` runs ce-lfg; plain `steer`, `wave-swarm`, `beads-lifecycle` and `goal` run ce-wave.
+
 # captain: prove, install, land
 bash scripts/clean-proof.sh --sha <rev> --mutations changed --keep --receipt /tmp/<dir>/r.json
 AGENT_NAME=<captain> FLYWHEEL_SOURCE=<kept>/flywheel TORON_SOURCE=<kept>/toron \

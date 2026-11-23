@@ -106,7 +106,86 @@ steps:
 name: ce-lfg
 compose: true
 shape: pipeline
-description: "The go pipeline: ideate → plan (gated unless direct) → track (unless direct) → implement (single build or wave dispatch) → review → verify → ship. Replaces goal, goal-direct, ship, the phase-* chain, plan-direct, ce-plan(+review), beads, beads-lifecycle, wave-swarm and feature."
+description: "The light go loop: optional three-way ideation (explore=true), build with TDD, adversarial review, independent verify, hand-off to the captain. A planned multi-bead wave is ce-wave. Replaces goal-direct and feature."
+trigger:
+  type: webhook
+crew: auto
+inputs:
+  - name: objective
+  - name: explore
+    default: false
+  - name: captain_pin
+    default: ""
+steps:
+  - name: ideate
+    action: branch
+    if: "{{inputs.explore}} == true"
+    then:
+      - name: ideate-oracle
+        action: dispatch_job
+        assignee: x
+        spec: { profile: "@oracle", task: "Diverge on the question — surface ideas, angles, and options: {{inputs.objective}}" }
+        on_error: fail_run
+      - name: ideate-structure
+        action: dispatch_job
+        assignee: x
+        spec: { profile: "@planner", task: "From a STRUCTURAL angle on the question, map what a solution must satisfy — the moving parts, the constraints, the shape of the work: {{inputs.objective}}" }
+        on_error: fail_run
+      - name: ideate-risk
+        action: dispatch_job
+        assignee: x
+        spec: { profile: "@reviewer", task: "From a RISK angle on the question, attack it — what could go wrong, what would make this a bad idea, what would you refuse to sign off on: {{inputs.objective}}" }
+        on_error: fail_run
+      - name: ideate-reduce
+        action: dispatch_job
+        assignee: x
+        spec:
+          profile: "@planner"
+          stage: "ce-brainstorm"
+          task: "Reduce these into ranked options for: {{inputs.objective}}"
+        on_error: fail_run
+  - name: implement
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@coder"
+      stage: "ce-work"
+      plan: "{{steps.ideate}}"
+      task: 'Implement {{inputs.objective}}. TDD first.'
+    on_error: fail_run
+  - name: review
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@reviewer"
+      harness: "opencode"
+      plan: "{{steps.implement}}"
+      task: 'Adversarial review with quoted evidence. Verdict: AGREE, AGREE-WITH-CHANGES, or REJECT.'
+    on_error: fail_run
+  - name: verify
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      stage: "ce-verify"
+      task: 'Run the acceptance gate for {{inputs.objective}} and record its outcome verbatim.'
+    on_error: fail_run
+  - name: ship
+    action: dispatch_job
+    assignee: x
+    spec:
+      profile: "@housekeeper"
+      task: 'Hand {{inputs.objective}} to the captain: list each commit sha with its bead id and verify result. The captain proves, installs and lands with ship land; do not close beads or push.'
+    on_error: fail_run
+"#,
+    ),
+    (
+        "ce-wave",
+        r#"
+name: ce-wave
+compose: true
+shape: pipeline
+description: "The planned wave: plan → polish until coverage → fresh audit → approval gate → track beads → one dispatch per bead → exit only when every wave bead is landed → review → verify → hand-off. Replaces goal, ship, the phase-* chain, plan-direct, ce-plan(+review), beads, beads-lifecycle and wave-swarm."
 trigger:
   type: webhook
 crew: auto
@@ -114,40 +193,11 @@ inputs:
   - name: objective
   - name: data_shape
     default: ""
+  - name: wave_label
+    default: "wave-1"
   - name: captain_pin
     default: ""
-  - name: direct
-    default: false
-  - name: track
-    default: true
-  - name: wave
-    default: false
-  - name: polish
-    default: false
 steps:
-  - name: ideate-oracle
-    action: dispatch_job
-    assignee: x
-    spec: { profile: "@oracle", task: "Diverge on the question — surface ideas, angles, and options: {{inputs.objective}}" }
-    on_error: fail_run
-  - name: ideate-structure
-    action: dispatch_job
-    assignee: x
-    spec: { profile: "@planner", task: "From a STRUCTURAL angle on the question, map what a solution must satisfy — the moving parts, the constraints, the shape of the work: {{inputs.objective}}" }
-    on_error: fail_run
-  - name: ideate-risk
-    action: dispatch_job
-    assignee: x
-    spec: { profile: "@reviewer", task: "From a RISK angle on the question, attack it — what could go wrong, what would make this a bad idea, what would you refuse to sign off on: {{inputs.objective}}" }
-    on_error: fail_run
-  - name: ideate-reduce
-    action: dispatch_job
-    assignee: x
-    spec:
-      profile: "@planner"
-      stage: "ce-brainstorm"
-      task: "Reduce these into ranked options for: {{inputs.objective}}"
-    on_error: fail_run
   - name: plan
     action: dispatch_job
     assignee: x
@@ -210,15 +260,7 @@ steps:
       on_error: fail_run
   - name: execute-exit
     action: verify
-    command: 'IDS=$(br list --all --json | jq -r ''.issues[] | select(.status != "closed") | .id''); if [ -n "$IDS" ]; then echo "execute exit refused: wave still open: $IDS"; exit 1; fi; MEMBERS=$(br list --all --json | jq -r ''.issues[] | select((.labels // [] | index("wave-2")) or .wave == 2) | .id''); if [ -z "$MEMBERS" ]; then echo "wave matched zero beads"; exit 1; fi; for id in $MEMBERS; do flywheel ship check $id || exit 1; done'
-    on_error: fail_run
-  - name: implement
-    action: dispatch_job
-    assignee: x
-    spec:
-      profile: "@coder"
-      stage: "ce-work"
-      task: 'Implement {{inputs.objective}}. TDD first.'
+    command: 'WAVE=''.issues[] | select((.labels // [] | index("{{inputs.wave_label}}")) or ("wave-" + (.wave | tostring)) == "{{inputs.wave_label}}")''; IDS=$(br list --all --json | jq -r "$WAVE | select(.status != \"closed\") | .id"); if [ -n "$IDS" ]; then echo "execute exit refused: wave still open: $IDS"; exit 1; fi; MEMBERS=$(br list --all --json | jq -r "$WAVE | .id"); if [ -z "$MEMBERS" ]; then echo "wave {{inputs.wave_label}} matched zero beads"; exit 1; fi; for id in $MEMBERS; do flywheel ship check $id || exit 1; done'
     on_error: fail_run
   - name: review
     action: dispatch_job
@@ -226,22 +268,23 @@ steps:
     spec:
       profile: "@reviewer"
       harness: "opencode"
-      plan: "{{steps.implement-wave}}{{steps.implement}}"
-      task: 'Adversarial review with quoted evidence. Verdict: AGREE, AGREE-WITH-CHANGES, or REJECT.'
+      plan: "{{steps.implement-wave}}"
+      task: 'Adversarial review of wave {{inputs.wave_label}} with quoted evidence. Verdict: AGREE, AGREE-WITH-CHANGES, or REJECT.'
     on_error: fail_run
   - name: verify
     action: dispatch_job
     assignee: x
     spec:
       profile: "@housekeeper"
-      task: 'Run the acceptance gate and record its outcome verbatim.'
+      stage: "ce-verify"
+      task: 'Run the acceptance gate for wave {{inputs.wave_label}} and record its outcome verbatim.'
     on_error: fail_run
   - name: ship
     action: dispatch_job
     assignee: x
     spec:
       profile: "@housekeeper"
-      task: 'Hand {{inputs.objective}} to the captain: list each commit sha with its bead id and verify result. The captain proves, installs and lands with ship land; do not close beads or push.'
+      task: 'Hand wave {{inputs.wave_label}} to the captain: list each commit sha with its bead id and verify result. The captain proves, installs and lands with ship land; do not close beads or push.'
     on_error: fail_run
 "#,
     ),
@@ -613,7 +656,12 @@ pub const WORKFLOW_GUIDANCE: &[(&str, &str, &str)] = &[
     (
         "ce-lfg",
         "delivery",
-        "go pipeline: ideate, plan, track, build, review, verify, ship",
+        "light go loop: optional ideation, build, review, verify, hand-off",
+    ),
+    (
+        "ce-wave",
+        "delivery",
+        "planned wave: plan, polish, audit, gate, track, dispatch per bead, exit on landed",
     ),
     (
         "ce-debug",
@@ -690,20 +738,20 @@ pub fn builtin_recipe(name: &str) -> Option<Workflow> {
 /// ce-bakeoff, 3 into ce-review, 3 into ce-measure, 2 into ce-triage, 5 into
 /// ce-resume, 3 into ce-compound (incl. ce-sweep/reflect), 2 into ce-retro.
 pub const WORKFLOW_ALIASES: &[(&str, &str)] = &[
-    ("goal", "ce-lfg"),
+    ("goal", "ce-wave"),
     ("goal-direct", "ce-lfg"),
-    ("ship", "ce-lfg"),
-    ("phase-resolve", "ce-lfg"),
-    ("phase-plan", "ce-lfg"),
-    ("phase-implement", "ce-lfg"),
-    ("phase-review", "ce-lfg"),
-    ("phase-verify", "ce-lfg"),
-    ("plan-direct", "ce-lfg"),
-    ("ce-plan", "ce-lfg"),
-    ("ce-plan-review", "ce-lfg"),
-    ("beads", "ce-lfg"),
-    ("beads-lifecycle", "ce-lfg"),
-    ("wave-swarm", "ce-lfg"),
+    ("ship", "ce-wave"),
+    ("phase-resolve", "ce-wave"),
+    ("phase-plan", "ce-wave"),
+    ("phase-implement", "ce-wave"),
+    ("phase-review", "ce-wave"),
+    ("phase-verify", "ce-wave"),
+    ("plan-direct", "ce-wave"),
+    ("ce-plan", "ce-wave"),
+    ("ce-plan-review", "ce-wave"),
+    ("beads", "ce-wave"),
+    ("beads-lifecycle", "ce-wave"),
+    ("wave-swarm", "ce-wave"),
     ("feature", "ce-lfg"),
     ("ce-brainstorm", "ce-lfg"),
     ("bug-fix", "ce-debug"),
@@ -749,7 +797,7 @@ pub fn resolve_workflow_alias(name: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use toron_workflow::lint_yaml;
-    use toron_workflow::schema::CrewSpec;
+    use toron_workflow::schema::{Action, CrewSpec};
 
     /// Every built-in has bounded agent-facing guidance, so discovery never
     /// depends on rereading the full workflow description.
@@ -773,6 +821,7 @@ mod tests {
         );
         for name in [
             "ce-lfg",
+            "ce-wave",
             "ce-debug",
             "ce-bakeoff",
             "ce-review",
@@ -791,56 +840,6 @@ mod tests {
         );
     }
 
-    /// bd-cvv9 (ADR-0022 §8 W3 box): `ship` renders the FIVE-link chain
-    /// (resolve → plan → implement → review → verify) in the structural
-    /// dry-run — the graph the gated runner walks.
-    /// bd-w2-review-s6ij: interrogate defaults N=2 with a @reviewer briefs
-    /// fanout (readonly lives in the task text; lint-asserted clean);
-    /// forensics has a @scout diagnose node and NO fix-named node
-    /// (lint-asserted — a fix is a separate bug-fix); figure-it-out authors
-    /// via @planner.
-    /// bd-t86p: the goal DIRECT arm is a built-in (`goal-direct` + its
-    /// gate-free `plan-direct` companion). Both parse, lint clean, and
-    /// declare crew: auto — the captain-free compose surface needs
-    /// zero-config auto-crew like the parent goal.
-    /// The five operations playbooks are builtins; each cites its principles
-    /// and is crew: auto; autonomous-work documents the decide target.
-    /// ship-beads = predicate gate (no ready beads + claim-watch empty +
-    /// every newly closed bead ledger-legal) THEN the p8 commit-and-push.
-    /// autonomous-work uses the REAL loop (never reimplements it) and ends
-    /// in a ship-beads call; the predicate input defaults to ship-beads.
-    /// pause kills nothing working unless force_working is explicit (the
-    /// input defaults false and the task gates on it).
-    /// babysit-bead drives ONE bead only — the task never starts new beads
-    /// and never writes a verdict (loop-only gate rows).
-    /// bd-t86p: goal-direct is goal MINUS the tracker + the plan gate — the
-    /// direct arm's steps are ideate/plan/build/review/ship (no `beads`
-    /// call, and `plan-direct` has no `request_approval` step). This pins
-    /// the autonomous contract: a steer --direct run never parks on an
-    /// approval or depends on the tracker.
-    /// STEER-COMPOSE (bd-2pcq #7): the goal workflows' arm selection is
-    /// structural — goal = bead-tracked chain (brainstorm → plan → beads),
-    /// goal-direct = direct chain (brainstorm → plan-direct, no beads). The
-    /// steer surface picks the arm by workflow NAME (goal vs goal-direct);
-    /// this pins that the names carry the right composition.
-    /// bd-pqwx: goal's plan step under-supplied phase-plan's declared
-    /// `data_shape`, so phase-plan's task kept the literal
-    /// `{{inputs.data_shape}}`; that payload flowed into `steps.track` and
-    /// the strict execution render of goal's build `$.spec.plan` failed
-    /// loud (2026-09-14 live: `render: workflow "goal" node "build" field
-    /// "$.spec.plan"`). goal now declares `data_shape` with an empty
-    /// default (`bind_input_defaults` fills it on a bare-objective invoke)
-    /// and passes it through exactly like the ship chain does.
-    /// WORKFLOW-COMPOSE (bd-2pcq #6): the call_workflow chain resolves across
-    /// the catalog+builtins resolver — every sub-workflow name referenced by
-    /// the steer arms must exist as a built-in (the resolver returns a
-    /// definition, never "unknown workflow").
-    /// STEER-COMPOSE crew strategy (bd-2pcq #7): the composed goal/direct
-    /// fleet includes the sub-workflow roles — a steer run spawns the WHOLE
-    /// fleet (oracle/planner from brainstorm + planner from plan-direct +
-    /// own coder/reviewer/housekeeper), never "no crew pane" on the first
-    /// composed dispatch. (The recursive inference itself is unit-tested in
-    /// crew.rs; this pins the end-to-end builtin composition.)
     /// The purpose-named workflows declare `crew: auto` (zero-config,
     /// auto-crew — Spec 4c). `triage` is the reactive one (no crew).
     #[test]
@@ -848,6 +847,7 @@ mod tests {
         let wfs = builtin_workflows();
         for name in [
             "ce-lfg",
+            "ce-wave",
             "ce-debug",
             "ce-bakeoff",
             "ce-review",
@@ -943,14 +943,17 @@ mod tests {
         }
     }
 
-    /// ce-lfg polish loop requires coverage (ported W1 invariant).
-    #[test]
-    fn ce_lfg_polish_requires_coverage() {
-        let yaml = BUILTIN_WORKFLOWS_YAML
+    fn builtin_yaml(name: &str) -> &'static str {
+        BUILTIN_WORKFLOWS_YAML
             .iter()
-            .find(|(n, _)| *n == "ce-lfg")
+            .find(|(n, _)| *n == name)
             .map(|(_, y)| *y)
-            .unwrap();
+            .unwrap_or_else(|| panic!("{name} is compiled in"))
+    }
+
+    #[test]
+    fn ce_wave_polish_requires_coverage() {
+        let yaml = builtin_yaml("ce-wave");
         assert!(
             yaml.contains("steps_coverage_ok"),
             "polish until must require coverage"
@@ -961,14 +964,9 @@ mod tests {
         );
     }
 
-    /// ce-lfg wave exit refuses while open (ported E3 invariant).
     #[test]
-    fn ce_lfg_wave_exit_refuses_while_open() {
-        let yaml = BUILTIN_WORKFLOWS_YAML
-            .iter()
-            .find(|(n, _)| *n == "ce-lfg")
-            .map(|(_, y)| *y)
-            .unwrap();
+    fn ce_wave_exit_refuses_while_open() {
+        let yaml = builtin_yaml("ce-wave");
         assert!(
             yaml.contains("execute exit refused"),
             "wave exit must refuse while open"
@@ -979,14 +977,70 @@ mod tests {
         );
     }
 
-    /// ce-lfg carries no .done marker reads (ported M1 invariant).
     #[test]
-    fn ce_lfg_no_marker_reads() {
+    fn ce_wave_exit_checks_the_wave_it_was_given() {
         let wfs = builtin_workflows();
-        let wf = &wfs["ce-lfg"];
-        let json = serde_json::to_value(&wf.steps).expect("steps serialize");
-        let text = json.to_string();
-        assert!(!text.contains("test -f"), "no step reads a marker: {text}");
+        let exit = wfs["ce-wave"]
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("execute-exit"))
+            .expect("execute-exit step");
+        let Action::Verify { command } = &exit.action else {
+            panic!("execute-exit is a verify step");
+        };
+        assert!(
+            command.contains("{{inputs.wave_label}}"),
+            "the exit selects members by the wave_label input: {command}"
+        );
+        assert!(
+            !command.contains("wave-2") && !command.contains(".wave =="),
+            "no hard-coded wave number: {command}"
+        );
+    }
+
+    #[test]
+    fn ce_lfg_ideates_only_when_asked_to_explore() {
+        let wfs = builtin_workflows();
+        let lfg = &wfs["ce-lfg"];
+        let top: Vec<&str> = lfg.steps.iter().filter_map(|s| s.name.as_deref()).collect();
+        assert_eq!(top, ["ideate", "implement", "review", "verify", "ship"]);
+        let Action::Branch {
+            if_guard,
+            then,
+            else_steps,
+        } = &lfg.steps[0].action
+        else {
+            panic!("ideate is a branch");
+        };
+        assert_eq!(if_guard, "{{inputs.explore}} == true");
+        assert!(else_steps.is_empty(), "no ideation without explore");
+        let arm: Vec<&str> = then.iter().filter_map(|s| s.name.as_deref()).collect();
+        assert_eq!(
+            arm,
+            [
+                "ideate-oracle",
+                "ideate-structure",
+                "ideate-risk",
+                "ideate-reduce"
+            ]
+        );
+        assert!(
+            toron_workflow::engine::durable::unsupported_reason(lfg).is_none(),
+            "ce-lfg opens on the durable linear model"
+        );
+    }
+
+    #[test]
+    fn delivery_workflows_carry_no_marker_reads() {
+        let wfs = builtin_workflows();
+        for name in ["ce-lfg", "ce-wave"] {
+            let json = serde_json::to_value(&wfs[name].steps).expect("steps serialize");
+            let text = json.to_string();
+            assert!(
+                !text.contains("test -f"),
+                "{name}: no step reads a marker: {text}"
+            );
+        }
     }
 
     /// The periodic digest is host-native (`awareness::tick`): paying an agent
@@ -1302,7 +1356,7 @@ graph:
                 std::env::var("PATH").unwrap_or_default()
             );
             let wfs = builtin_workflows();
-            let wave = &wfs["ce-lfg"];
+            let wave = &wfs["ce-wave"];
             let exit = wave
                 .steps
                 .iter()
@@ -1369,7 +1423,19 @@ graph:
             "the open bead is named: {}",
             text_of(&out)
         );
-        // Zero members fails.
+        let out = run(
+            r#"{"issues": [
+              {"id": "bd-a", "status": "closed", "labels": ["wave-2"]},
+              {"id": "bd-other", "status": "open", "labels": ["wave-3"]},
+              {"id": "bd-loose", "status": "open", "labels": []}
+            ]}"#,
+            "",
+        );
+        assert!(
+            out.status.success(),
+            "open beads outside the wave do not block its exit: {}",
+            text_of(&out)
+        );
         let out = run(
             r#"{"issues": [{"id": "bd-x", "status": "closed", "labels": ["wave-9"]}]}"#,
             "",

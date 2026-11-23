@@ -500,9 +500,9 @@ pub fn assemble_with_catalog(
         .collect();
 
     let mut argv = decision.argv.clone();
-    // bd-ihiqo.5: the 10-workflow merge folds wave-swarm/beads-lifecycle into
-    // ce-lfg, but the routed argv still names the compose token. Detect the
-    // compose form from the argv so declared-input binding survives the alias.
+    // wave-swarm/beads-lifecycle alias ce-wave, so the primitive is not itself
+    // a compose token; detect the compose form from the argv so declared-input
+    // binding survives the alias.
     let routed_compose = argv
         .windows(2)
         .any(|w| w[0] == "workflow" && w[1] == "compose");
@@ -1631,7 +1631,7 @@ mod tests {
         ];
         let b = assemble("wave-swarm the auth lanes", &world_empty(), &roles, 5, None);
         assert_eq!(b.proposal.topology, "swarm");
-        assert_eq!(b.proposal.workflow, "ce-lfg");
+        assert_eq!(b.proposal.workflow, "ce-wave");
         assert_eq!(b.proposal.crew_total, 5);
         assert_eq!(
             b.questions
@@ -1660,7 +1660,7 @@ mod tests {
     fn two_crews_packs_n_2_not_default_5() {
         let b = assemble("wave-swarm with 2 crews", &world_empty(), &[], 5, None);
         assert_eq!(b.proposal.topology, "swarm");
-        assert_eq!(b.proposal.workflow, "ce-lfg");
+        assert_eq!(b.proposal.workflow, "ce-wave");
         assert_eq!(b.proposal.crew_total, 2);
     }
 
@@ -1764,7 +1764,7 @@ mod tests {
         );
         assert!(b.proposal.token.is_none(), "compose token cleared");
         assert!(
-            !b.proposal.argv.iter().any(|a| a == "ce-lfg"),
+            !b.proposal.argv.iter().any(|a| a == "ce-wave"),
             "argv must not name invent wave-swarm: {:?}",
             b.proposal.argv
         );
@@ -1877,7 +1877,7 @@ mod tests {
             !b.proposal
                 .argv
                 .iter()
-                .any(|a| a == "arrive" || a == "ce-lfg"),
+                .any(|a| a == "arrive" || a == "ce-wave"),
             "{:?}",
             b.proposal.argv
         );
@@ -1937,7 +1937,7 @@ mod tests {
                 b.proposal.workflow, b.proposal.topology, b.proposal.argv, b.proposal.why
             );
             assert!(
-                !surface.contains("ce-lfg"),
+                !surface.contains("ce-wave"),
                 "{label}: invent swarm must not appear in align surface: {surface}"
             );
             assert!(
@@ -1968,7 +1968,7 @@ mod tests {
             None,
         );
         assert_eq!(b.proposal.topology, "swarm");
-        assert_eq!(b.proposal.workflow, "ce-lfg");
+        assert_eq!(b.proposal.workflow, "ce-wave");
         align_with_session_topology(&mut b, "loop", true);
         assert_eq!(b.proposal.topology, "open");
         assert_eq!(b.proposal.workflow, "loop-work");
@@ -1985,13 +1985,13 @@ mod tests {
             !b.proposal
                 .argv
                 .iter()
-                .any(|a| a == "ce-lfg" || a == "--crew"),
+                .any(|a| a == "ce-wave" || a == "--crew"),
             "must not keep invent swarm argv: {:?}",
             b.proposal.argv
         );
         assert_eq!(b.proposal.crew_total, 0);
         assert!(
-            !b.proposal.why.contains("ce-lfg"),
+            !b.proposal.why.contains("ce-wave"),
             "why must not name invent wave-swarm: {}",
             b.proposal.why
         );
@@ -2049,7 +2049,7 @@ mod tests {
         };
         let b = assemble("wave-swarm the auth lanes", &world, &[], 5, None);
         assert_eq!(
-            b.proposal.workflow, "ce-lfg",
+            b.proposal.workflow, "ce-wave",
             "precondition: routed to the workflow: {:?}",
             b.proposal
         );
@@ -2108,14 +2108,14 @@ mod tests {
             5,
             None,
         );
-        assert_eq!(b.proposal.workflow, "ce-lfg");
+        assert_eq!(b.proposal.workflow, "ce-wave");
         apply_answers(&mut b, Some("swarm"), Some("planner:1,coder:1"), None).unwrap();
-        assert_eq!(b.proposal.workflow, "ce-lfg");
+        assert_eq!(b.proposal.workflow, "ce-wave");
         assert!(
             b.proposal
                 .argv
                 .windows(2)
-                .any(|w| w == ["--parts", "beads-lifecycle"]),
+                .any(|w| w == ["--parts", "ce-wave"]),
             "{:?}",
             b.proposal.argv
         );

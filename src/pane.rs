@@ -4686,9 +4686,9 @@ mod tests {
         use crate::seat_binder::Binding;
         use toron_workflow::schema::Action;
         let wf = crate::builtin_workflows::builtin_workflows()
-            .get("ce-lfg")
+            .get("ce-wave")
             .cloned()
-            .expect("ce-lfg cataloged");
+            .expect("ce-wave cataloged");
         let audit = wf
             .steps
             .iter()

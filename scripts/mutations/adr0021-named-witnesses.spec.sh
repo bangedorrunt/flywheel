@@ -11,7 +11,7 @@ TEST_FILTER=(
     workflow_lowering_unbounded_back_edge_named
     workflow_lowering_approval_without_timeout_fails
     stage_contract_judge_arms_without_arms_fails
-    ce_lfg_no_marker_reads
+    delivery_workflows_carry_no_marker_reads
     graph_dispatch_missing_witness_fails_at_result_timeout
     durable_body_witness_fail_goes_to_on_error
     durable_body_witness_missing_report_fails
@@ -136,6 +136,6 @@ mutation "W2  a missing machine-readable report is accepted" \
 # M1 — A3/D4.4: a step reads a completion marker again (ported to ce-lfg).
 mutation "M1  ce-lfg reads a .done marker again" \
     file=src/builtin_workflows.rs \
-    expect=ce_lfg_no_marker_reads \
+    expect=delivery_workflows_carry_no_marker_reads \
     find="      task: 'Implement {{inputs.objective}}. TDD first.'" \
     replace="      task: 'test -f .flywheel/.done && Implement {{inputs.objective}}. TDD first.'"

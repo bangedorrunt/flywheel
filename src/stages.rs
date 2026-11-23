@@ -333,15 +333,15 @@ const RETIRED_STAGES: &[(&str, &str)] = &[
     ),
     (
         "wave-dispatch",
-        "waves are engine steps: run the ce-lfg workflow with wave=true",
+        "waves are engine steps: run the ce-wave workflow",
     ),
     (
         "wave-gate",
-        "waves are engine steps: run the ce-lfg workflow with wave=true",
+        "waves are engine steps: run the ce-wave workflow",
     ),
     (
         "wave-observe",
-        "waves are engine steps: run the ce-lfg workflow with wave=true",
+        "waves are engine steps: run the ce-wave workflow",
     ),
     ("seed-first-task", "run the ce-triage workflow"),
     ("prioritize-assign", "run the ce-triage workflow"),

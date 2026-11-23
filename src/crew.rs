@@ -125,32 +125,45 @@ fn role_uses(action: &Action, inputs: &BTreeMap<String, String>, out: &mut Vec<S
         Action::Branch {
             then, else_steps, ..
         } => {
-            let mut worst: Vec<String> = Vec::new();
-            let mut arm: Vec<String> = Vec::new();
-            for s in then {
-                arm.clear();
-                role_uses(&s.action, inputs, &mut arm);
-                if arm.len() > worst.len() {
-                    worst = arm.clone();
-                }
+            let mut either = sequential_role_peaks(then, inputs);
+            for (role, n) in sequential_role_peaks(else_steps, inputs) {
+                let slot = either.entry(role).or_insert(0);
+                *slot = (*slot).max(n);
             }
-            for s in else_steps {
-                arm.clear();
-                role_uses(&s.action, inputs, &mut arm);
-                if arm.len() > worst.len() {
-                    worst = arm.clone();
-                }
-            }
-            out.extend(worst);
+            extend_with_peaks(out, either);
         }
         Action::Retry { step, .. } => role_uses(&step.action, inputs, out),
         Action::Foreach { each, .. } => role_uses(&each.action, inputs, out),
-        Action::Loop { body, .. } => {
-            for s in body {
-                role_uses(&s.action, inputs, out);
-            }
-        }
+        Action::Loop { body, .. } => extend_with_peaks(out, sequential_role_peaks(body, inputs)),
         _ => {}
+    }
+}
+
+/// Steps that run one after another reuse a pane: each role needs only as
+/// many panes as its busiest single step.
+fn sequential_role_peaks(
+    steps: &[toron_workflow::schema::Step],
+    inputs: &BTreeMap<String, String>,
+) -> BTreeMap<String, usize> {
+    let mut peaks: BTreeMap<String, usize> = BTreeMap::new();
+    for s in steps {
+        let mut uses = Vec::new();
+        role_uses(&s.action, inputs, &mut uses);
+        let mut here: BTreeMap<String, usize> = BTreeMap::new();
+        for r in uses {
+            *here.entry(r).or_insert(0) += 1;
+        }
+        for (role, n) in here {
+            let slot = peaks.entry(role).or_insert(0);
+            *slot = (*slot).max(n);
+        }
+    }
+    peaks
+}
+
+fn extend_with_peaks(out: &mut Vec<String>, peaks: BTreeMap<String, usize>) {
+    for (role, n) in peaks {
+        out.extend(std::iter::repeat_n(role, n));
     }
 }
 
@@ -2635,7 +2648,7 @@ steps:
         assert_eq!(
             wf.steps.len(),
             1,
-            "override expands, not the 15-step builtin"
+            "override expands, not the 5-step builtin"
         );
         assert!(
             matches!(&wf.steps[0].action, Action::DispatchJob { spec, .. }
@@ -2654,8 +2667,8 @@ steps:
         .unwrap();
         assert_eq!(
             wf_builtin.steps.len(),
-            15,
-            "builtin token unchanged (ce-lfg pipeline)"
+            5,
+            "builtin token unchanged (ce-lfg light loop)"
         );
     }
 
@@ -4076,6 +4089,43 @@ steps:
         );
     }
 
+    #[test]
+    fn a_branch_arm_seats_every_role_its_steps_use_and_reuses_sequential_ones() {
+        let wf = parse_workflow(
+            r#"
+name: arm-roles
+steps:
+  - name: maybe
+    action: branch
+    if: "{{inputs.go}} == true"
+    then:
+      - name: a
+        action: dispatch_job
+        assignee: x
+        spec: { profile: "@oracle", task: "a" }
+      - name: b
+        action: dispatch_job
+        assignee: x
+        spec: { profile: "@planner", task: "b" }
+      - name: c
+        action: dispatch_job
+        assignee: x
+        spec: { profile: "@planner", task: "c" }
+"#,
+        )
+        .expect("parses");
+        let d = crew_demand(&wf);
+        assert_eq!(
+            d.crew_shape,
+            BTreeMap::from([("oracle".to_string(), 1), ("planner".to_string(), 1)]),
+            "every arm role is seated once: {d:?}"
+        );
+        assert!(
+            d.collisions.is_empty(),
+            "sequential reuse is no collision: {d:?}"
+        );
+    }
+
     /// `ce-lfg` specifically: five panes, zero collisions, and full three-way
     /// divergence. This is the analysis the request asked for, pinned so a
     /// future edit cannot quietly re-break it.
@@ -4092,9 +4142,19 @@ steps:
             d.required_panes
         );
 
+        let ideate_arm: Vec<&str> = goal
+            .steps
+            .iter()
+            .find_map(|s| match &s.action {
+                Action::Branch { then, .. } if s.name.as_deref() == Some("ideate") => {
+                    Some(then.iter().filter_map(|t| t.name.as_deref()).collect())
+                }
+                _ => None,
+            })
+            .expect("ce-lfg ideates behind the explore branch");
         let lenses: Vec<String> = ["ideate-oracle", "ideate-structure", "ideate-risk"]
             .into_iter()
-            .filter(|n| goal.steps.iter().any(|s| s.name.as_deref() == Some(*n)))
+            .filter(|n| ideate_arm.contains(n))
             .map(str::to_string)
             .collect();
         assert_eq!(
@@ -4145,7 +4205,7 @@ mod acceptance6_audit_binding {
     #[test]
     fn acceptance6_lifecycle_audit_binds_a_non_author_and_another_family() {
         let wfs = crate::builtin_workflows::builtin_workflows();
-        let wf = &wfs["ce-lfg"];
+        let wf = &wfs["ce-wave"];
         let audit = wf
             .steps
             .iter()

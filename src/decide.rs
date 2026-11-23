@@ -140,6 +140,11 @@ pub enum RouteArgv {
     WorkflowRun {
         mode: &'static str,
     },
+    /// flywheel workflow run <primitive> --execute --mode <mode> --inputs <json>.
+    WorkflowRunWith {
+        mode: &'static str,
+        inputs: &'static str,
+    },
     /// flywheel workflow run <primitive> --execute (pause: no --mode).
     WorkflowRunNoMode,
     /// flywheel workflow compose <target> --agent.
@@ -157,6 +162,18 @@ pub enum RouteArgv {
     SpawnSend,
     CoalitionForm,
     CronStart,
+}
+
+impl RouteArgv {
+    /// The row dispatches `flywheel workflow run <primitive>`.
+    pub fn runs_workflow(&self) -> bool {
+        matches!(
+            self,
+            RouteArgv::WorkflowRun { .. }
+                | RouteArgv::WorkflowRunWith { .. }
+                | RouteArgv::WorkflowRunNoMode
+        )
+    }
 }
 
 /// One declarative routing row: matchers + gate + argv shape + topology.
@@ -319,7 +336,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "feature — feature workflow (shape -> build -> prove)",
     },
     RouteEntry {
-        primitive: "ce-lfg",
+        primitive: "ce-wave",
         matchers: &["goal"],
         topology: "swarm",
         gate: RouteGate::Always,
@@ -427,14 +444,12 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "one pane — spawn --profile <role> --count 1, then send --to <full-name> --wait (never --oc)",
     },
     RouteEntry {
-        primitive: "ce-lfg",
+        primitive: "ce-wave",
         matchers: &["wave-swarm", "wave swarm"],
         topology: "swarm",
         gate: RouteGate::Always,
-        argv: RouteArgv::ComposeToken {
-            token: "wave-swarm",
-        },
-        reason: "wave-swarm — composed wave swarm (GATE -> DISPATCH -> OBSERVE -> VERIFY -> SIGNOFF)",
+        argv: RouteArgv::ComposeToken { token: "ce-wave" },
+        reason: "ce-wave — planned wave (plan -> polish -> audit -> gate -> track -> dispatch -> exit on landed)",
     },
     RouteEntry {
         primitive: "ce-debug",
@@ -456,14 +471,12 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "repair-until-verified — compose --parts repair-until-verified --run",
     },
     RouteEntry {
-        primitive: "ce-lfg",
+        primitive: "ce-wave",
         matchers: &["beads-lifecycle", "beads lifecycle"],
         topology: "swarm",
         gate: RouteGate::Always,
-        argv: RouteArgv::ComposeToken {
-            token: "beads-lifecycle",
-        },
-        reason: "beads-lifecycle — compose --parts beads-lifecycle --run",
+        argv: RouteArgv::ComposeToken { token: "ce-wave" },
+        reason: "beads-lifecycle — compose --parts ce-wave --run",
     },
     RouteEntry {
         primitive: "ce-review",
@@ -488,11 +501,14 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         ],
         topology: "swarm",
         gate: RouteGate::Always,
-        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        argv: RouteArgv::WorkflowRunWith {
+            mode: "pane",
+            inputs: r#"{"explore":true}"#,
+        },
         reason: "ce-brainstorm — requirements-first ideation (oracles diverge, planner reduces)",
     },
     RouteEntry {
-        primitive: "ce-lfg",
+        primitive: "ce-wave",
         matchers: &[
             "break this down",
             "bead-ready plan",
@@ -505,7 +521,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "ce-plan — goal to bead-ready plan, approval gate",
     },
     RouteEntry {
-        primitive: "ce-lfg",
+        primitive: "ce-wave",
         matchers: &[
             "ship the chain",
             "run the ship",
@@ -518,7 +534,7 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "ship — resolve to verify gated chain",
     },
     RouteEntry {
-        primitive: "ce-lfg",
+        primitive: "ce-wave",
         matchers: &[
             "convert to beads",
             "file these as beads",
@@ -726,10 +742,7 @@ pub fn check_catalog(table: &[RouteEntry]) -> Result<(), String> {
 /// them as an argument. Loud, naming the orphaned route.
 pub fn check_workflow_routes(table: &[RouteEntry], known: &[String]) -> Result<(), String> {
     for e in table {
-        if !matches!(
-            e.argv,
-            RouteArgv::WorkflowRun { .. } | RouteArgv::WorkflowRunNoMode
-        ) {
+        if !e.argv.runs_workflow() {
             continue;
         }
         if !known.iter().any(|k| k == e.primitive) {
@@ -811,6 +824,20 @@ fn build_decision(entry: &RouteEntry, target: &str, snap: &Snapshot) -> Decision
             "--execute",
             "--mode",
             mode,
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect(),
+        RouteArgv::WorkflowRunWith { mode, inputs } => [
+            "flywheel",
+            "workflow",
+            "run",
+            p,
+            "--execute",
+            "--mode",
+            mode,
+            "--inputs",
+            inputs,
         ]
         .iter()
         .map(|s| (*s).to_string())
@@ -1260,11 +1287,9 @@ mod tests {
     #[test]
     fn leftover_ready_beads_do_not_steal_beads_lifecycle_token() {
         let d = decide("beads-lifecycle for an existing open bead", &with_beads(3));
-        assert_eq!(d.primitive, "ce-lfg", "argv: {:?}", d.argv);
+        assert_eq!(d.primitive, "ce-wave", "argv: {:?}", d.argv);
         assert!(
-            d.argv
-                .windows(2)
-                .any(|w| w == ["--parts", "beads-lifecycle"]),
+            d.argv.windows(2).any(|w| w == ["--parts", "ce-wave"]),
             "argv: {:?}",
             d.argv
         );
@@ -1309,7 +1334,7 @@ mod tests {
         }
         let d = decide("wave-swarm --profile coder", &with_beads(3));
         assert_eq!(
-            d.primitive, "ce-lfg",
+            d.primitive, "ce-wave",
             "declared trigger with beads still routes: {:?}",
             d.argv
         );
@@ -1681,10 +1706,10 @@ mod tests {
         },
         Spec8Case {
             row: "row16",
-            primitive: Some("ce-lfg"),
+            primitive: Some("ce-wave"),
             targets: &["goal: ship the onboarding flow", "run the goal workflow"],
             not_primitive: &[],
-            argv_has: &["ce-lfg", "pane"],
+            argv_has: &["ce-wave", "pane"],
             argv_lacks: &[],
         },
         Spec8Case {
@@ -1771,31 +1796,31 @@ mod tests {
                 "sharpen the requirements first",
             ],
             not_primitive: &[],
-            argv_has: &["ce-lfg"],
+            argv_has: &["ce-lfg", "--inputs", r#"{"explore":true}"#],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row24e",
-            primitive: Some("ce-lfg"),
+            primitive: Some("ce-wave"),
             targets: &["break this down into beads", "make a bead-ready plan"],
             not_primitive: &[],
-            argv_has: &["ce-lfg"],
+            argv_has: &["ce-wave"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row24f",
-            primitive: Some("ce-lfg"),
+            primitive: Some("ce-wave"),
             targets: &["ship the chain", "run the ship workflow"],
             not_primitive: &[],
-            argv_has: &["ce-lfg"],
+            argv_has: &["ce-wave"],
             argv_lacks: &[],
         },
         Spec8Case {
             row: "row24g",
-            primitive: Some("ce-lfg"),
+            primitive: Some("ce-wave"),
             targets: &["convert to beads", "file these as beads"],
             not_primitive: &[],
-            argv_has: &["ce-lfg"],
+            argv_has: &["ce-wave"],
             argv_lacks: &[],
         },
     ];
@@ -1964,7 +1989,7 @@ mod decide_router_tests {
             assert_ne!(d.primitive, "wave-swarm", "target: {t}");
         }
         let d = decide("wave-swarm with 2 crews", &snap());
-        assert_eq!(d.primitive, "ce-lfg", "declared trigger still routes");
+        assert_eq!(d.primitive, "ce-wave", "declared trigger still routes");
     }
 
     #[test]
@@ -1985,7 +2010,7 @@ mod decide_router_tests {
             "fronted verb is the intent: {d:?}"
         );
         let d = decide("goal: ship the onboarding flow", &snap());
-        assert_eq!(d.primitive, "ce-lfg", "fronted topic is the intent: {d:?}");
+        assert_eq!(d.primitive, "ce-wave", "fronted topic is the intent: {d:?}");
     }
 
     #[test]
@@ -1998,12 +2023,7 @@ mod decide_router_tests {
             .expect("merged workflow catalog loads");
         let rows: Vec<(&str, Option<String>)> = ROUTING_TABLE
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.argv,
-                    RouteArgv::WorkflowRun { .. } | RouteArgv::WorkflowRunNoMode
-                )
-            })
+            .filter(|e| e.argv.runs_workflow())
             .map(|e| {
                 let role = merged
                     .get(e.primitive)

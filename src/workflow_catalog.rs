@@ -1942,8 +1942,8 @@ mod compose_token_data_tests {
             "ce-debug loops until verified"
         );
         assert!(
-            shape_conforms(Shape::Polish, &parsed_builtin("ce-lfg")).is_ok(),
-            "ce-lfg polishes in a loop"
+            shape_conforms(Shape::Polish, &parsed_builtin("ce-wave")).is_ok(),
+            "ce-wave polishes in a loop"
         );
     }
 

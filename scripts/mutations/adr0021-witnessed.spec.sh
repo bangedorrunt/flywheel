@@ -10,7 +10,7 @@ CARGO_ARGS=(--bin flywheel)
 TEST_FILTER=(
     stage_contract_seed_phases_complete
     dispatch_resolves_effort_stage_over_profile
-    ce_lfg_wave_exit_refuses_while_open
+    ce_wave_exit_refuses_while_open
     ship_routes_through_the_gated_chain_goal_direct_stays_plain
     statechart_report_fails_on_an_orphan_and_a_trap
     stage_contract_list_filters
@@ -36,9 +36,9 @@ mutation "E2  the stage effort no longer reaches the leaf" \
     replace='        effort: crate::headless::resolve_dispatch_field(spec_effort, None, profile_effort),'
 
 # E3 — D4.3: ce-lfg wave exit must refuse while wave beads are open.
-mutation "E3  ce-lfg wave exit passes while open" \
+mutation "E3  ce-wave exit passes while open" \
     file=src/builtin_workflows.rs \
-    expect=ce_lfg_wave_exit_refuses_while_open \
+    expect=ce_wave_exit_refuses_while_open \
     find='echo "execute exit refused: wave still open: $IDS"; exit 1' \
     replace='echo "wave done"; exit 0'
 
