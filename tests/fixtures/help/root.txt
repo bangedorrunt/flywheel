@@ -9,6 +9,7 @@ User config is `~/.config/flywheel`, or `$XDG_CONFIG_HOME/flywheel`. That direct
 Usage: flywheel [OPTIONS] [COMMAND]
 
 Commands:
+  proof              Background proof train: status of the newest HEAD proof (bd-7qhz0)
   seat               Re-bind a seat to a live pane without respawning it (bd-01q9d)
   hook               Report a harness hook event (bd-b2kaa): writes per-seat turn state and prints at most one continuation line. Hooks install this at spawn
   init               Scaffold a project (ensure dir + .beads + the project-scope compound spine: .flywheel/stages.toml, .flywheel/standing-orders.md, chiebukuro as the learning store) without spawning

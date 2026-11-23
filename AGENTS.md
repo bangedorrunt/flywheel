@@ -44,8 +44,9 @@ Delivery runs one of two workflows. `ce-lfg` is the light loop (build, review, v
 bash scripts/clean-proof.sh --sha <rev> --mutations changed --keep --receipt /tmp/<dir>/r.json
 AGENT_NAME=<captain> FLYWHEEL_SOURCE=<kept>/flywheel TORON_SOURCE=<kept>/toron \
   bash <kept>/flywheel/scripts/stack.sh install
+flywheel proof status [--json]              # background proof train (bd-7qhz0); never wait on it
 flywheel stack status --check
-flywheel ship land <bead-id> --sha <40hex> --receipt <proof.json> --as <pin> [--repo <dir>]
+flywheel ship land <bead-id> --sha <40hex> [--receipt <proof.json>] --as <pin> [--repo <dir>]  # omitted receipt = newest green proof-train receipt covering the bead
 flywheel integration install|uninstall|status [harness...]   # operator/captain only
 
 # crews and seats

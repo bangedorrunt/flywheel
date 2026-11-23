@@ -45,8 +45,10 @@ pub(crate) enum ShipCmd {
         #[arg(long)]
         sha: String,
         /// Proof receipt (machine-readable; becomes the gate `tail=`).
+        /// Omit to take the newest GREEN receipt covering this bead's commit
+        /// from the proof train (bd-7qhz0); landing never starts a proof.
         #[arg(long)]
-        receipt: PathBuf,
+        receipt: Option<PathBuf>,
         /// Toron project for the reservation release (default: the workspace
         /// project this repo sits in; a repo outside the workspace root must
         /// name it).
@@ -89,19 +91,91 @@ pub(crate) fn cmd_ship(cfg: &Config, cmd: &ShipCmd) -> Result<()> {
             dir,
             repo,
             json,
-        } => ship_land(LandArgs {
-            cfg,
-            bead: bead_id,
-            sha,
-            receipt,
-            project: project.as_deref(),
-            as_pin: as_pin.as_deref(),
-            message: message.as_deref(),
-            dir: dir.as_deref(),
-            repo: repo.as_deref(),
-            json: *json,
-        }),
+        } => {
+            let chosen = match receipt.clone() {
+                Some(path) => path,
+                None => newest_green_receipt_for(dir.as_deref(), bead_id).ok_or_else(|| {
+                    anyhow!(
+                        "no green receipt covers {bead_id}; check `flywheel proof status` \
+                         and wait for the train (landing never starts a proof)"
+                    )
+                })?,
+            };
+            ship_land(LandArgs {
+                cfg,
+                bead: bead_id,
+                sha,
+                receipt: &chosen,
+                project: project.as_deref(),
+                as_pin: as_pin.as_deref(),
+                message: message.as_deref(),
+                dir: dir.as_deref(),
+                repo: repo.as_deref(),
+                json: *json,
+            })
+        }
     }
+}
+
+/// Pick the newest GREEN receipt whose proof sha contains `bead_sha`.
+/// Pure core: callers supply the candidate rows and the ancestry predicate,
+/// so the ordering rule is testable without git or the filesystem.
+pub(crate) fn select_newest_green<'a, I, F>(
+    bead_sha: &str,
+    rows: I,
+    contains: F,
+) -> Option<&'a Path>
+where
+    I: IntoIterator<Item = (&'a Path, &'a str, &'a str, bool)>,
+    F: Fn(&str, &str) -> bool,
+{
+    rows.into_iter()
+        .filter(|(_, sha, _, ok)| *ok && contains(bead_sha, sha))
+        .max_by(|a, b| a.2.cmp(b.2))
+        .map(|(path, _, _, _)| path)
+}
+
+/// Impure wrapper: read the train's receipt archive and ask git ancestry.
+pub(crate) fn newest_green_receipt_for(dir: Option<&Path>, bead: &str) -> Option<PathBuf> {
+    let repo = dir.unwrap_or_else(|| Path::new("."));
+    let citing = git(repo, &["log", "-1", "--format=%H", "--grep", bead])
+        .ok()?
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    if citing.is_empty() {
+        return None;
+    }
+    let archive = crate::config::state_dir().join("clean-proof/receipts");
+    let mut rows: Vec<(PathBuf, String, String, bool)> = Vec::new();
+    for entry in std::fs::read_dir(&archive).ok()?.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let Some(sha) = doc.get("sha").and_then(Value::as_str) else {
+            continue;
+        };
+        let stamp = doc.get("stamp").and_then(Value::as_str).unwrap_or("");
+        rows.push((
+            path,
+            sha.to_string(),
+            stamp.to_string(),
+            doc.get("ok").and_then(Value::as_bool) == Some(true),
+        ));
+    }
+    let refs: Vec<(&Path, &str, &str, bool)> = rows
+        .iter()
+        .map(|(p, s, t, ok)| (p.as_path(), s.as_str(), t.as_str(), *ok))
+        .collect();
+    select_newest_green(&citing, refs, |a, b| is_ancestor(repo, a, b)).map(Path::to_path_buf)
 }
 
 /// bd-bi0mv: typed-receipt existence predicate. A commit exists when git can
@@ -1277,10 +1351,28 @@ mod tests {
     use super::{
         LandPlan, cache_key_at, gate_for, head_has_closed_bead, head_names_bead, land_project,
         landed_mail_args, normalize_spec_path, parse_legal_gates, pick_gate, receipt_is_landable,
-        receipt_is_witness_mode, record_witnessed_land, status_of,
+        receipt_is_witness_mode, record_witnessed_land, select_newest_green, status_of,
     };
     use crate::config::Config;
     use std::process::Command;
+
+    #[test]
+    fn newest_green_receipt_does_not_need_a_fresh_proof() {
+        let old = std::path::Path::new("/r/old.json");
+        let new = std::path::Path::new("/r/new.json");
+        let red = std::path::Path::new("/r/red.json");
+        let older_same_bead = std::path::Path::new("/r/older-bbb.json");
+        let rows = [
+            (old, "aaa", "2026-11-23T01:00:00Z", true),
+            (red, "bbb", "2026-11-23T03:00:00Z", false),
+            (new, "bbb", "2026-11-23T02:00:00Z", true),
+            (older_same_bead, "bbb", "2026-11-23T00:00:00Z", true),
+        ];
+        let contains = |bead: &str, sha: &str| sha == bead;
+        assert_eq!(select_newest_green("aaa", rows, contains), Some(old));
+        assert_eq!(select_newest_green("bbb", rows, contains), Some(new));
+        assert_eq!(select_newest_green("ccc", rows, contains), None);
+    }
 
     fn init_repo() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
