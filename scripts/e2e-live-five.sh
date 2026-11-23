@@ -182,7 +182,6 @@ fi
 
 PLANE_SESSION=""
 SPAWNED_PIN=""
-GUARD_PIN=""
 EVENTS_PIN=""
 # bd-833ya: spawn installs a per-project doorbell supervisor. Retiring the
 # seats alone leaves the project registered, and the next stack install boots
@@ -209,9 +208,6 @@ cleanup() {
     # swallowed by `|| true`), leaving registry rows and a live session.
     if [ -n "$SPAWNED_PIN" ] && [ "$KEEP" = 0 ]; then
         "$FLYWHEEL_BIN" retire "$SPAWNED_PIN" --project e2e-live-five --force-working >/dev/null 2>&1 || true
-    fi
-    if [ -n "$GUARD_PIN" ] && [ "$KEEP" = 0 ]; then
-        "$FLYWHEEL_BIN" retire "$GUARD_PIN" --project e2e-live-five --force-working >/dev/null 2>&1 || true
     fi
     if [ "$KEEP" = 0 ]; then
         retire_throwaway_project "$PROJECT"
@@ -289,10 +285,9 @@ export TORON_BIN
 # classifies as Unknown, which may_inject allows. Spawn one in THIS project only,
 # read its pin + pane_id from swarm status, and retire it in cleanup.
 # bd-oo7zi: the operator-typing guard needs a REAL harness pane. bd-live-wake-
-# pane-isolation: it gets its own claude pane, never the wake leg's opencode
-# pane. claude stays up; pi exits after one turn. The no-door events witness
-# uses gemini. No grok seat is spawned.
-spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --kind claude=1 --kind gemini=1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
+# pane-isolation: the guard types on the no-door gemini pane, never the wake
+# leg's opencode pane. No grok seat is spawned.
+spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --kind gemini=1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
     || die "flywheel spawn failed: $spawn_out"
 # Read pins and panes from the spawn receipt, not swarm status: once kill
 # clears the captain alias, the first spawned seat (opencode) is the captain
@@ -306,7 +301,7 @@ for m in re.finditer(r"state=Settled subject=flywheel-e2e-live-five-(\S+) \(pin=
 blocks = {}
 for m in re.finditer(r"^\s+(\S+) \(block:([^)]+)\)", text, re.M):
     blocks[m.group(1)] = m.group(2)
-kinds = {"opencode": "oc", "claude": "claude", "gemini": "gemini"}
+kinds = {"opencode": "oc", "gemini": "gemini"}
 for kind, suffix in kinds.items():
     block = blocks.get(kind, '')
     print(f"{pins.get(suffix, '')}\t{'block:' + block if block else ''}")
@@ -314,12 +309,10 @@ PY
 )" || die "cannot read the spawned seats from the spawn receipt"
 SPAWNED_PIN="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f1)"
 SPAWNED_PANE="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f2)"
-GUARD_PIN="$(printf '%s\n' "$seated" | sed -n '2p' | cut -f1)"
-GUARD_PANE="$(printf '%s\n' "$seated" | sed -n '2p' | cut -f2)"
-EVENTS_PIN="$(printf '%s\n' "$seated" | sed -n '3p' | cut -f1)"
+EVENTS_PIN="$(printf '%s\n' "$seated" | sed -n '2p' | cut -f1)"
+EVENTS_PANE="$(printf '%s\n' "$seated" | sed -n '2p' | cut -f2)"
 SPAWNED_SESSION="$(printf '%s\n' "$spawn_out" | sed -nE 's/.*(session:[^ ]+) created.*/\1/p' | head -1)"
 [ -n "$SPAWNED_PIN" ] || die "spawn receipt named no opencode pin"
-[ -n "$GUARD_PIN" ] || die "spawn receipt named no claude pin"
 [ -n "$EVENTS_PIN" ] || die "spawn receipt named no gemini pin"
 [ -n "$SPAWNED_SESSION" ] || die "spawn did not name its workspace session"
 
@@ -355,9 +348,9 @@ for t in "${TESTS[@]}"; do
     log="/tmp/e2e-live-five-$STAMP-$(basename "$t" .rs).log"
     if [ "$t" = "tests/live_doorbell_operator_guard.rs" ]; then
         export FLYWHEEL_LIVE_SESSION="$SPAWNED_SESSION"
-        export FLYWHEEL_LIVE_PIN="$GUARD_PIN"
-        export FLYWHEEL_LIVE_BLOCK="$GUARD_PANE"
-        export FLYWHEEL_LIVE_AS="$GUARD_PIN"
+        export FLYWHEEL_LIVE_PIN="$EVENTS_PIN"
+        export FLYWHEEL_LIVE_BLOCK="$EVENTS_PANE"
+        export FLYWHEEL_LIVE_AS="$EVENTS_PIN"
     elif [ "$t" = "tests/live_opencode_api_wake.rs" ]; then
         export FLYWHEEL_LIVE_SESSION="$SPAWNED_SESSION"
         export FLYWHEEL_LIVE_PIN="$SPAWNED_PIN"
