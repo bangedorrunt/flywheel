@@ -86,11 +86,13 @@ export_is_live() {
 sweep_kept_exports() {
     local dir age now
     now="$(date +%s)"
-    # Only OUR PIN's older exports, or ANY export older than a few hours.
+    # Only OUR PIN's older fence exports, or ANY export older than a few hours.
     # bd-8jakq's sweep-all deleted concurrent crews' kept exports mid-test.
-    for dir in "${TMPDIR:-/tmp}"/fence.*; do
+    # bd-p7oim: failed proofs keep fw-proof.* exports forever; those have no
+    # owner pin, so the age + live-lock checks are the only safety rules.
+    for dir in "${TMPDIR:-/tmp}"/fence.* "${TMPDIR:-/tmp}"/fw-proof.*; do
         [ -d "$dir" ] || continue
-        [ "$dir" = "$TMP" ] && continue
+        [ "$(basename "$dir")" = "$(basename "$TMP")" ] && continue
         case "$(basename "$dir")" in
             fence."$PIN".*) ;;
             *)
@@ -108,7 +110,7 @@ cleanup() {
     rm -f "$LOCK"
     if [ "$KEEP" -eq 1 ] || [ "$status" -ne 0 ]; then
         echo "fence: kept $TMP" >&2
-        [ "$status" -eq 0 ] && sweep_kept_exports
+        sweep_kept_exports
     else
         rm -rf "$TMP"
     fi
