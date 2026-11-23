@@ -711,4 +711,136 @@ mod tests {
             "post_once must send the mcp-method header"
         );
     }
+
+    /// A fake that enforces what toron's Streamable HTTP layer enforces
+    /// before it dispatches an `events/*` method: -32020 for a missing or
+    /// mismatched `mcp-method` / `MCP-Protocol-Version` header, -32602 for a
+    /// missing `_meta` protocolVersion. The wire is read from raw HTTP, so a
+    /// client that omits a header cannot pass by lying to the RPC port.
+    fn strict_events_server(log: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> String {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match s.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(_) => break,
+                    }
+                    if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                        let need = head
+                            .lines()
+                            .find_map(|l| {
+                                l.strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= head_end + 4 + need {
+                            break;
+                        }
+                    }
+                }
+                let raw = String::from_utf8_lossy(&buf);
+                let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+                let header = |name: &str| {
+                    head.lines().find_map(|l| {
+                        l.split_once(':').and_then(|(k, v)| {
+                            (k.trim().eq_ignore_ascii_case(name)).then(|| v.trim().to_string())
+                        })
+                    })
+                };
+                let req: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                let meta_version =
+                    req["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]
+                        .as_str()
+                        .map(str::to_string);
+                log.lock().expect("log").push(format!(
+                    "{method}:mcp-method={:?}:version={meta_version:?}",
+                    header("mcp-method")
+                ));
+                let method_header = header("mcp-method");
+                let version_header = header("mcp-protocol-version");
+                let error = if method_header.as_deref() != Some(method.as_str()) {
+                    Some((-32020, "missing or mismatched Mcp-Method header"))
+                } else if version_header.is_none() {
+                    Some((-32020, "Missing MCP-Protocol-Version header"))
+                } else if meta_version.is_none() {
+                    Some((-32602, "Missing protocolVersion in _meta"))
+                } else if version_header.as_deref() != meta_version.as_deref() {
+                    Some((-32020, "MCP-Protocol-Version header does not match _meta"))
+                } else {
+                    None
+                };
+                let payload = if let Some((code, msg)) = error {
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "error": {"code": code, "message": msg},
+                    })
+                } else {
+                    match method.as_str() {
+                        "events/subscribe" => serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1,
+                            "result": {"id": "s1", "expiresAt": 9_000_000_000i64, "cursor": "0"},
+                        }),
+                        "events/poll" => serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1,
+                            "result": {
+                                "events": [{
+                                    "eventId": "evt-strict-1", "name": "mail.addressed",
+                                    "data": {"project": "flywheel", "importance": "normal"},
+                                }],
+                                "cursor": "7", "truncated": false,
+                            },
+                        }),
+                        _ => serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1,
+                            "error": {"code": -32601, "message": "not available in this host"},
+                        }),
+                    }
+                };
+                let out = payload.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{out}",
+                    out.len()
+                );
+                let _ = s.write_all(response.as_bytes());
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn real_events_server_accepts_the_client_wire_and_serves_a_page() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = strict_events_server(log.clone());
+        let dir = std::env::temp_dir().join(format!("fw-strict-events-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let token_path = dir.join("token");
+        std::fs::write(&token_path, "test-token").expect("token file");
+        let rpc = UreqRpc::new(&url, token_path.to_str().expect("path"));
+        let mut client = ToronEventsClient::new(rpc, "mail.addressed", 3600);
+        client
+            .subscribe()
+            .expect("the strict server accepts subscribe");
+        let page = client.fetch("0").expect("the strict server accepts poll");
+        assert_eq!(page.events.len(), 1, "one real occurrence becomes one page");
+        let seen = log.lock().expect("log").join("\n");
+        assert!(
+            seen.contains("events/subscribe:mcp-method=Some(\"events/subscribe\")"),
+            "the real server saw the method header: {seen}"
+        );
+        assert!(
+            seen.contains("version=Some(\"2026-07-28\")"),
+            "the real server saw the meta version: {seen}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
