@@ -646,6 +646,39 @@ mod tests {
         );
     }
 
+    /// bd-slt2n: the log shape from the live doorbell — a cursor past the mail
+    /// and an events-door pin that never saw it. The idle pane still rings.
+    #[test]
+    fn wake_fires_after_interrupt() {
+        let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut index = SelfIndex::default();
+        index.insert_pin("BlueRidge".into(), Some(npub.into()));
+        let watch = format!(
+            r#"{{"kind":9,"id":"wake-interrupt-1","pubkey":"senderpk","created_at":1700000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-interrupt-1"]],"content":"mail"}}"#
+        );
+        let mut model = DoorbellModel {
+            index,
+            statuses: [("BlueRidge".into(), "idle".into())].into(),
+            ..DoorbellModel::default()
+        };
+        model.toron_cursor.insert(
+            "BlueRidge".into(),
+            doorbell_core::ToronRead {
+                cursor_us: Some(1_700_000_000_000_000),
+                read_at_secs: 1_700_000_000,
+            },
+        );
+        model.events_door_pins.insert("BlueRidge".into());
+        let (_, cmds) = InboxProgram::fold(&model, &DoorbellMsg::WatchNdjson { line: watch });
+        assert!(
+            cmds.iter().any(|c| matches!(
+                &c.action,
+                DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge"
+            )),
+            "an idle events-door pane must be rung after a plugin cursor read: {cmds:?}"
+        );
+    }
+
     #[test]
     fn doorbell_wake_delivery_idle_line_names_the_read_command() {
         let cmds = fold_tasked_mail_at("idle");
