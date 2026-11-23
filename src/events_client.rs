@@ -162,6 +162,15 @@ pub fn subscription_from_result(v: &serde_json::Value) -> Result<(String, i64, S
     let expires = v
         .get("expiresAt")
         .and_then(serde_json::Value::as_i64)
+        .or_else(|| {
+            v.get("refreshBefore")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .map(|dt| dt.timestamp_micros())
+                })
+        })
         .unwrap_or(0);
     let cursor = v
         .get("cursor")
@@ -278,9 +287,8 @@ impl<R: EventsRpc> ToronEventsClient<R> {
             "events/subscribe",
             serde_json::json!({
                 "name": self.name,
-                "arguments": {},
-                "delivery": "stream",
-                "ttl_us": self.ttl_us,
+                "arguments": {"ttl_us": self.ttl_us},
+                "delivery": {"mode": "stream"},
             }),
             None,
         )?;
@@ -429,6 +437,141 @@ mod tests {
             stream,
             poll,
         }
+    }
+
+    /// A fake that speaks toron's real `events/*` JSON-RPC surface: subscribe
+    /// returns the server's `{id, refreshBefore, cursor}` shape, and both
+    /// stream and poll refuse a request without the returned subscription id.
+    struct RealSurfaceRpc {
+        subscribed: std::cell::Cell<bool>,
+        stream_fails: bool,
+    }
+
+    impl EventsRpc for RealSurfaceRpc {
+        fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+            _last_event_id: Option<&str>,
+        ) -> Result<serde_json::Value, String> {
+            match method {
+                "events/subscribe" => {
+                    assert_eq!(params["name"], "mail.addressed", "catalogue name: {params}");
+                    assert!(
+                        params["arguments"]["ttl_us"].is_number(),
+                        "ttl belongs in arguments: {params}"
+                    );
+                    assert_eq!(
+                        params["delivery"]["mode"], "stream",
+                        "delivery is an object with a mode: {params}"
+                    );
+                    self.subscribed.set(true);
+                    Ok(serde_json::json!({
+                        "resultType": "complete",
+                        "id": "sub-real",
+                        "refreshBefore": "2026-11-23T00:00:00.000000Z",
+                        "cursor": "0",
+                    }))
+                }
+                "events/poll" => {
+                    assert!(self.subscribed.get(), "subscribe must come first");
+                    assert_eq!(
+                        params["subscriptionId"], "sub-real",
+                        "poll must name the subscription: {params}"
+                    );
+                    Ok(serde_json::json!({
+                        "resultType": "complete",
+                        "events": [{
+                            "eventId": "evt-real-1",
+                            "name": "mail.addressed",
+                            "timestamp": 1_700_000_000,
+                            "data": {
+                                "project": "flywheel",
+                                "senderPin": "SlateHarbor",
+                                "correlationId": "c-1",
+                                "importance": "urgent",
+                            },
+                        }],
+                        "cursor": "7",
+                        "hasMore": false,
+                    }))
+                }
+                other => panic!("unexpected method {other}"),
+            }
+        }
+
+        fn stream(
+            &self,
+            params: serde_json::Value,
+            _last_event_id: Option<&str>,
+            on_data: &mut dyn FnMut(&str),
+        ) -> Result<(), String> {
+            assert!(self.subscribed.get(), "subscribe must come first");
+            assert_eq!(
+                params["subscriptionId"], "sub-real",
+                "stream must name the subscription: {params}"
+            );
+            if self.stream_fails {
+                return Err("stream unavailable".into());
+            }
+            on_data(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/events/event",
+                    "params": {
+                        "_meta": {"io.modelcontextprotocol/subscriptionId": "sub-real"},
+                        "event": {
+                            "eventId": "evt-real-1",
+                            "name": "mail.addressed",
+                            "data": {"project": "flywheel", "senderPin": "SlateHarbor", "importance": "urgent"},
+                        },
+                    },
+                })
+                .to_string(),
+            );
+            Ok(())
+        }
+    }
+
+    fn real_surface_subscription(stream_fails: bool) -> ToronEventsClient<RealSurfaceRpc> {
+        let mut client = ToronEventsClient::new(
+            RealSurfaceRpc {
+                subscribed: std::cell::Cell::new(false),
+                stream_fails,
+            },
+            "mail.addressed",
+            3600,
+        );
+        let expires = client
+            .subscribe()
+            .expect("subscribe against the real shape");
+        assert!(expires > 0, "refreshBefore must be parsed: {expires}");
+        client
+    }
+
+    #[test]
+    fn real_surface_stream_feeds_one_typed_urgent_notice_to_the_plugin() {
+        let client = real_surface_subscription(false);
+        let page = client.fetch("0").expect("stream fetch");
+        assert_eq!(page.events.len(), 1);
+        let notice = crate::events_bridge::event_to_notice(&page.events[0]).expect("notice");
+        let frame = crate::events_bridge::notice_to_rpc(&notice);
+        assert_eq!(frame["params"]["meta"]["importance"], "urgent");
+        assert!(
+            frame["params"]["content"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("[wake] "))
+        );
+        assert_eq!(frame["params"]["meta"]["event_id"], "evt-real-1");
+    }
+
+    #[test]
+    fn real_surface_poll_fallback_feeds_one_typed_urgent_notice() {
+        let client = real_surface_subscription(true);
+        let page = client.fetch("0").expect("poll fallback");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].importance.as_deref(), Some("urgent"));
+        assert_eq!(page.next_cursor, "7");
     }
 
     #[test]
