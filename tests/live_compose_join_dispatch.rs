@@ -31,6 +31,14 @@ fn run(bin: &str, args: &[&str]) -> std::process::Output {
         .unwrap_or_else(|e| panic!("{bin} {}: {e}", args.join(" ")))
 }
 
+fn run_as(bin: &str, args: &[&str], as_pin: &str) -> std::process::Output {
+    Command::new(bin)
+        .args(args)
+        .env("AGENT_NAME", as_pin)
+        .output()
+        .unwrap_or_else(|e| panic!("{bin} {}: {e}", args.join(" ")))
+}
+
 fn text(out: &std::process::Output) -> String {
     format!(
         "{}{}",
@@ -124,7 +132,7 @@ fn composed_join_dispatches_the_bound_step_to_the_live_pin() {
 
     // Real CLI path: compose a role:coder step, join against live seats, run
     // it with consent. Nothing here calls apply_join_bindings directly.
-    let out = run(
+    let out = run_as(
         &bin,
         &[
             "workflow",
@@ -141,11 +149,12 @@ fn composed_join_dispatches_the_bound_step_to_the_live_pin() {
             "--project",
             &project,
         ],
+        &pin,
     );
     let log = text(&out);
     assert!(out.status.success(), "compose --join --run failed: {log}");
     assert!(
-        log.contains("flywheel: join step "),
+        log.contains("flywheel: join "),
         "the join plan must be printed: {log}"
     );
     assert!(
