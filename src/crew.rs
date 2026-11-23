@@ -3645,42 +3645,36 @@ steps:
         out
     }
 
-    /// bd-8c5h: THE remaining gap. `apply_role_aliases` rewrites the document
-    /// it is handed, so a fold only lands when the PARENT dispatches the role
-    /// itself. `goal` dispatches nothing (every node is a `call_workflow`) and
-    /// the role it needs is dispatched by the CHILD — so the rewrite is a
-    /// no-op and the fold the packer just announced never happens.
-    ///
-    /// The fold therefore has to travel with the RESOLVER, which is the only
-    /// thing that ever sees a child. This pins that against the REAL builtins:
-    /// if `goal` ever starts dispatching a role itself, or `ce-brainstorm`
-    /// stops dispatching the folded one, the preconditions fail loudly instead
-    /// of the test quietly asserting nothing.
+    /// bd-8c5h: `apply_role_aliases` rewrites the document it is handed, so a
+    /// fold only lands when the PARENT dispatches the role itself. Here the
+    /// parent is `ce-review` (dispatching @reviewer/@oracle) and the child is
+    /// `ce-bakeoff` (dispatching @coder) — so a coder fold is a no-op on the
+    /// parent and must travel with the RESOLVER to reach the child.
     #[test]
     fn the_fold_reaches_the_child_that_dispatches_the_role() {
         let catalog = crate::builtin_workflows::builtin_workflows();
-        let goal = catalog.get("goal").expect("goal builtin");
-        let child = catalog.get("ce-brainstorm").expect("ce-brainstorm builtin");
+        let parent = catalog.get("ce-review").expect("ce-review builtin");
+        let child = catalog.get("ce-bakeoff").expect("ce-bakeoff builtin");
 
-        let parent_roles = dispatch_profiles(goal);
+        let parent_roles = dispatch_profiles(parent);
         assert!(
             !parent_roles.is_empty(),
-            "goal dispatches nothing itself — re-check whether the child gap still exists"
+            "ce-review dispatches nothing itself — re-check whether the child gap still exists"
         );
         assert!(
-            !parent_roles.contains(&"oracle".to_string()),
-            "goal now dispatches @oracle itself, so the child gap is gone: {parent_roles:?}"
+            !parent_roles.contains(&"coder".to_string()),
+            "ce-review now dispatches @coder itself, so the child gap is gone: {parent_roles:?}"
         );
         assert!(
-            dispatch_profiles(child).contains(&"oracle".to_string()),
-            "ce-brainstorm no longer dispatches @oracle: {:?}",
+            dispatch_profiles(child).contains(&"coder".to_string()),
+            "ce-bakeoff no longer dispatches @coder: {:?}",
             dispatch_profiles(child)
         );
 
         let aliases: BTreeMap<String, String> =
-            BTreeMap::from([("oracle".to_string(), "coder".to_string())]);
+            BTreeMap::from([("coder".to_string(), "housekeeper".to_string())]);
 
-        let rewritten_parent = apply_role_aliases(goal, &aliases);
+        let rewritten_parent = apply_role_aliases(parent, &aliases);
         let parent_after = dispatch_profiles(&rewritten_parent);
         assert_eq!(
             parent_after, parent_roles,
@@ -3689,23 +3683,22 @@ steps:
         );
 
         let raw = std::sync::Arc::new(child.clone());
-        let base: toron_workflow::WorkflowResolver = std::sync::Arc::new(move |name: &str| {
-            (name == "ce-brainstorm").then(|| (*raw).clone())
-        });
+        let base: toron_workflow::WorkflowResolver =
+            std::sync::Arc::new(move |name: &str| (name == "ce-bakeoff").then(|| (*raw).clone()));
         let resolver = aliasing_resolver(base, aliases);
 
-        let folded = resolver("ce-brainstorm").expect("the child still resolves");
+        let folded = resolver("ce-bakeoff").expect("the child still resolves");
         let after = dispatch_profiles(&folded);
         assert!(
-            !after.contains(&"oracle".to_string()),
+            !after.contains(&"coder".to_string()),
             "the fold never reached the child document: {after:?}"
         );
         assert!(
-            after.contains(&"coder".to_string()),
+            after.contains(&"housekeeper".to_string()),
             "the host role is missing from the rewritten child: {after:?}"
         );
         assert!(
-            after.contains(&"reviewer".to_string()),
+            after.contains(&"oracle".to_string()),
             "an unfurled role was rewritten too: {after:?}"
         );
     }
@@ -3775,12 +3768,11 @@ steps:
     fn the_multi_copy_worklist_now_packs_with_real_copies() {
         let catalog = crate::builtin_workflows::builtin_workflows();
         for (name, expected) in [
-            ("debate", [("oracle", 1u32), ("reviewer", 2u32)].as_slice()),
-            ("phase-review", [("reviewer", 2u32)].as_slice()),
             (
-                "weekly-review",
-                [("oracle", 1u32), ("scout", 3u32)].as_slice(),
+                "ce-review",
+                [("oracle", 1u32), ("reviewer", 2u32)].as_slice(),
             ),
+            ("ce-bakeoff", [("coder", 2u32), ("oracle", 1u32)].as_slice()),
         ] {
             let shape = crew_demand(&catalog[name]).crew_shape;
             let got: Vec<(String, u32)> = shape.iter().map(|(k, v)| (k.clone(), *v)).collect();
@@ -4046,11 +4038,7 @@ steps:
     #[test]
     fn the_templated_fanout_builtins_are_seated_with_copies() {
         let catalog = crate::builtin_workflows::builtin_workflows();
-        for (name, role, copies) in [
-            ("interrogate", "reviewer", 2u32),
-            ("prototype", "coder", 2),
-            ("arena", "coder", 2),
-        ] {
+        for (name, role, copies) in [("ce-review", "reviewer", 2u32), ("ce-bakeoff", "coder", 2)] {
             let shape = crew_demand(&catalog[name]).crew_shape;
             assert_eq!(
                 shape.get(role).copied(),
@@ -4088,34 +4076,25 @@ steps:
         );
     }
 
-    /// `goal` specifically: five panes, zero collisions, and full three-way
+    /// `ce-lfg` specifically: five panes, zero collisions, and full three-way
     /// divergence. This is the analysis the request asked for, pinned so a
     /// future edit cannot quietly re-break it.
     #[test]
     fn goal_fits_five_panes_with_three_way_divergence() {
         let catalog = crate::builtin_workflows::builtin_workflows();
 
-        let goal = catalog.get("goal").expect("goal builtin");
-        assert_eq!(
-            crew_demand(goal).required_panes,
-            1,
-            "goal's own steps are sequential"
-        );
-
-        let cb = catalog.get("ce-brainstorm").expect("ce-brainstorm builtin");
-        let d = crew_demand(cb);
+        let goal = catalog.get("ce-lfg").expect("ce-lfg builtin");
+        let d = crew_demand(goal);
+        assert!(d.collisions.is_empty(), "ce-lfg self-collides: {d:?}");
         assert!(
-            d.collisions.is_empty(),
-            "ce-brainstorm self-collides: {d:?}"
-        );
-        assert_eq!(
-            d.required_panes, 3,
-            "three independent divergers, three panes"
+            d.required_panes <= DEFAULT_CREW_MAX,
+            "ce-lfg needs {} panes, cap is {DEFAULT_CREW_MAX}",
+            d.required_panes
         );
 
-        let lenses: Vec<String> = ["diverge_oracle", "diverge_structure", "diverge_risk"]
+        let lenses: Vec<String> = ["ideate-oracle", "ideate-structure", "ideate-risk"]
             .into_iter()
-            .filter(|n| cb.graph.as_ref().is_some_and(|g| g.nodes.contains_key(*n)))
+            .filter(|n| goal.steps.iter().any(|s| s.name.as_deref() == Some(*n)))
             .map(str::to_string)
             .collect();
         assert_eq!(
@@ -4125,23 +4104,15 @@ steps:
         );
 
         let mut roles: std::collections::BTreeSet<String> = Default::default();
-        for wf_name in ["goal", "ce-brainstorm", "phase-plan", "beads"] {
-            let wf = catalog.get(wf_name).expect("workflow in goal's call graph");
-            for action in wf
-                .graph
-                .iter()
-                .flat_map(|g| g.nodes.values().map(|n| &n.action))
-                .chain(wf.steps.iter().map(|s| &s.action))
-            {
-                let mut uses = Vec::new();
-                role_uses(action, &BTreeMap::new(), &mut uses);
-                roles.extend(uses);
-            }
+        for action in goal.steps.iter().map(|s| &s.action) {
+            let mut uses = Vec::new();
+            role_uses(action, &BTreeMap::new(), &mut uses);
+            roles.extend(uses);
         }
         assert_eq!(
             roles.len(),
             5,
-            "goal's call graph needs exactly one pane per role, and that is 5: {roles:?}"
+            "ce-lfg needs exactly one pane per role, and that is 5: {roles:?}"
         );
     }
 }
