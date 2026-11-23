@@ -1046,7 +1046,7 @@ fn every_profile_routes_on_every_bare_harness() {
 fn every_harness_named_by_a_workflow_is_registered() {
     let workflows = crate::builtin_workflows::builtin_workflows();
     assert!(
-        workflows.len() >= 20,
+        workflows.len() >= 10,
         "only {} workflows enumerated; the catalog accessor changed and this guard is \
          now vacuous",
         workflows.len()

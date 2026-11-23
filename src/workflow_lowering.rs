@@ -1164,21 +1164,21 @@ steps:
         assert!(errs[0].contains("wait"), "{errs:?}");
     }
 
-    /// bd-36zlq: bd-ge1zo retired the marker polls, so wave-swarm lowers with
+    /// bd-36zlq: bd-ge1zo retired the marker polls, so ce-lfg lowers with
     /// ZERO long-hold warnings.
     #[test]
     fn workflow_lowering_wave_swarm_has_no_long_hold() {
         let wf = crate::builtin_workflows::builtin_workflows()
             .into_iter()
-            .find(|(name, _)| name == "wave-swarm")
-            .expect("wave-swarm is compiled in")
+            .find(|(name, _)| name == "ce-lfg")
+            .expect("ce-lfg is compiled in")
             .1;
-        let lowered = lower(&wf).expect("wave-swarm lowers");
+        let lowered = lower(&wf).expect("ce-lfg lowers");
         let (errs, warns) = check_bounded(&lowered);
-        assert!(errs.is_empty(), "wave-swarm bounded errors: {errs:?}");
+        assert!(errs.is_empty(), "ce-lfg bounded errors: {errs:?}");
         assert!(
             warns.is_empty(),
-            "wave-swarm still has long-hold warnings: {warns:?}"
+            "ce-lfg still has long-hold warnings: {warns:?}"
         );
     }
 

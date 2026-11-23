@@ -3104,11 +3104,9 @@ mod workflow_cli_lint_tests {
     #[test]
     fn workflow_lowering_verify_row_clean_workflow_has_no_warnings() {
         let wfs = builtin_workflows::builtin_workflows();
-        let wf = wfs
-            .get("beads-lifecycle")
-            .expect("beads-lifecycle cataloged");
+        let wf = wfs.get("ce-triage").expect("ce-triage cataloged");
         let report = verify_catalog_workflow(
-            "beads-lifecycle",
+            "ce-triage",
             wf,
             "builtin",
             &crate::stages::StageLibrary::compiled_in(),

@@ -4674,22 +4674,22 @@ mod tests {
         e
     }
 
-    /// ADR-0022 D8 acceptance 6 on the real beads-lifecycle audit step: the
-    /// fresh reviewer dispatch binds a non-author seat of a different model
+    /// ADR-0022 D8 acceptance 6 on the real ce-lfg audit step: the fresh
+    /// reviewer dispatch binds a non-author seat of a different model
     /// family, and a replay binds identically.
     #[test]
     fn beads_lifecycle_audit_binds_a_non_author_different_family() {
         use crate::seat_binder::Binding;
         use toron_workflow::schema::Action;
         let wf = crate::builtin_workflows::builtin_workflows()
-            .get("beads-lifecycle")
+            .get("ce-lfg")
             .cloned()
-            .expect("beads-lifecycle cataloged");
+            .expect("ce-lfg cataloged");
         let audit = wf
-            .graph
-            .as_ref()
-            .and_then(|g| g.nodes.get("audit"))
-            .expect("audit node");
+            .steps
+            .iter()
+            .find(|s| s.name.as_deref() == Some("audit"))
+            .expect("audit step");
         let Action::DispatchJob { spec, .. } = &audit.action else {
             panic!("audit is a dispatch_job");
         };

@@ -19,16 +19,16 @@ mod tests {
     }
 
     /// D1: a `shape: fan-out` workflow without a parallel/foreach step is
-    /// refused by lint. `beads` is a linear pipeline.
+    /// refused by lint. `ce-triage` is a linear pipeline.
     #[test]
     fn adr0021_shape_lint_refuses_a_fanout_without_parallel() {
         use crate::workflow_catalog::{Shape, shape_conforms};
-        let err = shape_conforms(Shape::FanOut, &builtin("beads"))
+        let err = shape_conforms(Shape::FanOut, &builtin("ce-triage"))
             .expect_err("a fan-out shape needs a fan-out step");
         assert!(err.contains("parallel/foreach"), "{err}");
         assert!(
-            shape_conforms(Shape::FanOut, &builtin("arena")).is_ok(),
-            "arena fans out"
+            shape_conforms(Shape::FanOut, &builtin("ce-review")).is_ok(),
+            "ce-review fans out"
         );
     }
 
