@@ -9,7 +9,7 @@ TEST_FILTER=(
 mutation "B1  sibling test step is skipped" \
     file=scripts/clean-proof.sh \
     expect=a_failing_sibling_suite_fails_the_step_naming_it \
-    find='    run_step "sibling-$sib_name-tests" env "CARGO_TARGET_DIR=$TMP/$sib_name/test-target" \
-      "${MBX[@]}" test --manifest-path "$TMP/$sib_name/Cargo.toml" --workspace \
-      --no-fail-fast || true' \
-    replace='    : # sibling suite skipped'
+    find='      run_step "sibling-$sib_name-tests" env "CARGO_TARGET_DIR=$TMP/$sib_name/test-target" \
+        "${MBX[@]}" test --manifest-path "$TMP/$sib_name/Cargo.toml" --workspace \
+        --no-fail-fast || true' \
+    replace='      : # sibling suite skipped'

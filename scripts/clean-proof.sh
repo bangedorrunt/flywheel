@@ -371,6 +371,41 @@ run_step() { # name cmd...
   fi
 }
 
+# bd-p7oim: the sibling suites and the flywheel suite do not depend on each
+# other once the build is done. Launch them together, collect in launch order.
+PARALLEL_NAMES=""
+run_parallel_step() { # name cmd...
+  local name="$1"
+  shift
+  date +%s >"$TMP/$name.start"
+  echo "clean-proof: $name (parallel)"
+  ( "$@" >"$TMP/$name.log" 2>&1; echo $? >"$TMP/$name.status" ) &
+  PARALLEL_NAMES="$PARALLEL_NAMES$name
+"
+}
+
+collect_parallel() {
+  local name started status
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    while [ ! -f "$TMP/$name.status" ]; do sleep 0.1; done
+    status="$(cat "$TMP/$name.status")"
+    started="$(cat "$TMP/$name.start")"
+    STEP_NAMES="$STEP_NAMES$name
+"
+    STEP_STATUSES="$STEP_STATUSES$status
+"
+    STEP_SECS="$STEP_SECS$(( $(date +%s) - started ))
+"
+    if [ "$status" -ne 0 ] && [ -z "$FAILED_STEP" ]; then
+      echo "clean-proof: $name failed; log $TMP/$name.log" >&2
+      tail -25 "$TMP/$name.log" >&2 || true
+      FAILED_STEP="$name"
+    fi
+  done <<<"$PARALLEL_NAMES"
+  PARALLEL_NAMES=""
+}
+
 # bd-lfii3: a proof covers every repo it pins. Each sibling's OWN workspace
 # suite runs in this same export at its pinned rev, fail-fast before the
 # mutation stage, and is recorded as a receipt step.
@@ -381,8 +416,8 @@ sibling_tests() { # reads sibling names on stdin
     [ -z "$FAILED_STEP" ] || break
     [ -f "$TMP/$sib_name/Cargo.toml" ] || continue
     sib_rev="$(awk -F '\t' -v n="$sib_name" '$1 == n { print $2; exit }' \
-      <<<"$SIBLING_TEST_KEYS")"
-    cache_file="$SIBLING_TEST_CACHE/$sib_name-$sib_rev.green"
+      <<<"${SIBLING_TEST_KEYS:-}")"
+    cache_file="${SIBLING_TEST_CACHE:-/nonexistent}/$sib_name-$sib_rev.green"
     if [ -n "$sib_rev" ] && [ -f "$cache_file" ]; then
       echo "clean-proof: sibling-$sib_name-tests cached at $sib_rev"
       STEP_NAMES="${STEP_NAMES}sibling-${sib_name}-tests
@@ -393,11 +428,17 @@ sibling_tests() { # reads sibling names on stdin
 "
       continue
     fi
-    SIBLING_TEST_RAN="$SIBLING_TEST_RAN$sib_name	$sib_rev
+    SIBLING_TEST_RAN="${SIBLING_TEST_RAN:-}$sib_name	$sib_rev
 "
-    run_step "sibling-$sib_name-tests" env "CARGO_TARGET_DIR=$TMP/$sib_name/test-target" \
-      "${MBX[@]}" test --manifest-path "$TMP/$sib_name/Cargo.toml" --workspace \
-      --no-fail-fast || true
+    if [ "${PROOF_PARALLEL:-0}" = 1 ]; then
+      run_parallel_step "sibling-$sib_name-tests" env \
+        "CARGO_TARGET_DIR=$TMP/$sib_name/test-target" "${MBX[@]}" test \
+        --manifest-path "$TMP/$sib_name/Cargo.toml" --workspace --no-fail-fast
+    else
+      run_step "sibling-$sib_name-tests" env "CARGO_TARGET_DIR=$TMP/$sib_name/test-target" \
+        "${MBX[@]}" test --manifest-path "$TMP/$sib_name/Cargo.toml" --workspace \
+        --no-fail-fast || true
+    fi
   done
 }
 
@@ -449,8 +490,10 @@ elif [ -z "$FAILED_STEP" ]; then
   fi
 fi
 # bd-lfii3: sibling suites before flywheel's own suite and mutations.
+PROOF_PARALLEL=1
 sibling_tests <<< "$SIBLING_TEST_STEPS"
-[ -n "$FAILED_STEP" ] || run_step suite "${MBX[@]}" test -p flywheel --tests || true
+[ -n "$FAILED_STEP" ] || run_parallel_step suite "${MBX[@]}" test -p flywheel --tests
+collect_parallel
 [ -n "$FAILED_STEP" ] || run_step workflow-verify \
   env "XDG_CONFIG_HOME=$TMP/config" "XDG_STATE_HOME=$TMP/state" \
   "${MBX[@]}" run --quiet --bin flywheel -- workflow verify --json || true

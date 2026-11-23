@@ -49,7 +49,7 @@ fn proof_suite_step_runs_the_tests_directory() {
         .expect("scripts/clean-proof.sh");
     let step = src
         .lines()
-        .find(|line| line.contains("run_step suite "))
+        .find(|line| line.contains("run_parallel_step suite "))
         .expect("a suite step exists");
     assert!(
         step.contains("--tests"),
@@ -368,6 +368,15 @@ fn proof_sibling_suite_caches_by_rev() {
         .status()
         .expect("run scripts/test-proof-sibling-cache.sh");
     assert!(status.success(), "sibling suite cache witness failed");
+}
+
+/// bd-p7oim: independent suites must overlap once the build is done.
+#[test]
+fn proof_suites_run_concurrently() {
+    let status = sandboxed_bash(root(), "test-proof-parallel.sh")
+        .status()
+        .expect("run scripts/test-proof-parallel.sh");
+    assert!(status.success(), "parallel suite witness failed");
 }
 
 #[test]

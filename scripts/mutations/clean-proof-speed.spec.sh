@@ -3,7 +3,7 @@
 # bd-p7oim: each proof step carries its own wall time in the receipt.
 
 CARGO_ARGS=(-p flywheel --test proof_steps)
-TEST_FILTER=(proof_receipt_records_each_step_seconds proof_sibling_suite_caches_by_rev)
+TEST_FILTER=(proof_receipt_records_each_step_seconds proof_sibling_suite_caches_by_rev proof_suites_run_concurrently)
 
 mutation "T1  the receipt drops per-step seconds" \
     file=scripts/proof-lib.sh \
@@ -16,3 +16,9 @@ mutation "C1  a sibling suite cache never hits" \
     expect=proof_sibling_suite_caches_by_rev \
     find='if [ -n "$sib_rev" ] && [ -f "$cache_file" ]; then' \
     replace='if false; then # bd-p7oim mutation: re-run every sibling suite'
+
+mutation "D1  the suites run one after the other again" \
+    file=scripts/clean-proof.sh \
+    expect=proof_suites_run_concurrently \
+    find='( "$@" >"$TMP/$name.log" 2>&1; echo $? >"$TMP/$name.status" ) &' \
+    replace='( "$@" >"$TMP/$name.log" 2>&1; echo $? >"$TMP/$name.status" )'

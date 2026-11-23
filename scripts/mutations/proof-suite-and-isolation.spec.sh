@@ -8,8 +8,8 @@ TEST_FILTER=(proof_)
 mutation "S1  the suite step only runs --bin flywheel" \
     file=scripts/clean-proof.sh \
     expect=proof_suite_step_runs_the_tests_directory \
-    find='run_step suite "${MBX[@]}" test -p flywheel --tests' \
-    replace='run_step suite "${MBX[@]}" test -p flywheel --bin flywheel'
+    find='run_parallel_step suite "${MBX[@]}" test -p flywheel --tests' \
+    replace='run_parallel_step suite "${MBX[@]}" test -p flywheel --bin flywheel'
 
 mutation "I1  the mutation harness edits the caller tree" \
     file=scripts/verify-mutations.sh \
