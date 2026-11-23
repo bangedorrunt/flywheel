@@ -350,6 +350,16 @@ fn a_stale_lockfile_fails_the_proof_build_step() {
 
 /// bd-9os20: the Claude plugin must load from its installed path and stack.sh
 /// must copy it there; both are checkable without a live Claude seat.
+/// bd-p7oim: the proof receipt must carry per-step wall time, so a slow suite
+/// can be found from the receipt instead of reading each step's log.
+#[test]
+fn proof_receipt_records_each_step_seconds() {
+    let status = sandboxed_bash(root(), "test-proof-step-secs.sh")
+        .status()
+        .expect("run scripts/test-proof-step-secs.sh");
+    assert!(status.success(), "proof receipt timing witness failed");
+}
+
 #[test]
 fn proof_claude_plugin_loads_and_installs_to_plugin_dir() {
     let status = sandboxed_bash(root(), "test-claude-plugin-load.sh")

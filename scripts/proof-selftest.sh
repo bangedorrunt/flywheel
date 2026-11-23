@@ -134,6 +134,17 @@ else
   fail "receipt does not record mutation witnesses"
 fi
 
+# bd-p7oim: each step carries its own wall time, so a slow suite can be found
+# from the receipt without reading logs. Old callers that pass no secs stay ok.
+receipt_secs="$TMP/receipt-secs.json"
+proof_write_receipt "$receipt_secs" 0 deadbeef dead 20260101T000000Z head "$TMP" "" \
+  "build"$'\n'"tests" "0"$'\n'"0" "" "$empty" $'12\n345\n' >/dev/null
+if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert [(s["name"],s["secs"]) for s in d["steps"]]==[("build",12),("tests",345)]' "$receipt_secs"; then
+  pass "each receipt step records its own seconds"
+else
+  fail "receipt steps do not carry timings"
+fi
+
 # A changed-mode receipt carries the mode, the base and the diff it selected
 # from, so a landing can re-derive the coverage itself.
 receipt3="$TMP/receipt-changed.json"

@@ -172,15 +172,20 @@ proof_write_receipt() {
   PROOF_RECEIPT="$1" PROOF_OK="$2" PROOF_SHA="$3" PROOF_SHORT="$4" \
   PROOF_STAMP="$5" PROOF_MODE="$6" PROOF_TMP="$7" PROOF_FAILED="$8" \
   PROOF_STEPS="$9" PROOF_STATUSES="${10}" PROOF_SIBLINGS="${11}" \
-  PROOF_MUTATIONS_FILE="${12}" \
+  PROOF_MUTATIONS_FILE="${12}" PROOF_STEP_SECS="${13:-}" \
   PROOF_DRIVER_SHA="${CLEAN_PROOF_DRIVER_SHA:-}" python3 - <<'PY'
 import json, os
 
 def lines(key):
     return [x for x in os.environ.get(key, "").splitlines() if x]
 
-steps = [{"name": n, "status": int(s)}
-         for n, s in zip(lines("PROOF_STEPS"), lines("PROOF_STATUSES"))]
+secs = lines("PROOF_STEP_SECS")
+steps = []
+for i, (n, s) in enumerate(zip(lines("PROOF_STEPS"), lines("PROOF_STATUSES"))):
+    step = {"name": n, "status": int(s)}
+    if i < len(secs):
+        step["secs"] = int(secs[i])
+    steps.append(step)
 siblings = []
 for row in lines("PROOF_SIBLINGS"):
     path, _, rev = row.partition("=")

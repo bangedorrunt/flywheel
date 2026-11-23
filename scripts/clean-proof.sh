@@ -336,12 +336,15 @@ cd "$TMP/flywheel"
 
 STEP_NAMES=""
 STEP_STATUSES=""
+STEP_SECS=""
 FAILED_STEP=""
 LAST_STATUS=999
 
 run_step() { # name cmd...
   local name="$1"
   shift
+  local started
+  started="$(date +%s)"
   echo "clean-proof: $name"
   set +e
   "$@" >"$TMP/$name.log" 2>&1
@@ -350,6 +353,8 @@ run_step() { # name cmd...
   STEP_NAMES="$STEP_NAMES$name
 "
   STEP_STATUSES="$STEP_STATUSES$LAST_STATUS
+"
+  STEP_SECS="$STEP_SECS$(( $(date +%s) - started ))
 "
   if [ "$LAST_STATUS" -ne 0 ]; then
     echo "clean-proof: $name failed; log $TMP/$name.log" >&2
@@ -462,6 +467,7 @@ if [ -z "$FAILED_STEP" ]; then
   RECEIPT_MUTATIONS_BASE="$mut_base"
   RECEIPT_CHANGED_PATHS="$mut_changed"
   if [ -n "$MUTATIONS_MODE" ]; then
+  MUT_STARTED="$(date +%s)"
   wrapper="$TMP/mbx-wrapper"
   {
     printf '#!/usr/bin/env bash\nexec'
@@ -533,7 +539,9 @@ if [ -z "$FAILED_STEP" ]; then
   else
     echo "clean-proof: mutations $mut_ran spec(s), $mut_failed failing"
   fi
-  STEP_NAMES="$STEP_NAMES"$'mutations\n' 
+  STEP_NAMES="$STEP_NAMES"$'mutations\n'
+  STEP_SECS="$STEP_SECS$(( $(date +%s) - MUT_STARTED ))
+"
   if [ "$mut_failed" -ne 0 ]; then
     STEP_STATUSES="$STEP_STATUSES"$'1\n'
     FAILED_STEP="mutations"
@@ -720,7 +728,8 @@ PROOF_CHANGED_PATHS="$RECEIPT_CHANGED_PATHS" \
 PROOF_MUTATION_FAILED_SPEC="$MUT_FAILED_SPEC" \
 PROOF_RECEIPT_ARCHIVE="$RECEIPT_ARCHIVE" \
 proof_write_receipt "$RECEIPT" "$OK" "$PROVEN_SHA" "$SHORT" "$STAMP" "$MODE" "$TMP" \
-  "$FAILED_STEP" "$STEP_NAMES" "$STEP_STATUSES" "$SIBLING_RECORDS" "$MUTATION_RECORDS_FILE"
+  "$FAILED_STEP" "$STEP_NAMES" "$STEP_STATUSES" "$SIBLING_RECORDS" "$MUTATION_RECORDS_FILE" \
+  "$STEP_SECS"
 
 # bd-n21ml: route red rows to their owners once the receipt exists. Never fail
 # a proof because a mail could not be delivered.
