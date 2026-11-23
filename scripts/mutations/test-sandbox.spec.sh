@@ -19,3 +19,17 @@ mutation "M2  the lint stops refusing an offender" \
     expect=lint_refuses_a_test_that_spawns_the_binary_without_the_helper \
     find=$'    echo "test-sandbox: $file spawns a built binary without src/test_sandbox.rs" >&2\n    return 0' \
     replace=$'    return 1'
+
+# bd-yvnh6: a reintroduced bare spawn in commit_hook_guard must fail the
+# check-test-sandbox.sh scan, not just the lint's self-test.
+mutation "M3  commit_hook_guard reintroduces an unsandboxed spawn" \
+    file=tests/commit_hook_guard.rs \
+    expect=lint_refuses_a_test_that_spawns_the_binary_without_the_helper \
+    find='use flywheel_test_sandbox::TestSandbox;' \
+    replace='struct TestSandbox { dir: PathBuf }
+impl TestSandbox {
+    fn new() -> Self { Self { dir: std::env::temp_dir().join(format!("hook-{}", std::process::id())) } }
+    fn root(&self) -> &Path { &self.dir }
+    fn bin_dir(&self) -> PathBuf { self.dir.join("bin") }
+    fn command(&self, p: &str) -> Command { Command::new(p) }
+}'
