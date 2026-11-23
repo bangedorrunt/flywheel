@@ -212,7 +212,6 @@ pub fn plist_xml(
     )
 }
 
-#[cfg(target_os = "macos")]
 fn home_launch_agents() -> anyhow::Result<PathBuf> {
     let home = std::env::var("HOME")
         .map_err(|_| anyhow::anyhow!("HOME unset; cannot locate LaunchAgents"))?;
