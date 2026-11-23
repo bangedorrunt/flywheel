@@ -101,7 +101,16 @@ fn composed_join_dispatches_the_bound_step_to_the_live_pin() {
             "--no-focus",
         ],
     );
-    assert!(spawned.status.success(), "spawn failed: {}", text(&spawned));
+    let spawn_log = text(&spawned);
+    assert!(spawned.status.success(), "spawn failed: {spawn_log}");
+    let reuse = spawn_log
+        .lines()
+        .find_map(|line| {
+            let start = line.find("session:")?;
+            let id = line[start..].split_whitespace().next()?;
+            (!id.is_empty()).then(|| id.to_string())
+        })
+        .unwrap_or_else(|| panic!("spawn must name its workspace session: {spawn_log}"));
 
     let _idle = poll(120, || {
         find_seat(&seats(&bin, &project), "coder")
@@ -127,7 +136,8 @@ fn composed_join_dispatches_the_bound_step_to_the_live_pin() {
             "--join",
             "--run",
             "--yes",
-            "--retire-orphans",
+            "--reuse",
+            &reuse,
             "--project",
             &project,
         ],
