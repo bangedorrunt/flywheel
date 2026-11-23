@@ -119,6 +119,9 @@ pub struct McpClient {
     kind: ServerKind,
     /// Lazily-runs `initialize` once per client (per server endpoint).
     initialized: OnceLock<()>,
+    /// The version the server actually negotiated. toron 1.7.2 answers the
+    /// 2026-07-28 offer with 2025-11-25; later requests must use the answer.
+    negotiated_version: OnceLock<String>,
     /// Monotonic JSON-RPC id.
     next_id: std::sync::atomic::AtomicU64,
     /// Shared ureq agent carrying the bd-gtqe connect+overall timeouts.
@@ -145,6 +148,7 @@ impl Clone for McpClient {
             token: self.token.clone(),
             kind: self.kind,
             initialized: OnceLock::new(),
+            negotiated_version: self.negotiated_version.clone(),
             next_id: std::sync::atomic::AtomicU64::new(
                 self.next_id.load(std::sync::atomic::Ordering::Relaxed),
             ),
@@ -196,6 +200,7 @@ impl McpClient {
             token,
             kind,
             initialized: OnceLock::new(),
+            negotiated_version: OnceLock::new(),
             next_id: std::sync::atomic::AtomicU64::new(1),
             agent,
         })
@@ -230,7 +235,22 @@ impl McpClient {
             "clientInfo".into(),
             json!({ "name": "flywheel", "version": env!("CARGO_PKG_VERSION") }),
         );
-        self.post("initialize", Value::Object(params)).map(|_| ())
+        let result = self.post("initialize", Value::Object(params))?;
+        if let Some(version) = result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+        {
+            let _ = self.negotiated_version.set(version.to_string());
+        }
+        Ok(())
+    }
+
+    fn protocol_version(&self) -> &str {
+        self.negotiated_version
+            .get()
+            .map(String::as_str)
+            .unwrap_or(PROTOCOL_VERSION)
     }
 
     /// Extract the tool's structured JSON from a `tools/call` result.
@@ -269,7 +289,7 @@ impl McpClient {
         map.insert(
             "_meta".into(),
             json!({
-                "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
+                "io.modelcontextprotocol/protocolVersion": self.protocol_version(),
                 "io.modelcontextprotocol/clientCapabilities": {},
                 "io.modelcontextprotocol/clientInfo": { "name": "flywheel", "version": env!("CARGO_PKG_VERSION") },
             }),
@@ -281,7 +301,7 @@ impl McpClient {
             .post(&self.endpoint)
             .set("Content-Type", "application/json")
             .set("Accept", "application/json, text/event-stream")
-            .set("MCP-Protocol-Version", PROTOCOL_VERSION);
+            .set("MCP-Protocol-Version", self.protocol_version());
         if let Some(token) = &self.token {
             req = req.set("Authorization", &format!("Bearer {token}"));
         }
@@ -444,6 +464,47 @@ mod tests {
             .call_tool("health_check", json!({}))
             .expect("SSE handshake then JSON tool result");
         assert_eq!(out["ok"], true, "tool result parsed: {out}");
+    }
+
+    /// The live toron 1.7.2 initialize answer: a leading EMPTY `data:` event
+    /// with `id`/`retry`, then the JSON-RPC result in a second `data:` frame.
+    /// It negotiates down to 2025-11-25; the next request must use that
+    /// version, not the one we offered.
+    #[test]
+    fn real_initialize_sse_negotiation_is_used_on_the_next_call() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let base = serve_raw(move |req| {
+            let req = String::from_utf8_lossy(req).to_string();
+            recorded.lock().expect("record").push(req.clone());
+            if req.contains("\"initialize\"") {
+                sse_http(
+                    "200 OK",
+                    "data: \nid: 0\nretry: 3000\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"serverInfo\":{\"name\":\"toron\",\"version\":\"1.7.2\"}}}\n\n",
+                )
+            } else {
+                http(
+                    "200 OK",
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\"ok\":true}"}]}}"#,
+                )
+            }
+        });
+        let client = McpClient::new(&base, None, ServerKind::Toron).expect("client");
+        let out = client
+            .call_tool("health_check", json!({}))
+            .expect("live-shaped SSE initialize then tool call");
+        assert_eq!(out["ok"], true, "tool result parsed: {out}");
+        let requests = seen.lock().expect("seen").join("\n").to_ascii_lowercase();
+        assert!(
+            requests.contains("mcp-protocol-version: 2025-11-25"),
+            "the negotiated version must be sent on the tool call: {requests}"
+        );
+        assert_eq!(
+            requests.matches("mcp-protocol-version: 2026-07-28").count(),
+            1,
+            "only the initialize offer uses the newer version: {requests}"
+        );
     }
 
     #[test]
