@@ -94,12 +94,14 @@ pub(crate) fn cmd_ship(cfg: &Config, cmd: &ShipCmd) -> Result<()> {
         } => {
             let chosen = match receipt.clone() {
                 Some(path) => path,
-                None => newest_green_receipt_for(dir.as_deref(), bead_id).ok_or_else(|| {
-                    anyhow!(
-                        "no green receipt covers {bead_id}; check `flywheel proof status` \
-                         and wait for the train (landing never starts a proof)"
-                    )
-                })?,
+                None => newest_green_ci_receipt(dir.as_deref(), bead_id)
+                    .or_else(|| newest_green_receipt_for(dir.as_deref(), bead_id))
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "no green proof covers {bead_id}; check `flywheel proof status` \
+                             and wait for CI (landing never starts a proof)"
+                        )
+                    })?,
             };
             ship_land(LandArgs {
                 cfg,
@@ -133,6 +135,70 @@ where
         .filter(|(_, sha, _, ok)| *ok && contains(bead_sha, sha))
         .max_by(|a, b| a.2.cmp(b.2))
         .map(|(path, _, _, _)| path)
+}
+
+/// Find a GREEN CI Proof run for a commit covering `bead`, download its
+/// receipt artifact and hand back the local path. Nothing here starts a proof.
+pub(crate) fn newest_green_ci_receipt(dir: Option<&Path>, bead: &str) -> Option<PathBuf> {
+    let repo = dir.unwrap_or_else(|| Path::new("."));
+    let citing = git(repo, &["log", "-1", "--format=%H", "--grep", bead])
+        .ok()?
+        .lines()
+        .next()?
+        .to_string();
+    let raw = std::process::Command::new("gh")
+        .args([
+            "run",
+            "list",
+            "--workflow",
+            "Proof",
+            "--limit",
+            "30",
+            "--json",
+            "databaseId,headSha,status,conclusion",
+        ])
+        .current_dir(repo)
+        .output()
+        .ok()?;
+    if !raw.status.success() {
+        return None;
+    }
+    let runs: Value = serde_json::from_slice(&raw.stdout).ok()?;
+    let run = runs.as_array()?.iter().find(|r| {
+        r.get("status").and_then(Value::as_str) == Some("completed")
+            && r.get("conclusion").and_then(Value::as_str) == Some("success")
+            && r.get("headSha")
+                .and_then(Value::as_str)
+                .is_some_and(|sha| is_ancestor(repo, &citing, sha))
+    })?;
+    let id = run.get("databaseId")?.as_u64()?;
+    let out = std::env::temp_dir().join(format!(
+        "flywheel-proof-receipt-{}-{}",
+        id,
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&out).ok()?;
+    let dl = std::process::Command::new("gh")
+        .args([
+            "run",
+            "download",
+            &id.to_string(),
+            "-n",
+            "proof-receipt",
+            "-D",
+            out.to_str()?,
+        ])
+        .current_dir(repo)
+        .status()
+        .ok()?;
+    if !dl.success() {
+        return None;
+    }
+    let receipt = out.join("proof-receipt.json");
+    if !receipt.is_file() {
+        return None;
+    }
+    Some(receipt)
 }
 
 /// Impure wrapper: read the train's receipt archive and ask git ancestry.

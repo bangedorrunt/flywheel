@@ -1,0 +1,168 @@
+# Proof train (bd-7qhz0): the proof runs in CI, off the crew's critical path.
+#
+# One build, then parallel test shards / lints / mutation specs. Each part
+# uploads a receipt fragment; `receipt` merges them into the clean-proof shape
+# so `flywheel ship land <bead> --sha` can accept a green run without starting
+# a local proof. Sibling revs come from proof.toml, never from the operator's
+# dirty working tree (bd-v6j35).
+name: Proof
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 2 * * *'   # nightly: all mutation specs, not just changed ones
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
+  CARGO_BIN: cargo
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      toron_rev: ${{ steps.revs.outputs.toron }}
+      elm_rev: ${{ steps.revs.outputs.elm }}
+      all_specs: ${{ steps.specs.outputs.all }}
+      changed_specs: ${{ steps.specs.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: flywheel
+          fetch-depth: 0
+      - name: Read pinned sibling revs
+        id: revs
+        working-directory: flywheel
+        run: |
+          toron="$(awk '/^\[\[sibling\]\]/{n=""} /^path = /{n=$3} /^rev = /{if(n=="\"../toron\""){gsub(/"/,"",$3); print $3}}' proof.toml)"
+          elm="$(awk '/^\[\[sibling\]\]/{n=""} /^path = /{n=$3} /^rev = /{if(n=="\"../elm-effect-rs\""){gsub(/"/,"",$3); print $3}}' proof.toml)"
+          [ -n "$toron" ] && [ -n "$elm" ] || { echo "proof.toml sibling revs missing" >&2; exit 1; }
+          echo "toron=$toron" >> "$GITHUB_OUTPUT"
+          echo "elm=$elm" >> "$GITHUB_OUTPUT"
+      - name: Mutation spec matrix
+        id: specs
+        working-directory: flywheel
+        run: |
+          all="$(find scripts/mutations -maxdepth 1 -name '*.spec.sh' -printf '%f\n' | sed 's#\.spec\.sh$##' | jq -Rsc 'split("\n") | map(select(length>0))')"
+          echo "all=$all" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = schedule ]; then
+            echo "changed=$all" >> "$GITHUB_OUTPUT"
+          else
+            changed="$(git diff --name-only ${{ github.event.before || 'HEAD~1' }} HEAD -- scripts/mutations | sed -n 's#scripts/mutations/\(.*\)\.spec\.sh#\1#p' | sort -u | jq -Rsc 'split("\n") | map(select(length>0))')"
+            echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: flywheel, fetch-depth: 0 }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: bangedorrunt/toron, path: toron, ref: '${{ needs.prepare.outputs.toron_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: bangedorrunt/elm-effect-rs, path: elm-effect-rs, ref: '${{ needs.prepare.outputs.elm_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with: { toolchain: nightly-2026-08-20, components: rustfmt,clippy }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with: { workspaces: 'flywheel\ntoron\nelm-effect-rs' }
+      - name: Build once
+        working-directory: flywheel
+        run: cargo build --workspace --all-targets --locked
+
+  tests:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: { shard: [1, 2, 3, 4] }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: flywheel, fetch-depth: 0 }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: bangedorrunt/toron, path: toron, ref: '${{ needs.prepare.outputs.toron_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: bangedorrunt/elm-effect-rs, path: elm-effect-rs, ref: '${{ needs.prepare.outputs.elm_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with: { toolchain: nightly-2026-08-20 }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with: { workspaces: 'flywheel\ntoron\nelm-effect-rs' }
+      - uses: taiki-e/install-action@f7203e66315af55e5c0f3e20a099b4d9bb5f6bba # v2.62.0
+        with: { tool: cargo-nextest }
+      - name: Test shard ${{ matrix.shard }}/4
+        working-directory: flywheel
+        run: cargo nextest run -p flywheel --bin flywheel --partition count:${{ matrix.shard }}/4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: 'proof-test-${{ matrix.shard }}', path: 'flywheel/target/nextest/**/*.xml' }
+
+  lints:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: flywheel, fetch-depth: 0 }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: bangedorrunt/toron, path: toron, ref: '${{ needs.prepare.outputs.toron_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: bangedorrunt/elm-effect-rs, path: elm-effect-rs, ref: '${{ needs.prepare.outputs.elm_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with: { toolchain: nightly-2026-08-20, components: rustfmt,clippy }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with: { workspaces: 'flywheel\ntoron\nelm-effect-rs' }
+      - name: Needles, sandbox, clippy, jargon (unit test)
+        working-directory: flywheel
+        run: |
+          bash scripts/verify-needles.sh
+          bash scripts/check-test-sandbox.sh
+          cargo clippy -p flywheel --bin flywheel --tests -- -D warnings
+          cargo test -p flywheel --bin flywheel no_jargon_in_any_agent_facing_string
+
+  mutations:
+    needs: [prepare, build]
+    if: ${{ needs.prepare.outputs.changed_specs != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: { spec: '${{ fromJson(needs.prepare.outputs.changed_specs) }}' }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: flywheel, fetch-depth: 0 }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: bangedorrunt/toron, path: toron, ref: '${{ needs.prepare.outputs.toron_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: bangedorrunt/elm-effect-rs, path: elm-effect-rs, ref: '${{ needs.prepare.outputs.elm_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with: { toolchain: nightly-2026-08-20 }
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with: { workspaces: 'flywheel\ntoron\nelm-effect-rs' }
+      - name: Mutation spec ${{ matrix.spec }}
+        working-directory: flywheel
+        run: bash scripts/verify-mutations.sh "scripts/mutations/${{ matrix.spec }}.spec.sh" --cargo cargo --json-out /tmp/mut.jsonl
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: 'proof-mut-${{ matrix.spec }}', path: /tmp/mut.jsonl }
+
+  receipt:
+    needs: [prepare, build, tests, lints, mutations]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: flywheel, fetch-depth: 0 }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { path: /tmp/proof-parts }
+      - name: Merge fragments into the clean-proof receipt shape
+        working-directory: flywheel
+        env:
+          RESULTS: '${{ needs.prepare.result }},${{ needs.build.result }},${{ needs.tests.result }},${{ needs.lints.result }},${{ needs.mutations.result }}'
+        run: |
+          python3 scripts/merge-proof-receipt.py /tmp/proof-parts "$RESULTS" "$GITHUB_SHA" > proof-receipt.json
+          cat proof-receipt.json
+          python3 -c "import json,sys; d=json.load(open('proof-receipt.json')); sys.exit(0 if d['ok'] else 1)"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: proof-receipt, path: flywheel/proof-receipt.json }

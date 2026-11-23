@@ -807,11 +807,6 @@ enum ProofCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Run ONE train step (used by the cron/daemon wrapper)
-    Once {
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Subcommand)]
@@ -3248,7 +3243,7 @@ fn main() {
             "commands": [
                 "init spawn add list status decide rebind recover",
                 "commit <paths> -m <msg> [--repo <dir>] [--no-reservation-check] [--allow-empty] [--keep-lease] (bd-aberm private-index commit of exactly those paths; bd-62ei8 refuses when the private tree equals HEAD — name the unchanged paths — unless --allow-empty; bd-u1n91 releases committed leases on success unless --keep-lease)",
-                "proof status [--json] | proof train --once [--json] (bd-7qhz0: background proof train status and one reducer step; landing never starts a proof)",
+                "proof status [--json] (bd-7qhz0: latest GitHub Actions Proof runs per sha; landing never starts a proof)",
                 "ship check <bead> [--json] | ship land <bead> --sha <40hex> [--receipt <file>] [--project <p>] [--as <pin>] [--message <m>] [--repo <dir>] (one verb: gate -> close -> sync -> release -> commit THIS bead's tracker rows -> check; --receipt omitted takes the newest green train receipt covering the bead; idempotent, prints the resume command on failure; another lane's dirty tracker row never blocks; --repo names the repo holding the citing commit and the receipt's specs when the work lives elsewhere, symmetric with br close --repo; the HEAD-lock race other lanes cause is retried, not surfaced)",
                 "spawn <project> [--kind K=N ...] [--assign PIN=BEAD[,BEAD] ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--model harness-default leaves the harness's own model untouched] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
                 "assign <project> --to <pin> --beads <bd> [--msg <m>] [--reassign] (bd-vk0do: refuses with '<pin> holds <path> for <bead>' when a lease, intent or live brief on the bead belongs to another pin; --reassign mails that holder a withdrawal and proceeds)",
@@ -3338,7 +3333,6 @@ fn main() {
     let result = match &cli.command {
         Some(Commands::Proof { cmd }) => match cmd {
             ProofCmd::Status { json } => proof_train::cmd_status(*json),
-            ProofCmd::Once { json } => proof_train::cmd_once(*json),
         },
         Some(Commands::Seat { cmd }) => match cmd {
             SeatCmd::Adopt { pin, pane, session } => crate::cmd::swarm::seat_adopt(
