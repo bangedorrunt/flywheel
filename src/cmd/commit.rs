@@ -1027,6 +1027,9 @@ pub(crate) fn cmd_commit(
         && !pin.is_empty()
         && let Some(project) = (!ctx.project.is_empty())
             .then(|| ctx.project.clone())
+            .or_else(|| {
+                crate::cron::detect_project_in(&crate::config::Config::default(), &repo, None)
+            })
             .or_else(|| crate::pre_edit::project_for_pin(pin))
         && let Err(e) = crate::pre_edit::release_paths(&project, pin, paths)
     {
