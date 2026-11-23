@@ -287,7 +287,8 @@ export TORON_BIN
 # bd-live-guard-target-readiness: pin the captain alias BEFORE spawn. Once the
 # alias is absent, the first spawned seat becomes captain and swarm status
 # filters it out, so the guard leg cannot read its target's idle state.
-"$FLYWHEEL_BIN" arrive e2e-live-five --captain "$PIN" --as "$PIN" --skip-preflight >/dev/null 2>&1 \
+CAPTAIN_PIN="${AGENT_NAME:-$PIN}"
+"$FLYWHEEL_BIN" arrive e2e-live-five --captain "$CAPTAIN_PIN" --as "$CAPTAIN_PIN" --skip-preflight >/dev/null 2>&1 \
     || die "flywheel arrive could not pin the throwaway captain"
 
 # bd-oo7zi: both live legs use a REAL opencode harness pane. The guard leg
