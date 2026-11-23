@@ -21316,6 +21316,46 @@ mod integration_tests {
         workflow_hybrid_fields, workflow_list_brief_rows, workflow_list_full_rows,
     };
 
+    /// Empty user-tier config root for catalog tests: the operator's
+    /// ~/.config/flywheel must never decide which workflows a test sees.
+    struct EmptyCatalogRoot(std::path::PathBuf);
+
+    impl EmptyCatalogRoot {
+        fn new() -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("fw-empty-catalog-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("empty catalog root");
+            Self(dir)
+        }
+    }
+
+    impl Drop for EmptyCatalogRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// bd-mxwzn: catalog injection must honour the passed root, not the
+    /// operator's config dir. Mutant R1 swaps in config_dir() and goes RED.
+    #[test]
+    fn catalog_merge_respects_the_injected_config_root() {
+        let root = EmptyCatalogRoot::new();
+        let dir = root.0.join("workflows");
+        std::fs::create_dir_all(&dir).expect("workflows dir");
+        std::fs::write(
+            dir.join("injected-only.yaml"),
+            "name: injected-only\nsteps:\n  - name: noop\n    action: verify\n    command: 'true'\n",
+        )
+        .expect("write injected workflow");
+        let merged =
+            workflow_catalog::all_workflows_merged_from(&root.0, None).expect("injected catalog");
+        assert!(
+            merged.contains_key("injected-only"),
+            "the injected root must be read: {:?}",
+            merged.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// Regen writes only *-mode.md and deletes leftover /beads-* / /workflow-*.
     #[test]
     fn integration_writes_only_orchestration_and_removes_retired_slash() {
@@ -21427,7 +21467,8 @@ mod integration_tests {
     /// Bare list keeps description + decide_trigger + rest; show is separate (no decide_trigger); no competing brief path.
     #[test]
     fn workflow_list_brief_projects_hybrid_contract() {
-        let all = workflow_catalog::all_workflows_merged(None).expect("catalog");
+        let empty = EmptyCatalogRoot::new();
+        let all = workflow_catalog::all_workflows_merged_from(&empty.0, None).expect("catalog");
         let brief_stdout = serde_json::json!({ "workflows": workflow_list_brief_rows(&all) });
         let workflows = brief_stdout["workflows"]
             .as_array()
@@ -21476,6 +21517,15 @@ mod integration_tests {
         assert_eq!(wave["topology"], "swarm");
         assert_eq!(wave["compose_token"], true);
         assert_eq!(crate::decide::topology_for_primitive("ce-lfg"), "swarm");
+        assert_eq!(
+            workflows.len(),
+            10,
+            "hermetic brief catalog is exactly the ten ce-* workflows: {:?}",
+            workflows
+                .iter()
+                .map(|r| r["name"].as_str().unwrap_or("?"))
+                .collect::<Vec<_>>()
+        );
         let cfg = Config::default();
         let cmd = WorkflowCmd::List {
             json: false,
@@ -21490,7 +21540,8 @@ mod integration_tests {
     /// decide_trigger present; topology is brief-only (not required on full).
     #[test]
     fn workflow_list_full_projects_description_and_rest() {
-        let all = workflow_catalog::all_workflows_merged(None).expect("catalog");
+        let empty = EmptyCatalogRoot::new();
+        let all = workflow_catalog::all_workflows_merged_from(&empty.0, None).expect("catalog");
         let full_stdout = serde_json::json!({ "workflows": workflow_list_full_rows(&all) });
         let workflows = full_stdout["workflows"]
             .as_array()
@@ -21532,11 +21583,29 @@ mod integration_tests {
                 );
             }
         }
+        let ce_names = [
+            "ce-lfg",
+            "ce-debug",
+            "ce-bakeoff",
+            "ce-review",
+            "ce-measure",
+            "ce-triage",
+            "ce-resume",
+            "ce-compound",
+            "ce-retro",
+            "mutation-full",
+        ];
+        for name in ce_names {
+            assert!(
+                workflows.iter().any(|r| r["name"] == name),
+                "{name} in full list"
+            );
+        }
         let wave = workflows
             .iter()
-            .find(|r| r["name"] == "wave-swarm")
-            .expect("wave-swarm in full list");
-        let (run, family, selection, token) = workflow_hybrid_fields("wave-swarm");
+            .find(|r| r["name"] == "ce-lfg")
+            .expect("ce-lfg in full list");
+        let (run, family, selection, token) = workflow_hybrid_fields("ce-lfg");
         assert_eq!(wave["run"], run);
         assert_eq!(wave["family"], family);
         assert_eq!(wave["selection"], selection);

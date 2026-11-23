@@ -428,13 +428,24 @@ pub fn catalog_drift(config_root: &Path) -> Result<Vec<CatalogEntryStatus>> {
 pub fn all_workflows_merged(
     project_root: Option<&Path>,
 ) -> Result<BTreeMap<String, ResolvedWorkflow>> {
+    all_workflows_merged_from(&crate::config::config_dir(), project_root)
+}
+
+/// [`all_workflows_merged`] with an explicit user-tier config root. Tests use
+/// an empty temp root so the operator's ~/.config/flywheel cannot shadow a
+/// builtin (no process-global env mutation, which would leak to parallel
+/// tests).
+pub fn all_workflows_merged_from(
+    config_root: &Path,
+    project_root: Option<&Path>,
+) -> Result<BTreeMap<String, ResolvedWorkflow>> {
     let mut out: BTreeMap<String, ResolvedWorkflow> = BTreeMap::new();
     for (name, wf) in crate::builtin_workflows::builtin_workflows() {
         out.insert(name, (wf, "builtin"));
     }
     let cat = match project_root {
-        Some(root) => WorkflowCatalog::load_layered(Some(root))?,
-        None => WorkflowCatalog::load()?,
+        Some(root) => WorkflowCatalog::load_layered_with(config_root.to_path_buf(), Some(root))?,
+        None => WorkflowCatalog::load_from(config_root.to_path_buf())?,
     };
     let stages = crate::stages::StageLibrary::shared();
     for (name, mut wf) in cat.workflows {
