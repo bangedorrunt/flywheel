@@ -214,7 +214,9 @@ cleanup() {
     if [ -n "$PLANE_SESSION" ] && [ "$KEEP" = 0 ]; then
         "$REX_BIN" kill "$PLANE_SESSION" >/dev/null 2>&1 || true
     fi
-    [ -n "${EXPORT_ROOT:-}" ] && rm -rf "$EXPORT_ROOT"
+    # An `if` (not `&&`) keeps cleanup's exit status 0 when a selftest has no
+    # export — otherwise the EXIT trap flips the script's exit code.
+    if [ -n "${EXPORT_ROOT:-}" ]; then rm -rf "$EXPORT_ROOT"; fi
 }
 trap cleanup EXIT INT TERM HUP
 
