@@ -296,19 +296,22 @@ export TORON_BIN
 # together and separated by pin (grok is for the no-door events witness).
 spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 2 --gk 1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
     || die "flywheel spawn failed: $spawn_out"
-seated="$(FLYWHEEL_BIN="$FLYWHEEL_BIN" "$PYTHON_BIN" - <<'PY'
+seated=""
+for _seat_ready in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do
+    seated="$(FLYWHEEL_BIN="$FLYWHEEL_BIN" "$PYTHON_BIN" - <<'PY'
 import json, os, subprocess
 doc = json.loads(subprocess.check_output([
     os.environ["FLYWHEEL_BIN"], "swarm", "status", "e2e-live-five", "--json"
 ], text=True))
 rows = doc.get("seats", doc if isinstance(doc, list) else [])
 oc = [r for r in rows if str(r.get("harness", "")).lower() == "opencode" and r.get("pin") and r.get("pane_id")]
-if len(oc) < 2:
-    raise SystemExit(f"need two live opencode seats, got {len(oc)}")
 for r in oc[:2]:
     print(f"{r['pin']}\t{r['pane_id']}")
 PY
-)" || die "cannot read the two opencode seats from swarm status"
+)" || die "cannot read the opencode seats from swarm status"
+    [ "$(printf '%s\n' "$seated" | grep -c .)" -ge 2 ] && break
+    sleep 5
+done
 SPAWNED_PIN="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f1)"
 SPAWNED_PANE="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f2)"
 WAKE_PIN="$(printf '%s\n' "$seated" | sed -n '2p' | cut -f1)"
