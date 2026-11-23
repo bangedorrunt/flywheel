@@ -1023,10 +1023,12 @@ pub(crate) fn cmd_commit(
     println!("commit {}", &sha[..sha.len().min(12)]);
     // bd-lk0kt: the pre-edit hook leased these exact paths under a fallback
     // reason when the seat had no brief; the commit is the end of the edit.
-    if let Ok(pin) = std::env::var("AGENT_NAME")
+    if let Some(pin) = ctx.pin.as_deref()
         && !pin.is_empty()
-        && let Some(project) = crate::pre_edit::project_for_pin(&pin)
-        && let Err(e) = crate::pre_edit::release_paths(&project, &pin, paths)
+        && let Some(project) = (!ctx.project.is_empty())
+            .then(|| ctx.project.clone())
+            .or_else(|| crate::pre_edit::project_for_pin(pin))
+        && let Err(e) = crate::pre_edit::release_paths(&project, pin, paths)
     {
         eprintln!("flywheel: pre-edit lease release after commit failed: {e}");
     }

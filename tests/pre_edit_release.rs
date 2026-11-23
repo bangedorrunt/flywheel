@@ -130,6 +130,58 @@ fn commit_releases_only_the_committed_paths() {
     );
 }
 
+/// bd-0uxg6: the seat registry can name a session-scoped project
+/// (flywheel-d5080499) that has no toron key. The commit must release under
+/// the project it actually ran under, not the pin's seat project.
+#[test]
+fn commit_releases_under_the_commit_project_not_the_seat_project() {
+    let sandbox = TestSandbox::new();
+    fake_toron_with(&sandbox, false);
+    seed_seat(&sandbox, "flywheel-d5080499");
+    let repo = sandbox.root().join("repo");
+    std::fs::create_dir_all(&repo).expect("repo");
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["config", "user.email", "test@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    std::fs::write(repo.join("seed.txt"), "seed\n").expect("seed");
+    git(&repo, &["add", "seed.txt"]);
+    git(&repo, &["commit", "-qm", "seed"]);
+    std::fs::write(repo.join("a.rs"), "fn a() {}\n").expect("a");
+
+    let mut cmd = sandbox.command(env!("CARGO_BIN_EXE_flywheel"));
+    cmd.env("PATH", sandbox.path_env())
+        .env("TORON_ARGV_LOG", sandbox.root().join("toron-argv.log"))
+        .env("AGENT_NAME", PIN)
+        .env("FLYWHEEL_PROJECT", "flywheel")
+        .env("FLYWHEEL_PANE", "1")
+        .current_dir(&repo)
+        .args([
+            "commit",
+            "a.rs",
+            "-m",
+            "bd-0uxg6 witness",
+            "--repo",
+            repo.to_str().unwrap(),
+        ]);
+    let out = cmd.output().expect("run flywheel commit");
+    assert!(
+        out.status.success(),
+        "commit must succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let log = argv_log(&sandbox);
+    assert!(
+        log.lines()
+            .any(|l| l
+                == format!("reserve release --project flywheel --as {PIN} --paths a.rs --json")),
+        "the commit project must own the release: {log}"
+    );
+    assert!(
+        !log.contains("--project flywheel-d5080499"),
+        "the seat's session project has no toron key: {log}"
+    );
+}
+
 #[test]
 fn crew_done_releases_the_brief_pins_fallback_leases() {
     let sandbox = TestSandbox::new();
