@@ -24,6 +24,8 @@
 # installed launchd units, then runs `status --check`.
 set -euo pipefail
 
+RESTART_FAILURES=""
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FLYWHEEL_SOURCE="${FLYWHEEL_SOURCE:-$ROOT}"
 if [ -n "${TORON_SOURCE:-}" ]; then
@@ -129,15 +131,32 @@ installed_bins() {
 # exit 78) until the job is re-registered; kickstart -k does not do that.
 restart_label() {
   local label="$1"
-  local uid domain plist
+  local uid domain plist out rc
   uid="$(id -u)"
   domain="gui/$uid/$label"
   plist="$HOME/Library/LaunchAgents/$label.plist"
   if [ -f "$plist" ]; then
     run launchctl bootout "$domain" 2>/dev/null || true
-    run launchctl bootstrap "gui/$uid" "$plist"
+    if [ "${DRY_RUN:-0}" -eq 1 ]; then
+      run launchctl bootstrap "gui/$uid" "$plist"
+      return 0
+    fi
+    # bd-rgs02: a bootstrap failure (e.g. launchd I/O error 5) must name the
+    # job and show why, then let the OTHER jobs restart. The final doctor
+    # fails the install, so one bad job cannot hide the rest of the report.
+    if ! out="$(launchctl bootstrap "gui/$uid" "$plist" 2>&1)"; then
+      rc=$?
+      echo "restart $label: launchctl bootstrap failed (exit $rc): $(printf '%s' "$out" | tail -3)" >&2
+      RESTART_FAILURES+="$label "
+      return 0
+    fi
   elif launchctl print "$domain" >/dev/null 2>&1; then
-    run launchctl kickstart -k "$domain"
+    if ! out="$(launchctl kickstart -k "$domain" 2>&1)"; then
+      rc=$?
+      echo "restart $label: launchctl kickstart failed (exit $rc): $(printf '%s' "$out" | tail -3)" >&2
+      RESTART_FAILURES+="$label "
+      return 0
+    fi
   fi
 }
 
@@ -455,6 +474,9 @@ do_install() {
     sleep 2
     recover_stale_hosts
     sleep 1
+    if [ -n "$RESTART_FAILURES" ]; then
+      echo "restart failures (doctor will decide): $RESTART_FAILURES" >&2
+    fi
     CHECK=1
     show_status
   fi

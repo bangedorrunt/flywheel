@@ -47,6 +47,7 @@ exit 0
 "#
     );
     executable(&sandbox.bin_dir().join("launchctl"), &shim);
+    set_holder(&sandbox, "flywheel");
 
     let bin = sandbox.root().join("cargo/bin");
     std::fs::create_dir_all(&bin).expect("cargo bin");
@@ -68,6 +69,14 @@ exit 0
     // Keep the listener alive for the child's connect probe.
     std::mem::forget(listener);
     (sandbox, addr)
+}
+
+fn set_holder(sandbox: &TestSandbox, name: &str) {
+    executable(&sandbox.bin_dir().join("lsof"), "#!/bin/sh\necho 4242\n");
+    executable(
+        &sandbox.bin_dir().join("ps"),
+        &format!("#!/bin/sh\necho {name}\n"),
+    );
 }
 
 fn seed_seat(sandbox: &TestSandbox, with_doorbell: bool) {
@@ -103,6 +112,10 @@ fn doctor(sandbox: &TestSandbox, addr: &str, fix: bool) -> std::process::Output 
     cmd.env("PATH", sandbox.path_env())
         .env("CARGO_INSTALL_ROOT", sandbox.root().join("cargo"))
         .env("FLYWHEEL_TORON_URL", format!("http://{addr}"))
+        .env(
+            "FLYWHEEL_SERVE_PORT",
+            addr.rsplit(':').next().unwrap_or("8787"),
+        )
         .env("LAUNCHCTL_LOG", sandbox.root().join("launchctl.log"))
         .args(["stack", "doctor", "--json"]);
     if fix {
@@ -128,7 +141,15 @@ fn stack_doctor_probes_every_job_on_a_fresh_machine() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor json");
     assert_eq!(v["kind"], "flywheel-stack-doctor.v1");
     assert_eq!(v["ok"], true);
-    for name in ["binaries", "jobs", "toron", "doorbell", "events", "wake"] {
+    for name in [
+        "binaries",
+        "jobs",
+        "toron",
+        "doorbell",
+        "events",
+        "wake",
+        "daemon_port",
+    ] {
         assert_eq!(
             v["probes"]
                 .as_array()
@@ -171,6 +192,48 @@ fn doctor_fix_reregisters_a_job_then_reprobes() {
     assert!(
         log.contains("bootstrap gui/") && log.contains("dev.flywheel.daemon.plist"),
         "the failed job must be bootstrapped from its plist: {log}"
+    );
+}
+
+#[test]
+fn install_reports_a_bad_job_and_restarts_the_rest() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let sandbox = TestSandbox::new();
+    let out = sandbox
+        .command("/bin/bash")
+        .env("PATH", sandbox.path_env())
+        .arg(format!("{root}/scripts/test-stack-restart-failure.sh"))
+        .current_dir(root)
+        .output()
+        .expect("run restart-failure witness");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn doctor_names_a_foreign_holder_of_the_daemon_port() {
+    let (sandbox, addr) = fixture(false);
+    set_holder(&sandbox, "caveman-proxy");
+    let out = doctor(&sandbox, &addr, false);
+    assert!(
+        !out.status.success(),
+        "a foreign port holder must fail doctor"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor json");
+    let probe = v["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "daemon_port")
+        .expect("daemon_port probe");
+    assert_eq!(probe["ok"], false);
+    let text = format!("{} {}", probe["detail"], probe["fix"]);
+    assert!(
+        text.contains("caveman-proxy"),
+        "the holder must be named: {text}"
     );
 }
 

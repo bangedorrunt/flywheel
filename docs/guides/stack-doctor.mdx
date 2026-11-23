@@ -19,6 +19,7 @@ An install finishes by running `flywheel stack doctor`. If any probe fails, the 
 | `doorbell` | each seated project's dispatcher has a live pid | `flywheel doorbell start <project>` |
 | `events` | every events-door seat has an events token | install (mints missing tokens) |
 | `wake` | a probe wake is actually queued for the doctor pin | install, then check the doorbell dispatcher |
+| `daemon_port` | the serve port (default 8787, override `FLYWHEEL_SERVE_PORT`) is held by our flywheel process | stop the named conflicting process, then install |
 
 ## What a failure means
 
@@ -26,5 +27,8 @@ An install finishes by running `flywheel stack doctor`. If any probe fails, the 
 - **`doorbell … absent`**: no live dispatcher for a seated project; wakes will not reach that pane. Start the dispatcher or run install.
 - **`events … tokenless seats`**: an events-door harness has no minted token, so it falls back to the doorbell. Install again.
 - **`toron … refused`**: the daemon is down or the address is wrong. Check `FLYWHEEL_TORON_URL` and the daemon log.
+- **`daemon_port … held by <other>`**: another program owns the serve port, so `flywheel serve` dies in a loop while generic status still looks ok. Doctor names the process; stop it and reinstall.
+
+During install, a `launchctl bootstrap` failure now names the job, prints its exit code and stderr tail, and carries on with the remaining jobs. Install still fails at the end if doctor finds a job that did not come up.
 
 `doctor --fix` only performs repairs that are safe without the operator's install door: re-registering jobs from their plists. Everything else gets a fix hint, not a silent mutation.

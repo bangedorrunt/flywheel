@@ -189,6 +189,57 @@ fn doorbell_probe() -> Probe {
     }
 }
 
+fn daemon_port_probe() -> Probe {
+    let port = std::env::var("FLYWHEEL_SERVE_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(crate::daemon::SERVE_PORT_DEFAULT);
+    let addr = format!("127.0.0.1:{port}");
+    let listening = toron_reachable(&addr);
+    let holder = Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            s.lines()
+                .next()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+        });
+    let command = holder.as_deref().and_then(|pid| {
+        Command::new("ps")
+            .args(["-p", pid, "-o", "comm="])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+    });
+    let ours = command.as_deref().is_some_and(|c| c.contains("flywheel"));
+    let ok = listening && ours;
+    let detail = match (listening, &holder, &command) {
+        (false, _, _) => format!("{addr}: no listener"),
+        (true, Some(pid), Some(comm)) => format!("{addr} held by {comm} (pid {pid})"),
+        (true, _, _) => format!("{addr}: listening, holder unknown"),
+    };
+    Probe {
+        name: "daemon_port",
+        ok,
+        detail: detail.clone(),
+        fix: if ok {
+            String::new()
+        } else {
+            format!(
+                "stop the conflicting process ({}) and run flywheel stack install --operator",
+                command.as_deref().unwrap_or("unknown")
+            )
+        },
+    }
+}
+
 fn wake_probe() -> Probe {
     let state_dir = crate::config::state_dir();
     let project = "flywheel-doctor";
@@ -259,6 +310,7 @@ pub(crate) fn cmd_stack_doctor(cfg: &Config, json: bool, fix: bool) -> Result<()
     probes.push(doorbell_probe());
     probes.push(events_probe());
     probes.push(wake_probe());
+    probes.push(daemon_port_probe());
 
     if fix {
         for label in &failed_jobs {
@@ -276,6 +328,7 @@ pub(crate) fn cmd_stack_doctor(cfg: &Config, json: bool, fix: bool) -> Result<()
             probes.push(doorbell_probe());
             probes.push(events_probe());
             probes.push(wake_probe());
+            probes.push(daemon_port_probe());
         }
     }
 
