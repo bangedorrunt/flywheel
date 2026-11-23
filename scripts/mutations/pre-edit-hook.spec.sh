@@ -3,7 +3,7 @@
 # bd-lk0kt: each installability fence must fail loudly when removed.
 
 CARGO_ARGS=(-p flywheel --bin flywheel)
-TEST_FILTER=(pre_edit)
+TEST_FILTER=(pre_edit sibling_paths_are_leased_with_the_repo_prefix)
 
 mutation "E1  a blocked pre-edit does not queue its waiter" \
     file=src/elm/pre_edit_lease_statechart.rs \
@@ -16,6 +16,12 @@ mutation "T1  reads take a lease too" \
     expect=the_hook_filters_write_tools_at_the_door \
     find='                    if !crate::pre_edit::is_write_tool(&tool) {' \
     replace='                    if false {'
+
+mutation "S1  a sibling path loses its repo prefix" \
+    file=src/pre_edit.rs \
+    expect=sibling_paths_are_leased_with_the_repo_prefix \
+    find='            return format!("../{}", rel.to_string_lossy());' \
+    replace='            return rel.to_string_lossy().to_string();'
 
 mutation "B1  a conflict lets the edit proceed" \
     file=src/pre_edit.rs \

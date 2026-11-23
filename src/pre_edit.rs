@@ -68,6 +68,11 @@ pub fn lease_path(path: &str, workspace: &str) -> String {
         if let Ok(rel) = p.strip_prefix(root) {
             return rel.to_string_lossy().to_string();
         }
+        if let Some(parent) = root.parent()
+            && let Ok(rel) = p.strip_prefix(parent)
+        {
+            return format!("../{}", rel.to_string_lossy());
+        }
         return path.to_string();
     }
     path.to_string()
@@ -202,6 +207,20 @@ mod tests {
             Some("../toron/src/lib.rs".into())
         );
         assert_eq!(path_from_payload("not json"), None);
+    }
+
+    #[test]
+    fn sibling_paths_are_leased_with_the_repo_prefix() {
+        let ws = "/Users/x/workspace/flywheel";
+        assert_eq!(
+            lease_path("/Users/x/workspace/flywheel/src/main.rs", ws),
+            "src/main.rs"
+        );
+        assert_eq!(
+            lease_path("/Users/x/workspace/toron/src/lib.rs", ws),
+            "../toron/src/lib.rs"
+        );
+        assert_eq!(lease_path("../toron/src/lib.rs", ws), "../toron/src/lib.rs");
     }
 
     #[test]
