@@ -231,6 +231,30 @@ pub struct CoalitionStore {
     root: PathBuf,
     mailbox: Mailbox,
     bus: Arc<dyn Bus>,
+    goal_runner: toron_workflow::engine::EffectRunner,
+    goal_catalog: std::collections::BTreeMap<String, toron_workflow::schema::Workflow>,
+}
+
+/// The LIVE goal runner: the same pane-dispatch sink `flywheel workflow run
+/// --execute` wires. Form must dispatch real work, never dry-run it.
+fn live_goal_runner(project: &str, goal: &str) -> Result<toron_workflow::engine::EffectRunner> {
+    let catalog = crate::profile::ProfileCatalog::load()?;
+    let entries = crate::pane::live_registry_for_dispatch(project);
+    let project = project.to_string();
+    let goal = goal.to_string();
+    Ok(std::sync::Arc::new(
+        move |inv: &toron_workflow::engine::ActionInvocation| {
+            crate::pane::pane_dispatch(
+                &catalog,
+                &project,
+                &goal,
+                &serde_json::json!({}),
+                &entries,
+                &inv.action,
+                None,
+            )
+        },
+    ))
 }
 
 impl CoalitionStore {
@@ -275,12 +299,46 @@ impl CoalitionStore {
                     root,
                     mailbox,
                     bus: bus_arc,
+                    goal_runner: live_goal_runner(project, "coalition-goal")?,
+                    goal_catalog: goal_catalog()?,
                 })
             })
             .map_err(|e: anyhow::Error| anyhow!("coalition store init: {e:#}"))?;
         std::fs::create_dir_all(&store.root)
             .with_context(|| format!("create coalitions dir {}", store.root.display()))?;
         Ok(store)
+    }
+
+    /// Inject the goal engine's effect runner. Production keeps the live pane
+    /// dispatch from [`live_goal_runner`]; tests pass a recording runner.
+    #[cfg(test)]
+    pub fn with_goal_runner(mut self, runner: toron_workflow::engine::EffectRunner) -> Self {
+        self.goal_runner = runner;
+        self
+    }
+
+    /// Restrict goal resolution to compiled-in workflows. Tests must never
+    /// resolve the operator's ~/.config/flywheel copy of a workflow; an env
+    /// guard would leak into parallel tests, so the catalog is injected.
+    #[cfg(test)]
+    pub fn with_builtin_goal_catalog(mut self) -> Self {
+        self.goal_catalog = crate::builtin_workflows::builtin_workflows();
+        self
+    }
+
+    /// Inject one goal workflow (tests that need a deliberately failing goal).
+    #[cfg(test)]
+    pub fn with_goal_workflow(mut self, name: &str, wf: toron_workflow::schema::Workflow) -> Self {
+        self.goal_catalog.insert(name.to_string(), wf);
+        self
+    }
+
+    /// Resolve a goal from the store's injected catalog. Tests restrict it
+    /// to built-ins so ambient config cannot change what a coalition forms.
+    fn resolve_goal_workflow(&self, goal: &str) -> Result<toron_workflow::schema::Workflow> {
+        self.goal_catalog.get(goal).cloned().ok_or_else(|| {
+            anyhow!("goal {goal:?} is not a known workflow (flywheel workflow list)")
+        })
     }
 
     /// Register an agent in the project (kind-30013 profile; required before
@@ -318,7 +376,7 @@ impl CoalitionStore {
         beads: &[String],
         tracker: Option<&str>,
     ) -> Result<CoalitionManifest> {
-        let wf = resolve_goal_workflow(goal)?;
+        let wf = self.resolve_goal_workflow(goal)?;
         let blocking =
             toron_workflow::lint_workflow_with_principles(&wf, crate::principles::names())
                 .issues
@@ -380,7 +438,7 @@ impl CoalitionStore {
             let engine = toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
                 crate::profile::ProfileCatalog::catalog_profile_resolver(),
                 std::sync::Arc::new(crate::workflow_catalog::subworkflow_resolver(None)),
-                Some(crate::cron::recording_runner()),
+                Some(self.goal_runner.clone()),
             )?;
             engine.invoke(&run_id, wf.clone(), json!({})).await
         });
@@ -1453,15 +1511,13 @@ fn coalition_run_outcome(output: &Value) -> (&'static str, i32, Option<String>) 
 
 /// Resolve a goal workflow across built-ins + catalog (same precedence as
 /// `workflow run`: catalog shadows built-ins).
-fn resolve_goal_workflow(goal: &str) -> Result<toron_workflow::schema::Workflow> {
-    let mut all: BTreeMap<String, toron_workflow::schema::Workflow> =
+fn goal_catalog() -> Result<std::collections::BTreeMap<String, toron_workflow::schema::Workflow>> {
+    let mut all: std::collections::BTreeMap<String, toron_workflow::schema::Workflow> =
         crate::builtin_workflows::builtin_workflows();
     for (name, wf) in crate::workflow_catalog::WorkflowCatalog::load()?.workflows {
         all.insert(name, wf);
     }
-    all.get(goal)
-        .cloned()
-        .ok_or_else(|| anyhow!("goal {goal:?} is not a known workflow (flywheel workflow list)"))
+    Ok(all)
 }
 
 /// The `h` tag of a NIP-29 event (the channel id).
@@ -1572,11 +1628,7 @@ mod tests {
             data: std::env::var_os("XDG_DATA_HOME"),
         };
         let root = std::env::temp_dir().join(format!("fw-coal-fail-{}", uuid::Uuid::new_v4()));
-        let workflow_dir = root.join("config/flywheel/workflows");
-        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
-        std::fs::write(
-            workflow_dir.join("coalition-failing-run.yaml"),
-            r#"name: coalition-failing-run
+        let failing_yaml = r#"name: coalition-failing-run
 trigger:
   type: webhook
 steps:
@@ -1584,11 +1636,10 @@ steps:
     action: call_workflow
     workflow: coalition-missing-child
     on_error: fail_run
-"#,
-        )
-        .expect("workflow");
+"#;
+        let failing_wf: toron_workflow::schema::Workflow =
+            serde_yaml::from_str(failing_yaml).expect("workflow");
         unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", root.join("config"));
             std::env::set_var("XDG_STATE_HOME", root.join("state"));
             std::env::set_var("XDG_DATA_HOME", root.join("data"));
         }
@@ -1598,7 +1649,10 @@ steps:
             root.join("coalitions"),
             root.join("mail"),
         )
-        .expect("open store");
+        .expect("open store")
+        .with_goal_runner(crate::cron::recording_runner())
+        .with_builtin_goal_catalog()
+        .with_goal_workflow("coalition-failing-run", failing_wf);
         store.register_agent("captain").expect("register captain");
         let members = vec!["captain".to_string()];
         let formed = store.form(
@@ -1745,10 +1799,13 @@ steps:
     /// coalesce. `auto_coalesce` forms an ad-hoc coalition binding both.
     #[test]
     fn detector_e2e_overlap_proposes_and_coalesces() {
+        let _home = crate::config::test_state_home();
         let root = std::env::temp_dir().join(format!("fw-coal-det-{}", uuid::Uuid::new_v4()));
         let data = std::env::temp_dir().join(format!("fw-coal-det-data-{}", uuid::Uuid::new_v4()));
         let store = CoalitionStore::open_at("det-e2e", root.clone(), data.clone())
-            .expect("open hermetic store");
+            .expect("open hermetic store")
+            .with_goal_runner(crate::cron::recording_runner())
+            .with_builtin_goal_catalog();
         store.register_agent("oc").expect("register oc");
         store.register_agent("pi").expect("register pi");
 
@@ -1844,7 +1901,9 @@ steps:
         let root = std::env::temp_dir().join(format!("fw-coal-aff-{}", uuid::Uuid::new_v4()));
         let data = std::env::temp_dir().join(format!("fw-coal-aff-data-{}", uuid::Uuid::new_v4()));
         let store = CoalitionStore::open_at("det-aff", root.clone(), data.clone())
-            .expect("open hermetic store");
+            .expect("open hermetic store")
+            .with_goal_runner(crate::cron::recording_runner())
+            .with_builtin_goal_catalog();
         store.register_agent("oc").expect("register oc");
         store.register_agent("pi").expect("register pi");
         store
@@ -1900,7 +1959,9 @@ steps:
         let data =
             std::env::temp_dir().join(format!("fw-coal-xproj-data-{}", uuid::Uuid::new_v4()));
         let store = CoalitionStore::open_at("proj-a", root.clone(), data.clone())
-            .expect("open hermetic store");
+            .expect("open hermetic store")
+            .with_goal_runner(crate::cron::recording_runner())
+            .with_builtin_goal_catalog();
 
         store.register_agent("oc").expect("register oc in proj-a");
         let pi_profile = toron_core::nostr::identity::AgentProfile {
@@ -2053,7 +2114,9 @@ steps:
         let data =
             std::env::temp_dir().join(format!("fw-coal-xproj-rej-data-{}", uuid::Uuid::new_v4()));
         let store = CoalitionStore::open_at("proj-a", root.clone(), data.clone())
-            .expect("open hermetic store");
+            .expect("open hermetic store")
+            .with_goal_runner(crate::cron::recording_runner())
+            .with_builtin_goal_catalog();
         store.register_agent("oc").expect("register oc in proj-a");
         let err = store
             .form(
@@ -2134,7 +2197,9 @@ steps:
         let root = std::env::temp_dir().join(format!("fw-coal-leaf-{}", uuid::Uuid::new_v4()));
         let data = std::env::temp_dir().join(format!("fw-coal-leaf-data-{}", uuid::Uuid::new_v4()));
         let store = CoalitionStore::open_at("leaf-e2e", root.clone(), data.clone())
-            .expect("open hermetic store");
+            .expect("open hermetic store")
+            .with_goal_runner(crate::cron::recording_runner())
+            .with_builtin_goal_catalog();
         store.register_agent("oc").expect("register oc");
         store.register_agent("pi").expect("register pi");
         let m = store
@@ -2196,7 +2261,9 @@ steps:
         let root = std::env::temp_dir().join(format!("fw-coal-obs-{}", uuid::Uuid::new_v4()));
         let data = std::env::temp_dir().join(format!("fw-coal-obs-data-{}", uuid::Uuid::new_v4()));
         let store = CoalitionStore::open_at("obs-e2e", root.clone(), data.clone())
-            .expect("open hermetic store");
+            .expect("open hermetic store")
+            .with_goal_runner(crate::cron::recording_runner())
+            .with_builtin_goal_catalog();
         store.register_agent("oc").expect("register oc");
         store.register_agent("pi").expect("register pi");
         let m = store
@@ -2295,7 +2362,9 @@ steps:
         let root = std::env::temp_dir().join(format!("fw-coal-join-{}", uuid::Uuid::new_v4()));
         let data = std::env::temp_dir().join(format!("fw-coal-join-data-{}", uuid::Uuid::new_v4()));
         let store = CoalitionStore::open_at("join-e2e", root.clone(), data.clone())
-            .expect("open hermetic store");
+            .expect("open hermetic store")
+            .with_goal_runner(crate::cron::recording_runner())
+            .with_builtin_goal_catalog();
         store.register_agent("oc").expect("register oc");
         store.register_agent("pi").expect("register pi");
 
@@ -2375,7 +2444,9 @@ steps:
         let data =
             std::env::temp_dir().join(format!("fw-coal-leave-data-{}", uuid::Uuid::new_v4()));
         let store = CoalitionStore::open_at("leave-e2e", root.clone(), data.clone())
-            .expect("open hermetic store");
+            .expect("open hermetic store")
+            .with_goal_runner(crate::cron::recording_runner())
+            .with_builtin_goal_catalog();
         store.register_agent("oc").expect("register oc");
         store.register_agent("pi").expect("register pi");
 
@@ -2453,24 +2524,22 @@ steps:
         let _ = std::fs::remove_dir_all(&data);
     }
 
-    /// bd-yf465: form must give the goal engine a job sink. Force the BUILTIN
-    /// ce-compound (the ambient user-tier copy has only a continue-on-error
-    /// dispatch step and masks a missing sink); its failing-on-error reflect
-    /// step makes form refuse unless dispatch_job can run.
+    /// bd-yf465: form must give the goal engine a job sink. `test_state_home`
+    /// pins an empty XDG_CONFIG_HOME, so the BUILTIN ce-compound is resolved
+    /// (the ambient user-tier copy has only a continue-on-error dispatch step
+    /// and masks a missing sink); its fail_run reflect step makes form refuse
+    /// unless dispatch_job can run. The injected recording runner is the test
+    /// sink; production keeps the live pane dispatch.
     #[test]
     fn form_builtin_goal_with_dispatch_steps_needs_a_job_sink() {
         let _home = crate::config::test_state_home();
-        let prev_config = std::env::var_os("XDG_CONFIG_HOME");
-        let empty_config =
-            std::env::temp_dir().join(format!("fw-coal-empty-config-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&empty_config).expect("empty config dir");
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &empty_config) };
-
         let root =
             std::env::temp_dir().join(format!("fw-coal-builtin-goal-{}", uuid::Uuid::new_v4()));
         let data = root.join("data");
         let store = CoalitionStore::open_at("coal-builtin-goal", root.clone(), data.clone())
-            .expect("open hermetic store");
+            .expect("open hermetic store")
+            .with_goal_runner(crate::cron::recording_runner())
+            .with_builtin_goal_catalog();
         store.register_agent("oc").expect("register oc");
         store
             .form(
@@ -2483,12 +2552,35 @@ steps:
             )
             .expect("the builtin goal has a job sink and completes");
 
-        match prev_config {
-            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-        }
         let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&empty_config);
+    }
+
+    /// bd-yf465: production form must dispatch real work. The store's default
+    /// goal runner is the live pane sink, never cron's documented dry-run
+    /// recorder. Source shape is pinned here because the failure mode is a
+    /// one-line swap at the constructor (mutant S2).
+    #[test]
+    fn production_store_wires_the_live_goal_runner() {
+        let src = include_str!("coalition.rs");
+        let ctor = src
+            .split("pub fn open_at")
+            .nth(1)
+            .expect("open_at exists")
+            .split("/// Register an agent")
+            .next()
+            .expect("constructor body");
+        assert!(
+            ctor.contains("live_goal_runner(project"),
+            "production form must use the live pane-dispatch runner"
+        );
+        assert!(
+            !ctor.contains("recording_runner"),
+            "the dry-run recorder must never be the production default"
+        );
+        assert!(
+            src.contains("crate::pane::pane_dispatch("),
+            "live runner must reuse the pane dispatch sink from workflow run"
+        );
     }
 
     /// proof78 flake: `form()` writes a run log under `config::state_dir()`.
