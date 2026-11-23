@@ -1,12 +1,15 @@
 //! bd-4z7mb follow-up: `e2e-live.sh --five --dry-run` prints its plan and
 //! touches nothing. The script below drives it against a fake rex on PATH.
 
-use std::process::Command;
+use flywheel_test_sandbox::TestSandbox;
 
 #[test]
 fn the_live_five_dry_run_plans_without_creating_a_session() {
     let root = env!("CARGO_MANIFEST_DIR");
-    let status = Command::new("bash")
+    let sandbox = TestSandbox::new();
+    let status = sandbox
+        .command("/bin/bash")
+        .env("PATH", sandbox.path_env())
         .arg(format!("{root}/scripts/test-e2e-live-dry.sh"))
         .current_dir(root)
         .status()
@@ -18,7 +21,10 @@ fn the_live_five_dry_run_plans_without_creating_a_session() {
 #[test]
 fn the_live_five_refuses_a_non_throwaway_project() {
     let root = env!("CARGO_MANIFEST_DIR");
-    let status = Command::new("bash")
+    let sandbox = TestSandbox::new();
+    let status = sandbox
+        .command("/bin/bash")
+        .env("PATH", sandbox.path_env())
         .arg(format!("{root}/scripts/test-e2e-live-dry.sh"))
         .arg("--guard")
         .current_dir(root)
@@ -33,7 +39,10 @@ fn the_live_five_refuses_a_non_throwaway_project() {
 #[test]
 fn the_live_five_runs_from_a_clean_export() {
     let root = env!("CARGO_MANIFEST_DIR");
-    let status = Command::new("bash")
+    let sandbox = TestSandbox::new();
+    let status = sandbox
+        .command("/bin/bash")
+        .env("PATH", sandbox.path_env())
         .arg(format!("{root}/scripts/test-e2e-live-export.sh"))
         .current_dir(root)
         .status()

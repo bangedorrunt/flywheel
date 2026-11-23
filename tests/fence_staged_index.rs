@@ -3,12 +3,18 @@
 //! index fence refuses it, naming the build error, while the pair staged
 //! together passes.
 
-use std::process::Command;
+use flywheel_test_sandbox::TestSandbox;
 
 #[test]
 fn the_fence_refuses_a_staged_caller_without_its_callee() {
     let root = env!("CARGO_MANIFEST_DIR");
-    let status = Command::new("bash")
+    let sandbox = TestSandbox::new();
+    let real_home = std::env::var("HOME").unwrap_or_default();
+    let status = sandbox
+        .command("/bin/bash")
+        .env("PATH", sandbox.path_env())
+        .env("RUSTUP_HOME", format!("{real_home}/.rustup"))
+        .env("CARGO_HOME", format!("{real_home}/.cargo"))
         .arg(format!("{root}/scripts/test-fence.sh"))
         .current_dir(root)
         .status()
