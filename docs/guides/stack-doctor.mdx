@@ -18,6 +18,7 @@ An install finishes by running `flywheel stack doctor`. If any probe fails, the 
 | `toron` | the effective toron address accepts a TCP connection | install, then check the toron daemon log |
 | `doorbell` | each seated project's dispatcher has a live pid | `flywheel doorbell start <project>` |
 | `events` | every events-door seat has an events token | install (mints missing tokens) |
+| `wake` | a probe wake is actually queued for the doctor pin | install, then check the doorbell dispatcher |
 
 ## What a failure means
 

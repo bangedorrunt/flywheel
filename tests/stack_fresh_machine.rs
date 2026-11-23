@@ -128,7 +128,7 @@ fn stack_doctor_probes_every_job_on_a_fresh_machine() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor json");
     assert_eq!(v["kind"], "flywheel-stack-doctor.v1");
     assert_eq!(v["ok"], true);
-    for name in ["binaries", "jobs", "toron", "doorbell", "events"] {
+    for name in ["binaries", "jobs", "toron", "doorbell", "events", "wake"] {
         assert_eq!(
             v["probes"]
                 .as_array()

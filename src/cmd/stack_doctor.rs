@@ -189,6 +189,33 @@ fn doorbell_probe() -> Probe {
     }
 }
 
+fn wake_probe() -> Probe {
+    let state_dir = crate::config::state_dir();
+    let project = "flywheel-doctor";
+    let pin = "DoctorProbe";
+    let summary = format!("emit stack-doctor -> {pin}");
+    // Use the same wake path the stack itself uses, then verify a wake row
+    // was actually queued for the probe pin — not that a status flag was set.
+    crate::doorbell::service_emit_wake_in(&state_dir, project, "stack-doctor", pin);
+    let path = state_dir.join("facts").join(format!(
+        "{}-pending.jsonl",
+        crate::state::state_key(project)
+    ));
+    let ok = std::fs::read_to_string(&path)
+        .map(|body| body.lines().any(|line| line.contains(&summary)))
+        .unwrap_or(false);
+    Probe {
+        name: "wake",
+        ok,
+        detail: format!(
+            "{}: {}",
+            path.display(),
+            if ok { "wake queued" } else { "no wake row" }
+        ),
+        fix: "flywheel stack install --operator; check the doorbell dispatcher".into(),
+    }
+}
+
 fn events_probe() -> Probe {
     let (seats, tokens) = super::stack::events_seats_and_tokens();
     let tokenless = super::stack::tokenless_events_seats(&seats, &tokens);
@@ -231,6 +258,7 @@ pub(crate) fn cmd_stack_doctor(cfg: &Config, json: bool, fix: bool) -> Result<()
     probes.push(toron_probe(cfg));
     probes.push(doorbell_probe());
     probes.push(events_probe());
+    probes.push(wake_probe());
 
     if fix {
         for label in &failed_jobs {
@@ -247,6 +275,7 @@ pub(crate) fn cmd_stack_doctor(cfg: &Config, json: bool, fix: bool) -> Result<()
             probes.push(toron_probe(cfg));
             probes.push(doorbell_probe());
             probes.push(events_probe());
+            probes.push(wake_probe());
         }
     }
 
