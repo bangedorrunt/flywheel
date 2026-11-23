@@ -182,7 +182,6 @@ fi
 
 PLANE_SESSION=""
 SPAWNED_PIN=""
-EVENTS_PIN=""
 # bd-833ya: spawn installs a per-project doorbell supervisor. Retiring the
 # seats alone leaves the project registered, and the next stack install boots
 # that supervisor back up. Drop both the registration and the unit.
@@ -316,7 +315,6 @@ PY
 )" || die "cannot read the spawned seats from the spawn receipt"
 SPAWNED_PIN="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f1)"
 SPAWNED_PANE="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f2)"
-EVENTS_PIN="$SPAWNED_PIN"
 SPAWNED_SESSION="$(printf '%s\n' "$spawn_out" | sed -nE 's/.*(session:[^ ]+) created.*/\1/p' | head -1)"
 [ -n "$SPAWNED_PIN" ] || die "spawn receipt named no opencode pin"
 
@@ -367,11 +365,6 @@ for t in "${TESTS[@]}"; do
         export FLYWHEEL_LIVE_PIN="$PIN"
         export FLYWHEEL_LIVE_BLOCK="$BLOCK_ID"
         export FLYWHEEL_LIVE_AS="$AS"
-    fi
-    if [ "$t" = "tests/live_events_delivery.rs" ]; then
-        export FLYWHEEL_LIVE_EVENTS_PIN="$EVENTS_PIN"
-    else
-        unset FLYWHEEL_LIVE_EVENTS_PIN
     fi
     if (cd "$TEST_REPO" && "$CARGO_BIN" test --test "$(basename "$t" .rs)" -- --ignored --nocapture >"$log" 2>&1); then
         printf '  PASS  %s\n' "$t"

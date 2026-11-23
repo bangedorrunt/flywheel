@@ -40,8 +40,20 @@ fn live_events_delivery_is_gated_and_every_test_is_ignored() {
 fn e2e_live_five_runs_the_events_delivery_witness() {
     let runner = std::fs::read_to_string(format!("{}/scripts/e2e-live-five.sh", root()))
         .expect("scripts/e2e-live-five.sh");
+    // The runner also names this file in a per-leg env branch, so a bare
+    // contains() passes even when the TESTS array dropped the leg. Check the
+    // array it actually iterates.
+    let start = runner
+        .find("TESTS=(")
+        .expect("the runner must declare a TESTS array");
+    let end = runner[start..]
+        .find(')')
+        .map(|i| start + i)
+        .unwrap_or(runner.len());
+    let list = &runner[start..end];
     assert!(
-        runner.contains("tests/live_events_delivery.rs"),
-        "scripts/e2e-live.sh --five must run the events-delivery witness"
+        list.lines()
+            .any(|line| line.trim() == "tests/live_events_delivery.rs"),
+        "the runner's TESTS array must include the events-delivery witness: {list}"
     );
 }

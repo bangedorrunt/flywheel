@@ -1,20 +1,13 @@
-//! bd-znczi: gated live proof of ADR-0039 "Events primary" (P1).
+//! bd-znczi/bd-rrlo2: gated live proof that ADR-0039 "Events primary" works.
 //!
 //! Run only through `FLYWHEEL_LIVE_E2E=1 bash scripts/e2e-live-five.sh`, which
-//! supplies a THROWAWAY project, state dir and a real harness seat spawned in
-//! that project. This file follows the live carve-out: every test is `#[ignore]`d
-//! and gated on FLYWHEEL_LIVE_E2E, so a plain `cargo test` never runs it.
-//! Commands use the REAL environment (no TestSandbox): the seat needs its
-//! harness auth and mise trust, and `toron` needs the operator's local key.
-//!
-//! The runner's spawned seat reaches the mailbox through MCP Events with a
-//! 0600 per-pin token (bd-rrlo2). This witness asserts that seat's events
-//! journal records a fetch and that the doorbell records NO ring for the mail.
-//! With the per-pin token mint disabled the pump never starts and the doorbell
-//! rings instead — this witness then fails naming that fallback.
+//! supplies a throwaway project and state dir. This leg owns a fake no-door
+//! seat: it seeds one registry row and one 0600 token, then starts its own
+//! doorbell host so the daemon events pump arms for that pin. No harness kind
+//! (grok, gemini, antigravity) and no runner env branch are needed.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const GATE: &str = "FLYWHEEL_LIVE_E2E";
@@ -30,8 +23,8 @@ fn live_var(key: &str) -> String {
         .unwrap_or_else(|| panic!("{GATE}=1 requires {key} to be set"))
 }
 
-fn toron() -> String {
-    std::env::var("TORON_BIN").unwrap_or_else(|_| "toron".to_string())
+fn bin(key: &str, fallback: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| fallback.to_string())
 }
 
 fn run(bin: &str, args: &[&str]) -> std::process::Output {
@@ -60,55 +53,121 @@ fn poll(secs: u64, mut ready: impl FnMut() -> bool) -> bool {
     false
 }
 
+fn state_dir() -> PathBuf {
+    std::env::var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
+        })
+        .join("flywheel")
+}
+
+/// Kill the test-owned doorbell child even if an assertion fails.
+struct PumpHost(Child);
+impl Drop for PumpHost {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 #[ignore = "gated live: FLYWHEEL_LIVE_E2E=1, run only via scripts/e2e-live-five.sh"]
-fn one_addressed_mail_reaches_the_seat_through_events_not_doorbell() {
+fn one_addressed_mail_reaches_the_events_pump_not_the_doorbell() {
     if !enabled() {
         eprintln!("{GATE} unset — live events witness skipped");
         return;
     }
     let project = live_var("FLYWHEEL_LIVE_PROJECT");
-    // The runner's no-door grok seat: only those get a daemon events pump and
-    // an events-<pin>.jsonl journal row (pi/opencode ride their own MCP config).
-    let pin = live_var("FLYWHEEL_LIVE_EVENTS_PIN");
+    let fw = bin("FLYWHEEL_BIN", env!("CARGO_BIN_EXE_flywheel"));
+    let toron = bin("TORON_BIN", "toron");
+    let state = state_dir();
     let tag = format!("znczi-{}", std::process::id());
+    let probe = format!("{project}-probe");
+    let pin = format!("EventsProbe{}", std::process::id());
 
-    // bd-rrlo2 guard: the rex spawn path must have minted a 0600 per-pin token
-    // before launch. No token means this seat is on the doorbell fallback.
-    let flywheel_state = std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
-        })
-        .join("flywheel");
-    let token = flywheel_state
-        .join("events-tokens")
-        .join(format!("{project}-{pin}.token"));
-    assert!(
-        token.is_file(),
-        "{pin}: no per-pin events token — spawn did not mint (bd-rrlo2)"
+    // One fake no-door seat, owned by this test. The pump only needs the
+    // registry row and its token; no harness process is involved.
+    let agents = state.join("agents");
+    std::fs::create_dir_all(&agents).expect("agents dir");
+    let registry = agents.join(format!("{probe}.json"));
+    let row = serde_json::json!([{
+        "pane_id": "block:fake-events-seat",
+        "name": "fake-events-seat",
+        "harness": "gemini",
+        "mail_identity": pin,
+        "skills_injected": false,
+        "incarnation": 0
+    }]);
+    std::fs::write(&registry, row.to_string()).expect("fake seat row");
+
+    let minted = run(
+        &toron,
+        &[
+            "events",
+            "token",
+            "mint",
+            "--pin",
+            &pin,
+            "--project",
+            &probe,
+            "--ttl-secs",
+            "600",
+        ],
     );
+    assert!(
+        minted.status.success(),
+        "token mint failed: {}",
+        text(&minted)
+    );
+    let minted_json: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(&minted.stdout).expect("mint utf8"))
+            .expect("mint json");
+    let token = minted_json
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .expect("mint token");
+    let tokens = state.join("events-tokens");
+    std::fs::create_dir_all(&tokens).expect("token dir");
+    let token_file = tokens.join(format!("{probe}-{pin}.token"));
+    std::fs::write(&token_file, token).expect("token file");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(&token)
-            .expect("token metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600, "{pin}: token file must be 0600");
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))
+            .expect("token mode");
     }
 
-    // Addressed mail straight into the pin's mailbox: the seat's events pump
-    // fetches it with its token. Sending as the seat itself needs no extra
-    // operator registration and still exercises the same events door.
+    // Arm the pump with a test-owned doorbell host. spawn_events_pumps reads
+    // the registry at host start, so the row above must exist first.
+    let workspace = format!("session:events-probe-{}", std::process::id());
+    let host = Command::new(&fw)
+        .args(["__doorbell", "--project", &probe, "--workspace", &workspace])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn test-owned doorbell host");
+    let _host = PumpHost(host);
+
+    let journal = state.join("doorbell").join(format!("events-{pin}.jsonl"));
+    let pumped = poll(90, || {
+        std::fs::read_to_string(&journal)
+            .map(|s| s.lines().any(|l| l.contains("\"op\":\"fetch\"")))
+            .unwrap_or(false)
+    });
+    assert!(
+        pumped,
+        "{pin}: no events-journal fetch rows — the daemon pump did not arm: {}",
+        journal.display()
+    );
+
     let sent = run(
-        &toron(),
+        &toron,
         &[
             "mail",
             "send",
             "--project",
-            &project,
+            &probe,
             "--as",
             &pin,
             "--to",
@@ -121,22 +180,7 @@ fn one_addressed_mail_reaches_the_seat_through_events_not_doorbell() {
     );
     assert!(sent.status.success(), "mail send failed: {}", text(&sent));
 
-    // (1) Events path active: the per-pin events journal got a fetch row.
-    let events_journal = flywheel_state
-        .join("doorbell")
-        .join(format!("events-{pin}.jsonl"));
-    let events_ok = poll(90, || {
-        std::fs::read_to_string(&events_journal)
-            .map(|s| s.lines().any(|l| l.contains("\"op\":\"fetch\"")))
-            .unwrap_or(false)
-    });
-    assert!(
-        events_ok,
-        "{pin}: no events-journal rows — MCP Events is inert. With the per-pin token mint disabled the seat falls back to the DOORBELL (bd-rrlo2); this witness requires the events path."
-    );
-
-    // (2) No doorbell ring for this pin bearing our marker.
-    let doorbell_journal_dir = flywheel_state.join("journals");
+    let doorbell_journal_dir = state.join("journals");
     let mut rings = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&doorbell_journal_dir) {
         for entry in entries.flatten() {
@@ -155,6 +199,9 @@ fn one_addressed_mail_reaches_the_seat_through_events_not_doorbell() {
     }
     assert!(
         rings.is_empty(),
-        "{pin}: the doorbell rang for {tag} — the seat fell back to the DOORBELL instead of the events path: {rings:?}"
+        "{pin}: the doorbell rang for {tag} instead of the events path: {rings:?}"
     );
+
+    let _ = std::fs::remove_file(&registry);
+    let _ = std::fs::remove_file(&token_file);
 }
