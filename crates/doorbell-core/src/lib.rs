@@ -584,6 +584,30 @@ pub fn doorbell_line(class: EventClass, hint: &str) -> String {
     )
 }
 
+/// Stamp the exact read door onto a rendered wake that only says
+/// `toron next` (bd-idle-done-wake-not-delivered-gnjok). `doorbell_line`
+/// renders generically because it has no reader; the one funnel that does —
+/// `route_or_queue` — owns the flags before ANY prompt, digest or queued
+/// line is emitted. `toron next` requires both flags, so a bare word made
+/// idle/done crews miss every tasked wake.
+pub fn with_read_flags(line: String, project: &str, pin: &str) -> String {
+    if project.is_empty() || pin.is_empty() {
+        return line;
+    }
+    const GENERIC: &str = "Read it with: toron next";
+    let Some(at) = line.find(GENERIC) else {
+        return line;
+    };
+    let tail = &line[at + GENERIC.len()..];
+    if tail.starts_with(" --project") || tail.starts_with(" --as") {
+        return line;
+    }
+    format!(
+        "{}{GENERIC} --project {project} --as {pin}{tail}",
+        &line[..at]
+    )
+}
+
 /// The hint that marks a system notice: a `PlanePMail` line carrying it is
 /// journaled as silent and never rings (bd-0uzrq.1).
 pub const SYSTEM_NOTICE_HINT: &str = "system-notice";
@@ -1802,6 +1826,10 @@ fn route_or_queue(
         .get(pin)
         .map(String::as_str)
         .unwrap_or("unknown");
+    // bd-idle-done-wake-not-delivered-gnjok: the immediate-inject path never
+    // passes through composed_ring, so stamp the reader here. A queued wake
+    // gets the same door in its line, and composed_ring re-forms its own.
+    let line = with_read_flags(line, &project, pin);
     if !key.is_empty() && next.rung.contains(&key) {
         actions.push(DoorbellAction::Audit {
             kind: "already_rung".into(),

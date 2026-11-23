@@ -646,6 +646,65 @@ mod tests {
         );
     }
 
+    /// bd-idle-done-wake-not-delivered-gnjok: a tasked wake typed into an
+    /// IDLE or DONE pane must carry the exact read command. `toron next`
+    /// requires --project and --as; a bare word is a usage error, so an agent
+    /// that follows it never reads the mail and the doorbell calls it deaf.
+    /// This folds through the same program the live workspace uses.
+    #[test]
+    fn doorbell_wake_delivery_idle_line_names_the_read_command() {
+        let cmds = fold_tasked_mail_at("idle");
+        let line = prompt_line(&cmds, "BlueRidge");
+        assert!(
+            line.contains("toron next --project flywheel --as BlueRidge"),
+            "the typed wake must say how to read this mail: {line}"
+        );
+    }
+
+    #[test]
+    fn doorbell_wake_delivery_done_line_names_the_read_command() {
+        let cmds = fold_tasked_mail_at("done");
+        let line = prompt_line(&cmds, "BlueRidge");
+        assert!(
+            line.contains("toron next --project flywheel --as BlueRidge"),
+            "a done pane is at a prompt; its wake must be actionable: {line}"
+        );
+    }
+
+    fn fold_tasked_mail_at(status: &str) -> Vec<InboxCmd> {
+        let row = serde_json::json!({
+            "id": "m-wake-delivery",
+            "subject": "a task for you",
+            "body": "please do the work",
+            "wake": "tasked",
+            "importance": "normal",
+            "sender": "SlateHarbor",
+            "created_ts_us": 1_700_000_000_000_000_i64,
+        });
+        let model = DoorbellModel {
+            project: "flywheel".into(),
+            statuses: [("BlueRidge".into(), status.to_string())].into(),
+            ..DoorbellModel::default()
+        };
+        let (_, cmds) = InboxProgram::fold(
+            &model,
+            &DoorbellMsg::InboxRows {
+                rows: vec![row],
+                pin: "BlueRidge".into(),
+            },
+        );
+        cmds
+    }
+
+    fn prompt_line(cmds: &[InboxCmd], pin: &str) -> String {
+        cmds.iter()
+            .find_map(|c| match &c.action {
+                DoorbellAction::Prompt { pin: p, line, .. } if p == pin => Some(line.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no prompt for {pin}: {cmds:?}"))
+    }
+
     #[test]
     fn the_workspace_slice_and_the_program_fold_the_same_way() {
         let model = DoorbellModel::default();
