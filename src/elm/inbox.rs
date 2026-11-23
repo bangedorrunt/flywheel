@@ -553,11 +553,11 @@ mod tests {
             )),
             "unpulled mail rings once toron answers behind it: {decided_commands:?}"
         );
-        let mut pulled = unpulled.clone();
-        pulled
-            .pulled_us
-            .insert("BlueRidge".into(), 1_700_000_000_000_000);
-        let (_, pulled_commands) = InboxProgram::fold(&pulled, &edge);
+        // bd-ba4nl: consumed means toron's per-pin READ cursor, not the
+        // doorbell's own fetch high-water. With no read yet the mail parks
+        // and asks; a fresh answer covering the event is what audits it as
+        // already pulled. pulled_us is a legacy field and decides nothing.
+        let (parked_pulled, pulled_commands) = InboxProgram::fold(&unpulled, &edge);
         assert!(
             !pulled_commands.iter().any(|c| matches!(
                 &c.action,
@@ -568,9 +568,31 @@ mod tests {
         assert!(
             pulled_commands.iter().any(|c| matches!(
                 &c.action,
+                DoorbellAction::ReadToronCursor { pin } if pin == "BlueRidge"
+            )),
+            "the pulled candidate asks for a fresh read first: {pulled_commands:?}"
+        );
+        let (_, decided_pulled) = InboxProgram::fold(
+            &parked_pulled,
+            &DoorbellMsg::ToronCursor {
+                pin: "BlueRidge".into(),
+                cursor_us: Some(1_700_000_000_000_000),
+                read_at_secs: 1_700_000_000,
+            },
+        );
+        assert!(
+            !decided_pulled.iter().any(|c| matches!(
+                &c.action,
+                DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge"
+            )),
+            "an answer covering the event must not ring: {decided_pulled:?}"
+        );
+        assert!(
+            decided_pulled.iter().any(|c| matches!(
+                &c.action,
                 DoorbellAction::Audit { kind, .. } if kind == "already-pulled"
             )),
-            "the skipped wake is audited, never silent: {pulled_commands:?}"
+            "the skipped wake is audited, never silent: {decided_pulled:?}"
         );
     }
 

@@ -3528,8 +3528,16 @@ mod bell_fold_tests {
             "RED: host writes a status side map; Model.doorbell.statuses is the only map"
         );
         let brain = include_str!("../crates/doorbell-rt/src/brain.rs");
+        // Scope to production code: the host-level fake-host fixtures in
+        // brain.rs's test module seed statuses on the real model, which is
+        // exactly where perception belongs. A crate-wide !contains now
+        // self-matches those fixtures (same trap as the WatchDied needle).
+        let brain_production = brain
+            .split("\nmod tests {")
+            .next()
+            .expect("brain.rs has a test module");
         assert!(
-            !brain.contains("statuses"),
+            !brain_production.contains("statuses"),
             "RED: brain owns status state; perception lives in the ticked model"
         );
     }
