@@ -122,6 +122,7 @@ TESTS=(
     tests/live_serialize_worktree.rs
     tests/live_opencode_api_wake.rs
     tests/live_events_delivery.rs
+    tests/live_compose_join_dispatch.rs
 )
 
 resolve_tool() {
