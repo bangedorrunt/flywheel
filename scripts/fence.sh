@@ -76,6 +76,8 @@ LOCK="$TMP/.fence-running.lock"
 export_is_live() {
     local dir="$1"
     [ -f "$dir/.fence-running.lock" ] && return 0
+    # A clean-proof run holds this lock for its whole (multi-hour) lifetime.
+    [ -f "$dir/.proof-running.lock" ] && return 0
     if command -v lsof >/dev/null 2>&1 \
         && lsof +D "$dir" >/dev/null 2>&1; then
         return 0

@@ -199,6 +199,10 @@ else
 fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/fw-proof.XXXXXX")"
+# A proof can run for hours. The lock tells fence.sh's export sweep this dir
+# is live even when it is older than the sweep age.
+PROOF_LOCK="$TMP/.proof-running.lock"
+: >"$PROOF_LOCK"
 
 # bd-9dxjt: build into a REAL target dir the proof owns. By default mbx makes
 # `target` a symlink into its shared managed cache, which ANY lane's `mbx gc`
@@ -212,6 +216,7 @@ CACHE_STORES="$TMP/cache-stores.tsv"
 : >"$CACHE_STORES"
 cleanup() {
   local status=$?
+  rm -f "$PROOF_LOCK"
   if [ "$status" -ne 0 ] || [ "$KEEP" -eq 1 ]; then
     echo "clean-proof: kept $TMP" >&2
     # bd-3681w: a kept export is for the captain's install. Older ones must not
@@ -221,7 +226,8 @@ cleanup() {
     # A red proof keeps the last installable export: prune only on green.
     if [ "$status" -eq 0 ]; then
       find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'fw-proof.*' \
-        ! -name "$(basename "$TMP")" -exec rm -rf {} + 2>/dev/null || true
+        ! -name "$(basename "$TMP")" -exec sh -c \
+        'for d do [ -f "$d/.proof-running.lock" ] || rm -rf "$d"; done' sh {} + 2>/dev/null || true
     fi
     # bd-9dxjt: a kept export keeps only logs, receipt and source. The real
     # proof-owned target dirs are multi-GB; drop them on this exit path too so

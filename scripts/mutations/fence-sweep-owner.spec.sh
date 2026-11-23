@@ -27,3 +27,9 @@ mutation "W3  a failed fence never sweeps old exports" \
     expect=fence_test_export_witness \
     find='        sweep_kept_exports' \
     replace='        : # bd-p7oim mutation: failed fences keep every old export'
+
+mutation "W4  a long proof's live lock is ignored" \
+    file=scripts/fence.sh \
+    expect=fence_test_export_witness \
+    find='    [ -f "$dir/.proof-running.lock" ] && return 0' \
+    replace='    : # bd-p7oim mutation: a long proof is swept while it runs'
