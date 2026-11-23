@@ -379,6 +379,15 @@ fn proof_suites_run_concurrently() {
     assert!(status.success(), "parallel suite witness failed");
 }
 
+/// bd-p7oim: tests in changed files run before the long suite.
+#[test]
+fn proof_changed_file_tests_run_first() {
+    let status = sandboxed_bash(root(), "test-proof-changed-tests.sh")
+        .status()
+        .expect("run scripts/test-proof-changed-tests.sh");
+    assert!(status.success(), "changed-file test witness failed");
+}
+
 #[test]
 fn proof_claude_plugin_loads_and_installs_to_plugin_dir() {
     let status = sandboxed_bash(root(), "test-claude-plugin-load.sh")

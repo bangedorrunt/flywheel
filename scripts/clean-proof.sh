@@ -442,6 +442,29 @@ sibling_tests() { # reads sibling names on stdin
   done
 }
 
+# bd-p7oim: tests in files changed since the mutation base run before the
+# expensive suite. A red one stops the proof here, not 18 minutes later.
+CHANGED_RS=""
+changed_base="$(proof_mutation_base "$ROOT" "$PROVEN_SHA")"
+[ -n "$changed_base" ] || changed_base="$(proof_green_base "$ROOT" "$PROVEN_SHA" "$RECEIPT_ARCHIVE")"
+if [ -n "$changed_base" ] && git -C "$ROOT" cat-file -e "${changed_base}^{commit}" 2>/dev/null; then
+  CHANGED_RS="$(git -C "$ROOT" diff --name-only "$changed_base..$PROVEN_SHA" -- '*.rs')"
+fi
+
+run_changed_file_tests() {
+  local file name
+  while IFS= read -r file; do
+    [ -n "$file" ] || continue
+    [ -f "$TMP/flywheel/$file" ] || continue
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      run_step "changed-$name" "${MBX[@]}" test -p flywheel --bin flywheel \
+        "$name" --exact || return 1
+    done < <(grep -A1 '#\[.*test' "$TMP/flywheel/$file" 2>/dev/null \
+      | sed -n 's/.*fn \([A-Za-z0-9_]*\)(.*/\1/p')
+  done <<<"${CHANGED_RS:-}"
+}
+
 # Warnings are errors for every workspace target (skips cached deps).
 export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
 
@@ -459,6 +482,8 @@ if [ -z "$FAILED_STEP" ] && [ -L "$CARGO_TARGET_DIR" ]; then
 fi
 [ -n "$FAILED_STEP" ] || run_step no-run "${MBX[@]}" test --workspace --no-run || true
 [ -n "$FAILED_STEP" ] || run_step verify-clippy bash scripts/verify-clippy.sh || true
+# bd-p7oim: fail on a changed file's test before the long suite starts.
+[ -n "$FAILED_STEP" ] || run_changed_file_tests || true
 # bd-jp9z1.5: the suite now executes the tests/ targets, and
 # tests/adr0027_slice1 refuses an installed toron on purpose — it needs the
 # PINNED sibling built at ../toron/target/debug/toron. Build the export's

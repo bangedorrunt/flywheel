@@ -3,7 +3,7 @@
 # bd-p7oim: each proof step carries its own wall time in the receipt.
 
 CARGO_ARGS=(-p flywheel --test proof_steps)
-TEST_FILTER=(proof_receipt_records_each_step_seconds proof_sibling_suite_caches_by_rev proof_suites_run_concurrently)
+TEST_FILTER=(proof_receipt_records_each_step_seconds proof_sibling_suite_caches_by_rev proof_suites_run_concurrently proof_changed_file_tests_run_first)
 
 mutation "T1  the receipt drops per-step seconds" \
     file=scripts/proof-lib.sh \
@@ -22,3 +22,12 @@ mutation "D1  the suites run one after the other again" \
     expect=proof_suites_run_concurrently \
     find='( "$@" >"$TMP/$name.log" 2>&1; echo $? >"$TMP/$name.status" ) &' \
     replace='( "$@" >"$TMP/$name.log" 2>&1; echo $? >"$TMP/$name.status" )'
+
+mutation "E1  changed-file tests are skipped" \
+    file=scripts/clean-proof.sh \
+    expect=proof_changed_file_tests_run_first \
+    find='run_changed_file_tests() {
+  local file name' \
+    replace='run_changed_file_tests() {
+  return 0
+  local file name'
