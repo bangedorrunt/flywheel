@@ -296,47 +296,33 @@ export TORON_BIN
 # The no-door events witness uses gemini — no grok seat is spawned at all.
 spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --pi 1 --kind gemini=1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
     || die "flywheel spawn failed: $spawn_out"
-seated=""
-for _seat_ready in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do
-    seated="$(FLYWHEEL_BIN="$FLYWHEEL_BIN" "$PYTHON_BIN" - <<'PY'
-import json, os, subprocess
-doc = json.loads(subprocess.check_output([
-    os.environ["FLYWHEEL_BIN"], "swarm", "status", "e2e-live-five", "--json"
-], text=True))
-rows = doc.get("seats", doc if isinstance(doc, list) else [])
-for r in rows:
-    if r.get("pin") and r.get("pane_id"):
-        print(f"{r['pin']}\t{r['pane_id']}\t{str(r.get('harness', '')).lower()}")
+# Read pins and panes from the spawn receipt, not swarm status: once kill
+# clears the captain alias, the first spawned seat (opencode) is the captain
+# and seat_rows filters it out. The receipt names every seat it created.
+seated="$(SPAWN_OUT="$spawn_out" "$PYTHON_BIN" - <<'PY'
+import os, re
+text = os.environ["SPAWN_OUT"]
+pins = {}
+for m in re.finditer(r"state=Settled subject=flywheel-e2e-live-five-(\S+) \(pin=([^)]+)\)", text):
+    pins[m.group(1)] = m.group(2)
+blocks = {}
+for m in re.finditer(r"^\s+(\S+) \(block:([^)]+)\)", text, re.M):
+    blocks[m.group(1)] = m.group(2)
+kinds = {"opencode": "oc", "pi": "pi", "gemini": "gemini"}
+for kind, suffix in kinds.items():
+    print(f"{pins.get(suffix, '')}\t{blocks.get(kind, '')}")
 PY
-)" || die "cannot read the spawned seats from swarm status"
-    printf '%s\n' "$seated" | grep -q $'\topencode' && break
-    sleep 5
-done
-SPAWNED_PIN="$(printf '%s\n' "$seated" | grep $'\topencode' | head -1 | cut -f1)"
-SPAWNED_PANE="$(printf '%s\n' "$seated" | grep $'\topencode' | head -1 | cut -f2)"
-PI_PIN="$(printf '%s\n' "$seated" | grep $'\tpi' | head -1 | cut -f1)"
-PI_PANE="$(printf '%s\n' "$seated" | grep $'\tpi' | head -1 | cut -f2)"
+)" || die "cannot read the spawned seats from the spawn receipt"
+SPAWNED_PIN="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f1)"
+SPAWNED_PANE="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f2)"
+PI_PIN="$(printf '%s\n' "$seated" | sed -n '2p' | cut -f1)"
+PI_PANE="$(printf '%s\n' "$seated" | sed -n '2p' | cut -f2)"
+EVENTS_PIN="$(printf '%s\n' "$seated" | sed -n '3p' | cut -f1)"
 SPAWNED_SESSION="$(printf '%s\n' "$spawn_out" | sed -nE 's/.*(session:[^ ]+) created.*/\1/p' | head -1)"
-[ -n "$SPAWNED_PIN" ] || die "swarm status named no opencode pin"
-[ -n "$PI_PIN" ] || die "swarm status named no pi pin"
+[ -n "$SPAWNED_PIN" ] || die "spawn receipt named no opencode pin"
+[ -n "$PI_PIN" ] || die "spawn receipt named no pi pin"
+[ -n "$EVENTS_PIN" ] || die "spawn receipt named no gemini pin"
 [ -n "$SPAWNED_SESSION" ] || die "spawn did not name its workspace session"
-
-# bd-znczi: the events witness needs a NO-DOOR seat — only those get a daemon
-# events pump and an events-<pin>.jsonl journal row (pi/opencode ride their own
-# MCP config instead). gemini is no-door; no grok seat is used.
-EVENTS_PIN="$(FLYWHEEL_BIN="$FLYWHEEL_BIN" "$PYTHON_BIN" - <<'PY'
-import json, os, subprocess
-doc = json.loads(subprocess.check_output([
-    os.environ["FLYWHEEL_BIN"], "swarm", "status", "e2e-live-five", "--json"
-], text=True))
-rows = doc.get("seats", doc if isinstance(doc, list) else [])
-for r in rows:
-    if str(r.get("harness", "")).lower() == "gemini" and r.get("pin"):
-        print(r["pin"])
-        break
-PY
-)" || die "cannot read the gemini seat from swarm status"
-[ -n "$EVENTS_PIN" ] || die "swarm status named no gemini seat"
 
 # A freshly spawned agent stays WORKING while it boots; the send door correctly
 # refuses "not at a prompt". Poll ITS status until it is idle (up to 2 min).
