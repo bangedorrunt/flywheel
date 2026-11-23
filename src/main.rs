@@ -6973,6 +6973,52 @@ mod spawn_boot_reliability_tests {
     }
 
     #[test]
+    /// bd-t38jb: a fake rex backend that mirrors the production refusal of a
+    /// narrow close. The kill teardown must use the whole-session scope or it
+    /// leaves the registry rows and the session behind.
+    fn kill_teardown_closes_the_whole_rex_session() {
+        use std::sync::Mutex;
+        use toron_plane::backend::error::{BackendError, BackendErrorCode};
+
+        struct RefusingNarrowClose {
+            calls: Mutex<Vec<(String, bool)>>,
+        }
+        impl crate::backend::MultiplexerBackend for RefusingNarrowClose {
+            fn name(&self) -> &'static str {
+                "fake-rex"
+            }
+            fn workspace_close(
+                &self,
+                workspace_id: &str,
+                close_group: bool,
+            ) -> Result<(), BackendError> {
+                self.calls
+                    .lock()
+                    .expect("mutex")
+                    .push((workspace_id.to_string(), close_group));
+                if !close_group {
+                    return Err(BackendError::new(
+                        BackendErrorCode::Unsupported,
+                        "rex workspace_close has one scope: session kill closes every block; \
+                         close_group=false is refused rather than killing more than asked",
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        let fake = RefusingNarrowClose {
+            calls: Mutex::new(Vec::new()),
+        };
+        crate::close_kill_workspace(&fake, "session:throwaway").expect("teardown must close");
+        assert_eq!(
+            fake.calls.into_inner().expect("mutex"),
+            vec![("session:throwaway".to_string(), true)],
+            "kill must ask rex for the one whole-session scope it supports"
+        );
+    }
+
+    #[test]
     fn kill_never_touches_daemon() {
         let src = include_str!("main.rs");
         let kill = crate::tripwire::find_fn(src, "cmd_kill");
@@ -14238,7 +14284,7 @@ fn cmd_kill(
         }
         _ => {}
     }
-    backend.workspace_close(&ws_id, false)?;
+    close_kill_workspace(&*backend, &ws_id)?;
     doorbell::stop(&config::state_dir(), &ws_label);
     {
         use doorbell_rt::subscribe::{Actor, SubscriptionStore};
@@ -14275,6 +14321,13 @@ fn cmd_kill(
     }
     log(project, EventKind::Close, json!({ "workspace_id": ws_id }));
     println!("closed {project}");
+    Ok(())
+}
+
+/// bd-t38jb: one teardown seam. rex only has a whole-session close primitive,
+/// so a narrow (`close_group=false`) request is refused before any effect.
+fn close_kill_workspace(backend: &dyn backend::MultiplexerBackend, ws_id: &str) -> Result<()> {
+    backend.workspace_close(ws_id, true)?;
     Ok(())
 }
 
