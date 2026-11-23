@@ -285,9 +285,9 @@ export TORON_BIN
 # classifies as Unknown, which may_inject allows. Spawn one in THIS project only,
 # read its pin + pane_id from swarm status, and retire it in cleanup.
 # bd-oo7zi: the operator-typing guard needs a REAL harness pane. bd-live-wake-
-# pane-isolation: the guard types on the no-door gemini pane, never the wake
-# leg's opencode pane. No grok seat is spawned.
-spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --kind gemini=1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
+# pane-isolation: it types on the antigravity pane, never the wake leg's
+# opencode pane. antigravity is also the no-door events witness. No pi/grok.
+spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --kind antigravity=1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
     || die "flywheel spawn failed: $spawn_out"
 # Read pins and panes from the spawn receipt, not swarm status: once kill
 # clears the captain alias, the first spawned seat (opencode) is the captain
@@ -301,7 +301,7 @@ for m in re.finditer(r"state=Settled subject=flywheel-e2e-live-five-(\S+) \(pin=
 blocks = {}
 for m in re.finditer(r"^\s+(\S+) \(block:([^)]+)\)", text, re.M):
     blocks[m.group(1)] = m.group(2)
-kinds = {"opencode": "oc", "gemini": "gemini"}
+kinds = {"opencode": "oc", "antigravity": "antigravity"}
 for kind, suffix in kinds.items():
     block = blocks.get(kind, '')
     print(f"{pins.get(suffix, '')}\t{'block:' + block if block else ''}")
