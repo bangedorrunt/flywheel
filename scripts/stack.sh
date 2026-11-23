@@ -125,11 +125,18 @@ installed_bins() {
   printf '%s\n' "$dir/flywheel" "$dir/toron"
 }
 
+# bd-i4edn: launchd refuses to spawn a replaced binary ("needs LWCR update",
+# exit 78) until the job is re-registered; kickstart -k does not do that.
 restart_label() {
   local label="$1"
-  local domain
-  domain="gui/$(id -u)/$label"
-  if launchctl print "$domain" >/dev/null 2>&1; then
+  local uid domain plist
+  uid="$(id -u)"
+  domain="gui/$uid/$label"
+  plist="$HOME/Library/LaunchAgents/$label.plist"
+  if [ -f "$plist" ]; then
+    run launchctl bootout "$domain" 2>/dev/null || true
+    run launchctl bootstrap "gui/$uid" "$plist"
+  elif launchctl print "$domain" >/dev/null 2>&1; then
     run launchctl kickstart -k "$domain"
   fi
 }

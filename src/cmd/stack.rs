@@ -262,6 +262,63 @@ fn logrotate_plist_invalid() -> bool {
         .is_some_and(|path| logrotate_plist_invalid_at(&path))
 }
 
+fn launchd_spawn_failed(print_output: &str) -> bool {
+    print_output
+        .lines()
+        .any(|line| line.trim() == "job state = spawn failed")
+}
+
+fn flywheel_job_labels<'a>(plist_names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut labels: Vec<String> = plist_names
+        .filter_map(|name| name.strip_suffix(".plist"))
+        .filter(|label| label.starts_with("dev.flywheel."))
+        .map(String::from)
+        .collect();
+    labels.sort();
+    labels
+}
+
+/// bd-i4edn: flywheel launchd jobs whose binary launchd refuses to spawn.
+/// Reads only jobs with a plist under HOME, so a sandboxed HOME never shells
+/// out to launchctl.
+fn flywheel_jobs_unable_to_spawn() -> Vec<String> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let Some(agents) = dirs::home_dir().map(|home| home.join("Library/LaunchAgents")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&agents) else {
+        return Vec::new();
+    };
+    let names: Vec<String> = entries
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .collect();
+    let labels = flywheel_job_labels(names.iter().map(String::as_str));
+    if labels.is_empty() {
+        return Vec::new();
+    }
+    let Some(uid) = Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|uid| !uid.is_empty())
+    else {
+        return Vec::new();
+    };
+    labels
+        .into_iter()
+        .filter(|label| {
+            Command::new("launchctl")
+                .args(["print", &format!("gui/{uid}/{label}")])
+                .output()
+                .map(|out| launchd_spawn_failed(&String::from_utf8_lossy(&out.stdout)))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 fn binary_json(binary: &BinaryProbe) -> Value {
     json!({
         "name": binary.name,
@@ -408,8 +465,10 @@ fn stack_status(cfg: &Config, json_output: bool, check: bool) -> Result<()> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    let unspawnable_jobs = flywheel_jobs_unable_to_spawn();
     let required_binaries_bad = binaries[0].error.is_some() || binaries[2].error.is_some();
     let bad = required_binaries_bad
+        || !unspawnable_jobs.is_empty()
         || version_skew
         || flywheel_version_skew
         || !stale_pids.is_empty()
@@ -444,6 +503,7 @@ fn stack_status(cfg: &Config, json_output: bool, check: bool) -> Result<()> {
                 "error": toron_error,
                 "restart_required": toron_restart_required,
             },
+            "launchd": { "unable_to_spawn": unspawnable_jobs },
             "events_tokens": {
                 "missing": tokenless
                     .iter()
@@ -576,10 +636,20 @@ fn stack_status(cfg: &Config, json_output: bool, check: bool) -> Result<()> {
             }
         }
 
+        if !unspawnable_jobs.is_empty() {
+            println!("\n== launchd ==");
+            for label in &unspawnable_jobs {
+                println!("{label}: spawn failed (re-register: launchctl bootout + bootstrap)");
+            }
+        }
+
         println!("\nstack: {}", if bad { "FAILED" } else { "ok" });
     }
 
     if check && bad {
+        if let Some(label) = unspawnable_jobs.first() {
+            bail!("stack is not current: launchd cannot spawn {label}");
+        }
         if !toron_reachable_now {
             bail!("stack is not current: toron daemon not listening at {toron_daemon_addr}");
         }
@@ -679,6 +749,30 @@ pub(crate) fn installed_flywheel_version() -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+
+    /// bd-i4edn: a job launchd cannot spawn (new binary signature after an
+    /// install) must fail the check, not read as ok.
+    #[test]
+    fn a_job_launchd_cannot_spawn_is_a_failure() {
+        let stuck = "\tstate = spawn scheduled\n\tprogram = /x/flywheel\n\tlast exit code = 78: EX_CONFIG\n\tjob state = spawn failed\n\tproperties = runatload | needs LWCR update\n";
+        let running = "\tstate = running\n\tpid = 50358\n\tjob state = running\n";
+        assert!(super::launchd_spawn_failed(stuck));
+        assert!(!super::launchd_spawn_failed(running));
+    }
+
+    #[test]
+    fn flywheel_job_labels_come_from_their_plists() {
+        let names = [
+            "dev.flywheel.daemon.plist",
+            "dev.flywheel.doorbell.flywheel.plist",
+            "com.toron.serve.plist",
+            "dev.flywheel.cron.plist.bak",
+        ];
+        assert_eq!(
+            super::flywheel_job_labels(names.iter().copied()),
+            vec!["dev.flywheel.daemon", "dev.flywheel.doorbell.flywheel"]
+        );
+    }
 
     #[test]
     fn invalid_logrotate_plist_is_detected() {
