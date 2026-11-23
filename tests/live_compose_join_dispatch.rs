@@ -5,6 +5,7 @@
 //! `#[ignore]`d and gated, so a plain `cargo test` never runs it.
 
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 const GATE: &str = "FLYWHEEL_LIVE_E2E";
 
@@ -44,6 +45,34 @@ fn json_field(v: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn poll(secs: u64, mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if ready() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
+}
+
+fn seats(bin: &str, project: &str) -> serde_json::Value {
+    let status = run(bin, &["swarm", "status", project, "--json"]);
+    assert!(status.status.success(), "status failed: {}", text(&status));
+    serde_json::from_slice(&status.stdout).expect("status JSON")
+}
+
+fn find_seat<'a>(doc: &'a serde_json::Value, role: &str) -> Option<&'a serde_json::Value> {
+    doc.get("seats")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|s| {
+            json_field(s, "role").as_deref() == Some(role)
+                && json_field(s, "pin").is_some()
+                && json_field(s, "name").is_some()
+        })
+}
+
 #[test]
 #[ignore = "gated live: FLYWHEEL_LIVE_E2E=1, run only via scripts/e2e-live-five.sh"]
 fn composed_join_dispatches_the_bound_step_to_the_live_pin() {
@@ -54,27 +83,37 @@ fn composed_join_dispatches_the_bound_step_to_the_live_pin() {
     let project = live_var("FLYWHEEL_LIVE_PROJECT");
     let bin = flywheel();
 
-    // The runner's real opencode seat is the only seat with role "opencode",
-    // so a role:opencode step must bind to it.
-    let status = run(&bin, &["swarm", "status", &project, "--json"]);
-    assert!(status.status.success(), "status failed: {}", text(&status));
-    let doc: serde_json::Value = serde_json::from_slice(&status.stdout).expect("status JSON");
-    let seats = doc
-        .get("seats")
-        .and_then(serde_json::Value::as_array)
-        .expect("a seats array");
-    let seat = seats
-        .iter()
-        .find(|s| {
-            json_field(s, "harness").as_deref() == Some("opencode")
-                && json_field(s, "pin").is_some()
-                && json_field(s, "name").is_some()
-        })
-        .unwrap_or_else(|| panic!("the runner must leave one opencode seat: {seats:?}"));
+    // The runner's seats are harness-named ("opencode"/"grok"), which are not
+    // profile catalog entries. Spawn one real coder seat so role:coder is both
+    // a resolvable profile and a live join candidate.
+    let spawned = run(
+        &bin,
+        &[
+            "spawn",
+            &project,
+            "--profile",
+            "coder",
+            "--model",
+            "harness-default",
+            "--escape",
+            "--yes",
+            "--retire-orphans",
+            "--no-focus",
+        ],
+    );
+    assert!(spawned.status.success(), "spawn failed: {}", text(&spawned));
+
+    let _idle = poll(120, || {
+        find_seat(&seats(&bin, &project), "coder")
+            .is_some_and(|s| matches!(json_field(s, "status").as_deref(), Some("idle" | "done")))
+    });
+    let doc = seats(&bin, &project);
+    let seat =
+        find_seat(&doc, "coder").unwrap_or_else(|| panic!("a live coder seat is required: {doc}"));
     let pin = json_field(seat, "pin").expect("pin");
     let name = json_field(seat, "name").expect("name");
 
-    // Real CLI path: compose a role:opencode step, join against live seats, run
+    // Real CLI path: compose a role:coder step, join against live seats, run
     // it with consent. Nothing here calls apply_join_bindings directly.
     let out = run(
         &bin,
@@ -84,7 +123,7 @@ fn composed_join_dispatches_the_bound_step_to_the_live_pin() {
             "compose",
             "bd-sfkm8 live join dispatch",
             "--parts",
-            "role:opencode:ce-work",
+            "role:coder:ce-work",
             "--join",
             "--run",
             "--yes",
@@ -99,7 +138,7 @@ fn composed_join_dispatches_the_bound_step_to_the_live_pin() {
         "the join plan must be printed: {log}"
     );
     assert!(
-        log.contains(&format!("flywheel: dispatch @opencode → {name}")),
-        "bound step must dispatch to the chosen opencode seat {pin}/{name}: {log}"
+        log.contains(&format!("flywheel: dispatch @coder → {name}")),
+        "bound step must dispatch to the chosen coder seat {pin}/{name}: {log}"
     );
 }
