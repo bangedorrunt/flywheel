@@ -103,7 +103,7 @@ jobs:
           echo "$GITHUB_WORKSPACE/beads/target/debug" >> "$GITHUB_PATH"
           echo "$GITHUB_WORKSPACE/toron/target/debug" >> "$GITHUB_PATH"
           which br toron
-      - uses: taiki-e/install-action@f7203e66315af55e5c0f3e20a099b4d9bb5f6bba # v2.62.0
+      - uses: taiki-e/install-action@0e09747a63ae497bf945b3dcaf38fef0050d0109 # v2.62.0
         with: { tool: cargo-nextest }
       - name: Test shard ${{ matrix.shard }}/4
         working-directory: flywheel
