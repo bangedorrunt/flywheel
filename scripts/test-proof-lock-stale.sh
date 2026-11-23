@@ -36,7 +36,12 @@ exit 0
 STUB
 chmod +x "$TMP/bin/fakecargo"
 
-out="$(HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg/config" XDG_STATE_HOME="$TMP/xdg/state" \
+# bd-b3j7x: never inherit the operator's identity or daemon route. The Rust
+# witness also hands us a fake `toron` first on PATH via TestSandbox; assert
+# the red mail went there, never to the live daemon.
+: "${TORON_FAKE_LOG:?bd-b3j7x: run this witness under TestSandbox with a fake toron}"
+out="$(env -u AGENT_NAME -u TORON_MCP_URL \
+  HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg/config" XDG_STATE_HOME="$TMP/xdg/state" \
   XDG_CACHE_HOME="$TMP/xdg/cache" XDG_RUNTIME_DIR="$TMP/xdg/run" \
   CLEAN_PROOF_REPO_ROOT="$REPO" CLEAN_PROOF_LOCK_FILE="$TMP/proof.lock" \
   FAKE_CARGO_LOG="$TMP/cargo.log" MBX_CMD="$TMP/bin/fakecargo" \
@@ -54,5 +59,9 @@ r = json.load(open(sys.argv[1]))
 assert r["ok"] is False, r
 assert r["failed_step"] == "build", r
 PY
-pass "a stale Cargo.lock fails the build step and names Cargo.lock"
+grep -qF 'mail send' "$TORON_FAKE_LOG" \
+  || fail "the red mail never reached the fake toron: $(cat "$TORON_FAKE_LOG")"
+grep -qF '[clean-proof]' "$TORON_FAKE_LOG" \
+  || fail "the fake toron did not see the clean-proof red-row subject: $(cat "$TORON_FAKE_LOG")"
+pass "a stale Cargo.lock fails the build step; red mail went to the fake toron"
 echo "ok"

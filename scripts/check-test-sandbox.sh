@@ -24,6 +24,15 @@ refuse_baseline_entries() {
 
 offends() {
     local file="$1"
+    # bd-b3j7x: a bare bash spawn of a witness that drives clean-proof reaches
+    # the live toron daemon (its red-mail leg). It must go through TestSandbox
+    # so PATH is shimmed and AGENT_NAME/TORON_MCP_URL are cleared.
+    if grep -q 'Command::new("bash")' "$file" \
+        && grep -q 'test-proof-lock-stale.sh' "$file" \
+        && ! grep -q 'TestSandbox\|test_sandbox' "$file"; then
+        echo "test-sandbox: $file spawns a clean-proof witness with bare bash; route it through TestSandbox" >&2
+        return 0
+    fi
     grep -q 'CARGO_BIN_EXE_\(flywheel\|toron\|doorbell\)' "$file" || return 1
     grep -q 'test_sandbox' "$file" && return 1
     echo "test-sandbox: $file spawns a built binary without src/test_sandbox.rs" >&2
@@ -72,6 +81,15 @@ self_test() {
     if offends "$tmp/ok.rs" >/dev/null 2>&1; then ok=no; else ok=yes; fi
     [ "$bad" = yes ] || { echo "self-test: an offender was not caught" >&2; exit 1; }
     [ "$ok" = yes ] || { echo "self-test: a compliant file was refused" >&2; exit 1; }
+
+    # bd-b3j7x: a bare bash witness that drives clean-proof is an offender;
+    # the same witness routed through TestSandbox is not.
+    printf 'Command::new("bash")\n.arg("scripts/test-proof-lock-stale.sh")\n' >"$tmp/bare_bash.rs"
+    printf 'use flywheel_test_sandbox::TestSandbox;\nCommand::new("bash")\n.arg("scripts/test-proof-lock-stale.sh")\n' >"$tmp/sandboxed_bash.rs"
+    if offends "$tmp/bare_bash.rs" >/dev/null 2>&1; then bash_bad=yes; else bash_bad=no; fi
+    if offends "$tmp/sandboxed_bash.rs" >/dev/null 2>&1; then bash_ok=no; else bash_ok=yes; fi
+    [ "$bash_bad" = yes ] || { echo "self-test: a bare clean-proof bash witness was not caught" >&2; exit 1; }
+    [ "$bash_ok" = yes ] || { echo "self-test: a sandboxed clean-proof bash witness was refused" >&2; exit 1; }
 
     # The live_*.rs carve-out, in both directions.
     printf '#[ignore]\n#[test]\nfn f(){ let _ = env!("CARGO_BIN_EXE_flywheel"); }\n// FLYWHEEL_LIVE_E2E\n' >"$tmp/live_ok.rs"

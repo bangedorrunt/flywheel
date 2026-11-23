@@ -2,10 +2,42 @@
 //! `tests/` targets for real, and `verify-mutations.sh` must never edit the tree
 //! it was started from.
 
+use flywheel_test_sandbox::TestSandbox;
 use std::process::Command;
 
 fn root() -> &'static str {
     env!("CARGO_MANIFEST_DIR")
+}
+
+/// bd-b3j7x: every script witness runs under TestSandbox. A fake `toron`
+/// first on PATH records its argv, so clean-proof's red-mail leg can never
+/// reach the live daemon and the witness can assert where the mail went.
+fn sandboxed_bash(root: &str, script: &str) -> Command {
+    let sandbox = Box::leak(Box::new(TestSandbox::new()));
+    let fake = sandbox.bin_dir().join("toron");
+    std::fs::write(
+        &fake,
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "${TORON_FAKE_LOG:?}"
+exit 0
+"#,
+    )
+    .expect("fake toron");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("fake toron mode");
+    }
+    let mut cmd = sandbox.command("bash");
+    cmd.arg(format!("{root}/scripts/{script}"))
+        .current_dir(root)
+        .env("PATH", sandbox.path_env())
+        // Witnesses read the shipped source through FLYWHEEL_SOURCE; the
+        // sandbox's stub src/ exists only to keep an errant install harmless.
+        .env("FLYWHEEL_SOURCE", root)
+        .env("TORON_FAKE_LOG", sandbox.root().join("toron-calls.log"));
+    cmd
 }
 
 /// clean-proof's suite step ran only `--bin flywheel`, so 42 integration test
@@ -135,12 +167,7 @@ fn proof_reservation_board_model_fences_the_grant() {
 /// launchctl. It must run in its own scratch export instead.
 #[test]
 fn proof_verify_mutations_never_edits_the_shared_tree() {
-    let status = Command::new("bash")
-        .arg(format!(
-            "{}/scripts/test-verify-mutations-isolation.sh",
-            root()
-        ))
-        .current_dir(root())
+    let status = sandboxed_bash(root(), "test-verify-mutations-isolation.sh")
         .status()
         .expect("run scripts/test-verify-mutations-isolation.sh");
     assert!(
@@ -154,12 +181,7 @@ fn proof_verify_mutations_never_edits_the_shared_tree() {
 /// turn a flywheel mutant green or unbuildable.
 #[test]
 fn proof_verify_mutations_exports_pinned_siblings() {
-    let status = Command::new("bash")
-        .arg(format!(
-            "{}/scripts/test-verify-mutations-pinned-siblings.sh",
-            root()
-        ))
-        .current_dir(root())
+    let status = sandboxed_bash(root(), "test-verify-mutations-pinned-siblings.sh")
         .status()
         .expect("run scripts/test-verify-mutations-pinned-siblings.sh");
     assert!(
@@ -172,12 +194,7 @@ fn proof_verify_mutations_exports_pinned_siblings() {
 /// its name appears in a passing line beside another test's failure.
 #[test]
 fn proof_verify_mutations_credits_only_the_named_test() {
-    let status = Command::new("bash")
-        .arg(format!(
-            "{}/scripts/test-verify-mutations-expected-test.sh",
-            root()
-        ))
-        .current_dir(root())
+    let status = sandboxed_bash(root(), "test-verify-mutations-expected-test.sh")
         .status()
         .expect("run expected-test witness");
     assert!(status.success(), "expected-test verdict witness failed");
@@ -188,12 +205,7 @@ fn proof_verify_mutations_credits_only_the_named_test() {
 /// witness becomes a no-op that fails for the wrong reason.
 #[test]
 fn proof_verify_mutations_ignores_an_inherited_build_dir() {
-    let status = Command::new("bash")
-        .arg(format!(
-            "{}/scripts/test-verify-mutations-pinned-siblings.sh",
-            root()
-        ))
-        .current_dir(root())
+    let status = sandboxed_bash(root(), "test-verify-mutations-pinned-siblings.sh")
         .env("VERIFY_MUTATIONS_BUILD_DIR", "/tmp/fw-proof-stale/mut-tree")
         .env("VERIFY_MUTATIONS_TARGET_DIR", "/tmp/fw-proof-stale/target")
         .env("VERIFY_MUTATIONS_EXPORT_ROOT", "/tmp/fw-proof-stale/export")
@@ -229,9 +241,7 @@ fn proof_clean_proof_keep_prunes_older_exports() {
 /// both that case and the red-proof case with the real cleanup() in play.
 #[test]
 fn proof_clean_proof_keep_survives_trailing_slash_tmpdir() {
-    let status = Command::new("bash")
-        .arg(format!("{}/scripts/test-clean-proof-keep.sh", root()))
-        .current_dir(root())
+    let status = sandboxed_bash(root(), "test-clean-proof-keep.sh")
         .status()
         .expect("run scripts/test-clean-proof-keep.sh");
     assert!(status.success(), "scripts/test-clean-proof-keep.sh failed");
@@ -242,9 +252,7 @@ fn proof_clean_proof_keep_survives_trailing_slash_tmpdir() {
 /// needle gate must refuse it, and the fixture drives both halves.
 #[test]
 fn proof_verify_needles_refuses_a_dead_test_filter() {
-    let status = Command::new("bash")
-        .arg(format!("{}/scripts/test-verify-needles-filters.sh", root()))
-        .current_dir(root())
+    let status = sandboxed_bash(root(), "test-verify-needles-filters.sh")
         .status()
         .expect("run scripts/test-verify-needles-filters.sh");
     assert!(
@@ -256,12 +264,7 @@ fn proof_verify_needles_refuses_a_dead_test_filter() {
 /// bd-m97cj: a mutation whose expect= is outside TEST_FILTER reads VACUOUS.
 #[test]
 fn proof_verify_needles_refuses_an_unselected_expect() {
-    let out = Command::new("bash")
-        .arg(format!(
-            "{}/scripts/test-verify-needles-expect-filter.sh",
-            root()
-        ))
-        .current_dir(root())
+    let out = sandboxed_bash(root(), "test-verify-needles-expect-filter.sh")
         .output()
         .expect("run scripts/test-verify-needles-expect-filter.sh");
     assert!(
@@ -306,10 +309,8 @@ fn proof_every_gate_leg_denies_warnings() {
 /// NO-RESULTS sent the reader hunting a CARGO_ARGS bug that did not exist.
 #[test]
 fn proof_mutation_harness_classifies_an_abort() {
-    let out = Command::new("bash")
-        .arg(format!("{}/scripts/verify-mutations.sh", root()))
+    let out = sandboxed_bash(root(), "verify-mutations.sh")
         .arg("--self-test")
-        .current_dir(root())
         .output()
         .expect("run the mutation harness self-test");
     let text = format!(
@@ -332,12 +333,7 @@ fn proof_mutation_harness_classifies_an_abort() {
 /// witness cache are all cheap to prove without a full proof run.
 #[test]
 fn proof_mutation_failfast_and_crew_cache() {
-    let status = Command::new("bash")
-        .arg(format!(
-            "{}/scripts/test-proof-mutation-failfast.sh",
-            root()
-        ))
-        .current_dir(root())
+    let status = sandboxed_bash(root(), "test-proof-mutation-failfast.sh")
         .status()
         .expect("run scripts/test-proof-mutation-failfast.sh");
     assert!(status.success(), "proof mutation failfast test failed");
@@ -346,9 +342,7 @@ fn proof_mutation_failfast_and_crew_cache() {
 /// bd-2gxup: a stale committed Cargo.lock fails the proof at the build step.
 #[test]
 fn a_stale_lockfile_fails_the_proof_build_step() {
-    let status = Command::new("bash")
-        .arg(format!("{}/scripts/test-proof-lock-stale.sh", root()))
-        .current_dir(root())
+    let status = sandboxed_bash(root(), "test-proof-lock-stale.sh")
         .status()
         .expect("run scripts/test-proof-lock-stale.sh");
     assert!(status.success(), "stale Cargo.lock witness failed");
@@ -358,9 +352,7 @@ fn a_stale_lockfile_fails_the_proof_build_step() {
 /// must copy it there; both are checkable without a live Claude seat.
 #[test]
 fn proof_claude_plugin_loads_and_installs_to_plugin_dir() {
-    let status = Command::new("bash")
-        .arg(format!("{}/scripts/test-claude-plugin-load.sh", root()))
-        .current_dir(root())
+    let status = sandboxed_bash(root(), "test-claude-plugin-load.sh")
         .status()
         .expect("run scripts/test-claude-plugin-load.sh");
     assert!(status.success(), "claude plugin load test failed");
