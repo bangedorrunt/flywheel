@@ -588,6 +588,16 @@ pub fn doorbell_line_for(class: EventClass, hint: &str, project: &str, pin: &str
     )
 }
 
+/// bd-slt2n: an events-door plugin reads mail with the pin's token, which
+/// commits the pin's cursor. A plain `toron next` is then empty for that mail,
+/// so the wake names an explicit time to read from instead.
+pub fn mail_since_hint(created_us: i64) -> String {
+    let when = chrono::DateTime::from_timestamp_micros(created_us)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default();
+    format!("toron mail inbox --since {when}")
+}
+
 /// Generic line for callers that do not know the reader; `route_or_queue`
 /// and the inbox arms render with [`doorbell_line_for`] instead.
 pub fn doorbell_line(class: EventClass, hint: &str) -> String {
@@ -1432,7 +1442,23 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             };
             let created_us = watch_created_at(line).map(|s| (s as i64).saturating_mul(1_000_000));
             for pin in watch_targets(line, &next.index) {
-                let line_out = doorbell_line_for(class, &hint, &next.project, &pin);
+                let cursor_past = mail
+                    && created_us.is_some_and(|us| {
+                        next.toron_cursor.get(&pin).is_some_and(|t| {
+                            toron_read_is_fresh(t, (us / 1_000_000).max(0) as u64)
+                                && t.cursor_us.is_some_and(|c| us <= c)
+                        })
+                    });
+                let line_out = if next.events_door_pins.contains(&pin) && cursor_past {
+                    doorbell_line_for(
+                        class,
+                        &mail_since_hint(created_us.expect("cursor_past implies a time")),
+                        &next.project,
+                        &pin,
+                    )
+                } else {
+                    doorbell_line_for(class, &hint, &next.project, &pin)
+                };
                 // bd-yc6jf: the pull cursor is the one notion of consumed. A
                 // mail event at or below it was already pulled by toron next —
                 // no wake for an empty inbox. Ack-SLA and other urgent kinds
@@ -2122,6 +2148,47 @@ mod tests {
                 |a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "already-pulled")
             ),
             "no already-pulled audit for an events-door pin: {actions:?}"
+        );
+    }
+
+    /// bd-slt2n: after a plugin-style cursor read, `toron next` is empty for
+    /// this mail. The wake must name an explicit time to read from.
+    #[test]
+    fn events_door_cursor_read_carries_an_explicit_read_command() {
+        let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut index = SelfIndex::default();
+        index.insert_pin("BlueRidge".into(), Some(npub.into()));
+        let watch = format!(
+            r#"{{"kind":9,"id":"wake-since-1","pubkey":"senderpk","created_at":1700000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-since-1"]],"content":"mail"}}"#
+        );
+        let mut model = DoorbellModel {
+            index,
+            statuses: [("BlueRidge".into(), "idle".into())].into(),
+            ..Default::default()
+        };
+        model.toron_cursor.insert(
+            "BlueRidge".into(),
+            ToronRead {
+                cursor_us: Some(1_700_000_000_000_000),
+                read_at_secs: 1_700_000_000,
+            },
+        );
+        model.events_door_pins.insert("BlueRidge".into());
+        let (_, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: watch });
+        let line = actions
+            .iter()
+            .find_map(|a| match a {
+                DoorbellAction::Prompt { line, .. } => Some(line.as_str()),
+                _ => None,
+            })
+            .expect("the idle pane gets a wake");
+        assert!(
+            line.contains("toron mail inbox --since"),
+            "the wake must name a read that still shows the mail: {line}"
+        );
+        assert!(
+            !line.contains("Read it with: toron next"),
+            "`toron next` is empty after a plugin cursor read: {line}"
         );
     }
 
