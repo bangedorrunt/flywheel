@@ -41,6 +41,27 @@ fn opencode_api(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// bd-live-wake-pane-isolation: clear the operator line even when an assertion
+/// fails, so this leg cannot leave a half-typed line for another live leg.
+struct TypedLineCleanup<'a> {
+    session: &'a str,
+    block: &'a str,
+}
+impl Drop for TypedLineCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = Command::new("rex")
+            .args([
+                "send-key",
+                "-s",
+                self.session,
+                "--block",
+                self.block,
+                "ctrl+u",
+            ])
+            .output();
+    }
+}
+
 fn rex_out(args: &[&str]) -> String {
     let out = Command::new("rex")
         .args(args)
@@ -67,8 +88,14 @@ fn live_opencode_wake_lands_via_api_without_touching_operator_text() {
     let session_id = live_var("FLYWHEEL_LIVE_SESSION");
     let block = live_var("FLYWHEEL_LIVE_BLOCK");
 
-    let operator_text = "OPERATOR-TEXT-DO-NOT-TOUCH-7b0f888z";
+    // Short on purpose: a TUI input box horizontally scrolls a long paste, so
+    // a full-length marker can be present on the pane yet absent from capture.
+    let operator_text = "OT-7b0f";
     rex_out(&["send", "-s", &session_id, "-b", &block, "--", operator_text]);
+    let _typed = TypedLineCleanup {
+        session: &session_id,
+        block: &block,
+    };
     let before = rex_out(&["capture", "-s", &session_id, "-b", &block]);
     assert!(
         before.contains(operator_text),

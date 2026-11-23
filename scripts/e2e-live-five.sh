@@ -182,6 +182,7 @@ fi
 
 PLANE_SESSION=""
 SPAWNED_PIN=""
+WAKE_PIN=""
 # bd-833ya: spawn installs a per-project doorbell supervisor. Retiring the
 # seats alone leaves the project registered, and the next stack install boots
 # that supervisor back up. Drop both the registration and the unit.
@@ -207,6 +208,9 @@ cleanup() {
     # swallowed by `|| true`), leaving registry rows and a live session.
     if [ -n "$SPAWNED_PIN" ] && [ "$KEEP" = 0 ]; then
         "$FLYWHEEL_BIN" retire "$SPAWNED_PIN" --project e2e-live-five --force-working >/dev/null 2>&1 || true
+    fi
+    if [ -n "$WAKE_PIN" ] && [ "$KEEP" = 0 ]; then
+        "$FLYWHEEL_BIN" retire "$WAKE_PIN" --project e2e-live-five --force-working >/dev/null 2>&1 || true
     fi
     if [ "$KEEP" = 0 ]; then
         retire_throwaway_project "$PROJECT"
@@ -286,7 +290,11 @@ export TORON_BIN
 # bd-znczi/rrlo2: a grok seat rides the no-door events pump; spawn it in the
 # SAME command so its registry row and token exist before the doorbell arms the
 # pump (the pump reads the registry once at daemon start).
-spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --gk 1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
+# bd-live-wake-pane-isolation: two opencode seats in the SAME spawn/session —
+# the guard leg and the wake leg must never share a pane. A second spawn with
+# --retire-orphans would close the first seat's workspace, so they are spawned
+# together and separated by pin (grok is for the no-door events witness).
+spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 2 --gk 1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
     || die "flywheel spawn failed: $spawn_out"
 seated="$(FLYWHEEL_BIN="$FLYWHEEL_BIN" "$PYTHON_BIN" - <<'PY'
 import json, os, subprocess
@@ -294,16 +302,20 @@ doc = json.loads(subprocess.check_output([
     os.environ["FLYWHEEL_BIN"], "swarm", "status", "e2e-live-five", "--json"
 ], text=True))
 rows = doc.get("seats", doc if isinstance(doc, list) else [])
-for r in rows:
-    if r.get("pin") and r.get("pane_id"):
-        print(f"{r['pin']}\t{r['pane_id']}")
-        break
+oc = [r for r in rows if str(r.get("harness", "")).lower() == "opencode" and r.get("pin") and r.get("pane_id")]
+if len(oc) < 2:
+    raise SystemExit(f"need two live opencode seats, got {len(oc)}")
+for r in oc[:2]:
+    print(f"{r['pin']}\t{r['pane_id']}")
 PY
-)" || die "cannot read the spawned seat from swarm status"
-SPAWNED_PIN="${seated%%$'\t'*}"
-SPAWNED_PANE="${seated##*$'\t'}"
+)" || die "cannot read the two opencode seats from swarm status"
+SPAWNED_PIN="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f1)"
+SPAWNED_PANE="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f2)"
+WAKE_PIN="$(printf '%s\n' "$seated" | sed -n '2p' | cut -f1)"
+WAKE_PANE="$(printf '%s\n' "$seated" | sed -n '2p' | cut -f2)"
 SPAWNED_SESSION="$(printf '%s\n' "$spawn_out" | sed -nE 's/.*(session:[^ ]+) created.*/\1/p' | head -1)"
 [ -n "$SPAWNED_PIN" ] || die "swarm status named no pin"
+[ -n "$WAKE_PIN" ] || die "swarm status named no wake-leg pin"
 [ -n "$SPAWNED_SESSION" ] || die "spawn did not name its workspace session"
 
 # bd-znczi: the events witness needs a NO-DOOR seat — only those get a daemon
@@ -353,11 +365,16 @@ passed=0
 failed=0
 for t in "${TESTS[@]}"; do
     log="/tmp/e2e-live-five-$STAMP-$(basename "$t" .rs).log"
-    if [ "$t" = "tests/live_doorbell_operator_guard.rs" ] || [ "$t" = "tests/live_opencode_api_wake.rs" ]; then
+    if [ "$t" = "tests/live_doorbell_operator_guard.rs" ]; then
         export FLYWHEEL_LIVE_SESSION="$SPAWNED_SESSION"
         export FLYWHEEL_LIVE_PIN="$SPAWNED_PIN"
         export FLYWHEEL_LIVE_BLOCK="$SPAWNED_PANE"
         export FLYWHEEL_LIVE_AS="$SPAWNED_PIN"
+    elif [ "$t" = "tests/live_opencode_api_wake.rs" ]; then
+        export FLYWHEEL_LIVE_SESSION="$SPAWNED_SESSION"
+        export FLYWHEEL_LIVE_PIN="$WAKE_PIN"
+        export FLYWHEEL_LIVE_BLOCK="$WAKE_PANE"
+        export FLYWHEEL_LIVE_AS="$WAKE_PIN"
     else
         export FLYWHEEL_LIVE_SESSION="$SESSION_ID"
         export FLYWHEEL_LIVE_PIN="$PIN"

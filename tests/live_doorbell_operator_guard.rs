@@ -54,6 +54,21 @@ fn rex(args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// bd-live-guard-target-readiness: is the NAMED pin idle/done? A whole-project
+/// substring check answers for the fleet, not for the pane this leg types into.
+pub fn pin_idle(status_json: &str, pin: &str) -> Option<bool> {
+    let doc: serde_json::Value = serde_json::from_str(status_json).ok()?;
+    let row = doc
+        .get("seats")?
+        .as_array()?
+        .iter()
+        .find(|r| r.get("pin").and_then(serde_json::Value::as_str) == Some(pin))?;
+    Some(matches!(
+        row.get("status").and_then(serde_json::Value::as_str),
+        Some("idle" | "done")
+    ))
+}
+
 /// bd-oo7zi: the live leg exercises `src/cmd/send.rs`'s door
 /// (`pane_read::defer_if_operator_typing`) against a REAL screen, addressed by
 /// pane id, which is a documented `--to` form. It deliberately skips pin -> pane
@@ -62,19 +77,19 @@ fn rex(args: &[&str]) -> String {
 /// tests, and a rex block id is not a mail recipient.
 /// A real harness pane can drift back to `working` between the two probes;
 /// wait for idle before either send so the status gate is not what we test.
-fn wait_idle(project: &str) {
+fn wait_idle(project: &str, pin: &str) {
     for _ in 0..24 {
         let out = Command::new(env!("CARGO_BIN_EXE_flywheel"))
             .args(["swarm", "status", project, "--json"])
             .output()
             .expect("flywheel swarm status");
         let body = String::from_utf8_lossy(&out.stdout);
-        if body.contains("\"status\": \"idle\"") || body.contains("\"status\": \"done\"") {
+        if pin_idle(&body, pin) == Some(true) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_secs(5));
     }
-    panic!("the e2e pane never became idle: {project}");
+    panic!("the target pin {pin} never became idle in {project}");
 }
 
 /// Resolve the throwaway block's concrete id from rex's block list, matching
@@ -157,6 +172,27 @@ fn pane_capture(session: &str, block_id: &str) -> String {
     rex(&["capture", "-s", session, "-b", block_id])
 }
 
+/// bd-live-guard-target-readiness: a failed assertion must not leave a
+/// half-typed line for the next live leg sharing this pane.
+struct TypedLineCleanup<'a> {
+    session: &'a str,
+    block: &'a str,
+}
+impl Drop for TypedLineCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = Command::new("rex")
+            .args([
+                "send-key",
+                "-s",
+                self.session,
+                "--block",
+                self.block,
+                "ctrl+u",
+            ])
+            .output();
+    }
+}
+
 fn send_probe_with(
     bin: &std::path::Path,
     pane: &str,
@@ -206,10 +242,14 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
         &block_id,
         "half typed line",
     ]);
+    let _typed = TypedLineCleanup {
+        session: &session,
+        block: &block_id,
+    };
     std::thread::sleep(std::time::Duration::from_millis(800));
 
     // 2. The send door must DEFER — nothing is typed into their line.
-    wait_idle(&project);
+    wait_idle(&project, &pin);
     let deferred = send_probe(&pin, &project, "live probe: deferral");
     let text = format!(
         "{}{}",
@@ -250,7 +290,7 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
     // 3. Clear the line (ctrl+u) and the same send lands.
     rex(&["send-key", "-s", &session, "--block", &block_id, "ctrl+u"]);
     std::thread::sleep(std::time::Duration::from_millis(800));
-    wait_idle(&project);
+    wait_idle(&project, &pin);
     let landed = send_probe(&pin, &project, "live probe: ring");
     let text = format!(
         "{}{}",
@@ -284,7 +324,23 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
 
 #[cfg(test)]
 mod send_door_tests {
-    use super::{assert_send_target, resolve_block_id, send_probe_with};
+    use super::{assert_send_target, pin_idle, resolve_block_id, send_probe_with};
+
+    /// bd-live-guard-target-readiness: a working target and an idle OTHER seat
+    /// must NOT make the target ready. The old whole-project substring check
+    /// answered true here and let the leg type into a busy pane.
+    #[test]
+    fn readiness_targets_the_named_pin_not_any_seat() {
+        let two_seat = r#"{"seats":[
+            {"pin":"Target","status":"working"},
+            {"pin":"Other","status":"idle"}]}"#;
+        assert_eq!(pin_idle(two_seat, "Target"), Some(false));
+        assert_eq!(pin_idle(two_seat, "Other"), Some(true));
+        assert_eq!(pin_idle(two_seat, "Missing"), None);
+        assert_eq!(pin_idle("not json", "Target"), None);
+        let done = r#"{"seats":[{"pin":"Target","status":"done"}]}"#;
+        assert_eq!(pin_idle(done, "Target"), Some(true));
+    }
 
     /// bd-0kxzw: the capture target must resolve to exactly one live block; a
     /// stale label or duplicate must fail before any text is typed.
