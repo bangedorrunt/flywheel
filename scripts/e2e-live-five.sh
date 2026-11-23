@@ -202,7 +202,9 @@ retire_throwaway_project() { # project
     fi
 }
 cleanup() {
-    [ -n "${EXPORT_ROOT:-}" ] && rm -rf "$EXPORT_ROOT"
+    # bd-t38jb: FLYWHEEL_BIN normally lives INSIDE the export. Deleting the
+    # export first made every teardown verb below "command not found" (all
+    # swallowed by `|| true`), leaving registry rows and a live session.
     if [ -n "$SPAWNED_PIN" ] && [ "$KEEP" = 0 ]; then
         "$FLYWHEEL_BIN" retire "$SPAWNED_PIN" --project e2e-live-five --force-working >/dev/null 2>&1 || true
     fi
@@ -212,6 +214,7 @@ cleanup() {
     if [ -n "$PLANE_SESSION" ] && [ "$KEEP" = 0 ]; then
         "$REX_BIN" kill "$PLANE_SESSION" >/dev/null 2>&1 || true
     fi
+    [ -n "${EXPORT_ROOT:-}" ] && rm -rf "$EXPORT_ROOT"
 }
 trap cleanup EXIT INT TERM HUP
 
