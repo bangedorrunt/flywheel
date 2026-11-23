@@ -377,8 +377,10 @@ impl CoalitionStore {
 
         let rt = runtime()?;
         let invocation = rt.block_on(async {
-            let engine = toron_workflow::WorkflowEngine::local_with(
+            let engine = toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
                 crate::profile::ProfileCatalog::catalog_profile_resolver(),
+                std::sync::Arc::new(crate::workflow_catalog::subworkflow_resolver(None)),
+                Some(crate::cron::recording_runner()),
             )?;
             engine.invoke(&run_id, wf.clone(), json!({})).await
         });
@@ -1578,10 +1580,9 @@ mod tests {
 trigger:
   type: webhook
 steps:
-  - name: dispatch
-    action: dispatch_job
-    assignee: x
-    spec: { task: "must fail without a runner" }
+  - name: child
+    action: call_workflow
+    workflow: coalition-missing-child
     on_error: fail_run
 "#,
         )
@@ -2450,6 +2451,44 @@ steps:
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// bd-yf465: form must give the goal engine a job sink. Force the BUILTIN
+    /// ce-compound (the ambient user-tier copy has only a continue-on-error
+    /// dispatch step and masks a missing sink); its failing-on-error reflect
+    /// step makes form refuse unless dispatch_job can run.
+    #[test]
+    fn form_builtin_goal_with_dispatch_steps_needs_a_job_sink() {
+        let _home = crate::config::test_state_home();
+        let prev_config = std::env::var_os("XDG_CONFIG_HOME");
+        let empty_config =
+            std::env::temp_dir().join(format!("fw-coal-empty-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&empty_config).expect("empty config dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &empty_config) };
+
+        let root =
+            std::env::temp_dir().join(format!("fw-coal-builtin-goal-{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        let store = CoalitionStore::open_at("coal-builtin-goal", root.clone(), data.clone())
+            .expect("open hermetic store");
+        store.register_agent("oc").expect("register oc");
+        store
+            .form(
+                "ce-compound",
+                "oc",
+                &["oc".into()],
+                &BTreeMap::new(),
+                &[],
+                None,
+            )
+            .expect("the builtin goal has a job sink and completes");
+
+        match prev_config {
+            Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&empty_config);
     }
 
     /// proof78 flake: `form()` writes a run log under `config::state_dir()`.
