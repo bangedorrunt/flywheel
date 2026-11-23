@@ -134,6 +134,8 @@ pub struct TestStateHome {
     prev_toron_mcp_data: Option<std::ffi::OsString>,
     prev_br_bin: Option<std::ffi::OsString>,
     prev_path: Option<std::ffi::OsString>,
+    prev_agent: Option<std::ffi::OsString>,
+    prev_pane: Option<std::ffi::OsString>,
 }
 
 #[cfg(test)]
@@ -148,6 +150,8 @@ impl Drop for TestStateHome {
         restore_env("TORON_MCP_DATA_DIR", self.prev_toron_mcp_data.take());
         restore_env("FLYWHEEL_BR_BIN", self.prev_br_bin.take());
         restore_env("PATH", self.prev_path.take());
+        restore_env("AGENT_NAME", self.prev_agent.take());
+        restore_env("FLYWHEEL_PANE", self.prev_pane.take());
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -188,6 +192,8 @@ pub fn test_state_home() -> TestStateHome {
     // its test; resolving it later is Os NotFound. Hermetic per guard.
     let prev_br_bin = std::env::var_os("FLYWHEEL_BR_BIN");
     let prev_path = std::env::var_os("PATH");
+    let prev_agent = std::env::var_os("AGENT_NAME");
+    let prev_pane = std::env::var_os("FLYWHEEL_PANE");
     // A leaked store root from a sibling must not redirect this test.
     // NOTE: the in-process mailbox is a process-global OnceLock; a per-guard
     // root would delete its store between tests. Tests that need isolation
@@ -196,6 +202,10 @@ pub fn test_state_home() -> TestStateHome {
         std::env::remove_var("TORON_DATA_DIR");
         std::env::remove_var("TORON_MCP_DATA_DIR");
         std::env::remove_var("FLYWHEEL_BR_BIN");
+        // Identity and pane state decide who may bounce the fleet. A sibling
+        // that leaked either must not turn an operator shell into a crew pane.
+        std::env::remove_var("AGENT_NAME");
+        std::env::remove_var("FLYWHEEL_PANE");
         std::env::set_var("XDG_STATE_HOME", &dir);
     }
     TestStateHome {
@@ -207,6 +217,8 @@ pub fn test_state_home() -> TestStateHome {
         prev_toron_mcp_data,
         prev_br_bin,
         prev_path,
+        prev_agent,
+        prev_pane,
     }
 }
 
@@ -1592,6 +1604,8 @@ daily = [
                     prev_toron_mcp_data: std::env::var_os("TORON_MCP_DATA_DIR"),
                     prev_br_bin: std::env::var_os("FLYWHEEL_BR_BIN"),
                     prev_path: std::env::var_os("PATH"),
+                    prev_agent: std::env::var_os("AGENT_NAME"),
+                    prev_pane: std::env::var_os("FLYWHEEL_PANE"),
                 };
                 assert_eq!(
                     std::env::var_os("XDG_STATE_HOME").as_deref(),

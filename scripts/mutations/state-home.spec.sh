@@ -14,10 +14,12 @@ TEST_FILTER=(config::tests::)
 
 mutation "M1  constructor stops pinning XDG_STATE_HOME" \
   file=src/config.rs \
-  find='        std::env::remove_var("FLYWHEEL_BR_BIN");
+  find='        std::env::remove_var("AGENT_NAME");
+        std::env::remove_var("FLYWHEEL_PANE");
         std::env::set_var("XDG_STATE_HOME", &dir);
     }' \
-  replace='        std::env::remove_var("FLYWHEEL_BR_BIN");
+  replace='        std::env::remove_var("AGENT_NAME");
+        std::env::remove_var("FLYWHEEL_PANE");
     }' \
   expect=lock_env_pins_a_private_hermetic_state_dir
 
