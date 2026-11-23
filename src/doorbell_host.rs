@@ -474,6 +474,18 @@ impl RtHost {
         brain_tx: mpsc::Sender<BrainMsg>,
     ) -> anyhow::Result<Self> {
         let mut model = workspace::WorkspaceModel::from_environment();
+        // bd-slt2n: an events-door plugin can move toron's read cursor without
+        // showing the mail to the agent. Record those pins so the fold rings
+        // an idle pane even when the cursor has passed the mail.
+        model.doorbell.events_door_pins = state::load_spawn_registry(project)
+            .into_iter()
+            .filter_map(|entry| {
+                let pin = entry.mail_identity?;
+                let harness =
+                    crate::harness_registry::canonical(entry.harness.as_deref().unwrap_or(""));
+                matches!(harness.as_str(), "opencode" | "pi").then_some(pin)
+            })
+            .collect();
         if let Some(pin) = state::load_captain_alias(project) {
             model.roles.insert("captain".into(), pin);
         }

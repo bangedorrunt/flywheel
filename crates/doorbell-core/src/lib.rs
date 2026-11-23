@@ -1140,6 +1140,12 @@ pub struct DoorbellModel {
     /// (bd-ba4nl). Kept for the legacy `already_pulled` helper.
     #[serde(default)]
     pub pulled_us: BTreeMap<String, i64>,
+    /// Pins whose harness reads mail over its own events door (opencode/pi).
+    /// Their plugin can advance toron's read cursor without putting the mail
+    /// in front of the agent, so a cursor below this pin does NOT mean the
+    /// agent saw the mail: an idle pane still gets rung (bd-slt2n).
+    #[serde(default)]
+    pub events_door_pins: std::collections::BTreeSet<String>,
     /// Pins with an unanswered toron-cursor read (bd-yc6jf): a burst of
     /// mail for one of these parks without a second ask.
     #[serde(default)]
@@ -1168,6 +1174,12 @@ pub fn already_pulled(pulled_us: &BTreeMap<String, i64>, pin: &str, created_us: 
 /// never dropped by a pull cursor.
 #[must_use]
 pub fn mail_consumed(model: &DoorbellModel, pin: &str, created_us: Option<i64>) -> bool {
+    // bd-slt2n: an events-door plugin reads mail with the pin's token and
+    // advances toron's cursor without showing it to the agent. A cursor read
+    // is not proof the agent saw the mail; ring toward delivery instead.
+    if model.events_door_pins.contains(pin) {
+        return false;
+    }
     let Some(us) = created_us else {
         return false;
     };
@@ -1431,7 +1443,10 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 // bd-cursor-reask: a decide-only re-fold never parks — the
                 // answer in hand is the freshest possible read, so it
                 // decides by max(host, toron) even when stale.
-                if mail && let Some(us) = created_us {
+                if mail
+                    && let Some(us) = created_us
+                    && !next.events_door_pins.contains(&pin)
+                {
                     let created_secs = (us / 1_000_000).max(0) as u64;
                     let fresh = next
                         .toron_cursor
@@ -1755,6 +1770,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                     if wake
                         .created_us
                         .is_some_and(|us| cursor_us.is_some_and(|cursor| us <= cursor))
+                        && !next.events_door_pins.contains(pin)
                     {
                         actions.push(DoorbellAction::Audit {
                             kind: "already-pulled".into(),
@@ -2016,6 +2032,46 @@ mod tests {
                 |a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "already-pulled")
             ),
             "the skipped wake is audited, never silent"
+        );
+    }
+
+    /// bd-slt2n: the opencode plugin reads mail with the pin's token, which
+    /// moves toron's cursor without putting the mail in front of the agent.
+    /// Feed exactly that log shape: cursor past the mail, pin has an events
+    /// door. The idle pane must still get a wake line.
+    #[test]
+    fn events_door_cursor_read_still_rings_the_idle_pane() {
+        let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        let mut index = SelfIndex::default();
+        index.insert_pin("BlueRidge".into(), Some(npub.into()));
+        let watch = format!(
+            r#"{{"kind":9,"id":"wake-door-1","pubkey":"senderpk","created_at":1700000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-door-1"]],"content":"mail"}}"#
+        );
+        let mut model = DoorbellModel {
+            index,
+            statuses: [("BlueRidge".into(), "idle".into())].into(),
+            ..Default::default()
+        };
+        model.toron_cursor.insert(
+            "BlueRidge".into(),
+            ToronRead {
+                cursor_us: Some(1_700_000_000_000_000),
+                read_at_secs: 1_700_000_000,
+            },
+        );
+        model.events_door_pins.insert("BlueRidge".into());
+        let (_, actions) = tick(&model, &DoorbellMsg::WatchNdjson { line: watch });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
+            "a plugin's cursor read is not the agent seeing the mail: {actions:?}"
+        );
+        assert!(
+            !actions.iter().any(
+                |a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "already-pulled")
+            ),
+            "no already-pulled audit for an events-door pin: {actions:?}"
         );
     }
 
