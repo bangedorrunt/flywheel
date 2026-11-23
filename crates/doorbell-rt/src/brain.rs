@@ -654,37 +654,55 @@ impl<H: Host> Brain<H> {
     /// deliver. Shared by the watch hook and `dispatch` so the decision is
     /// journaled with the same value on replay either way.
     async fn on_toron_cursor(&mut self, pin: String, cursor_us: Option<i64>, read_at_secs: u64) {
-        let effects = self.host.tick(&BrainMsg::ToronCursor {
-            pin: pin.clone(),
-            cursor_us,
-            read_at_secs,
-        });
-        self.journal(
-            &serde_json::json!({"rt_kind": "ToronCursor"}),
-            &effects,
-            serde_json::json!({"stage": "answered"}),
-            std::slice::from_ref(&pin),
-        );
-        // bd-cursor-reask: a re-ask here would have nowhere to go (deliver
-        // only routes Digest/Prompt), so make it loud instead of dropping
-        // it. Unreachable by construction — the fold never parks a
-        // decide-only re-fold — but a silent drop wedged the pin once.
-        if effects
-            .iter()
-            .any(|e| matches!(e, Effect::ReadToronCursor { .. }))
-        {
-            self.audit("toron-cursor-ask-dropped", serde_json::json!({"pin": pin}));
+        // bd-cursor-reask-dropped-15ail: an answer can itself emit a re-ask
+        // (a second mail landing after the read was taken). Execute it
+        // through the same reader as the watch hook — deliver only routes
+        // Digest/Prompt, so dropping the effect wedged the pin behind
+        // cursor_inflight forever. Bound at two rounds so a broken reader
+        // cannot spin, and make the cut-off loud.
+        let mut answer = Some((pin, cursor_us, read_at_secs));
+        let mut rounds = 0u8;
+        while let Some((answer_pin, cursor_us, read_at_secs)) = answer.take() {
+            rounds += 1;
+            let effects = self.host.tick(&BrainMsg::ToronCursor {
+                pin: answer_pin.clone(),
+                cursor_us,
+                read_at_secs,
+            });
+            self.journal(
+                &serde_json::json!({"rt_kind": "ToronCursor"}),
+                &effects,
+                serde_json::json!({"stage": "answered"}),
+                std::slice::from_ref(&answer_pin),
+            );
+            self.deliver(effects.clone(), "toron-cursor").await;
+            answer = self
+                .answer_cursor_reads(&effects)
+                .into_iter()
+                .find_map(|msg| match msg {
+                    BrainMsg::ToronCursor {
+                        pin,
+                        cursor_us,
+                        read_at_secs,
+                    } => Some((pin, cursor_us, read_at_secs)),
+                    _ => None,
+                });
+            if answer.is_some() && rounds >= 2 {
+                self.audit(
+                    "toron-cursor-ask-dropped",
+                    serde_json::json!({"pin": answer_pin, "reason": "bounded"}),
+                );
+                answer = None;
+            }
         }
-        self.deliver(effects, "toron-cursor").await;
     }
 
     /// bd-cursor-reask: run the interpreter for every toron-cursor ask in
     /// these effects and build each answer as a ToronCursor message. The
     /// caller feeds answers to on_toron_cursor. Synchronous: reading the
     /// cursor never awaits, so answering can never recurse the dispatch
-    /// loop. Used by the watch hook; on_toron_cursor never calls this —
-    /// the fold never parks a decide-only re-fold, so an answer cannot
-    /// ask again (a stray ask there is a loud audit, never a silent drop).
+    /// loop. Used by the watch hook and by on_toron_cursor's bounded re-ask
+    /// loop; a third re-ask is cut off loud, never silently dropped.
     fn answer_cursor_reads(&self, effects: &[Effect]) -> Vec<BrainMsg> {
         effects
             .iter()
@@ -2879,15 +2897,13 @@ mod tests {
         );
     }
 
-    /// bd-cursor-reask: a re-ask emitted while answering has nowhere to go
-    /// (deliver only routes Digest/Prompt), so it is journaled as a loud
-    /// miss instead of being silently dropped. Unreachable by construction
-    /// — the fold never parks a decide-only re-fold — but the wedge it
-    /// would re-open suppressed a pin forever.
+    /// bd-cursor-reask-dropped-15ail: a re-ask emitted while answering must
+    /// be executed through the same reader as the watch hook, not dropped.
+    /// Dropping it left the pin parked with cursor_inflight set forever.
     #[tokio::test]
-    async fn toron_cursor_reask_while_answering_is_a_loud_miss() {
+    async fn toron_cursor_reask_while_answering_is_executed() {
         let (mut brain, _rx, _tx) = test_brain(
-            "toron-cursor-loud",
+            "toron-cursor-reask",
             vec![vec![Effect::ReadToronCursor {
                 pin: "BlueRidge".into(),
             }]],
@@ -2895,10 +2911,55 @@ mod tests {
         brain
             .on_toron_cursor("BlueRidge".into(), Some(0), 1_700_000_000)
             .await;
+        assert_eq!(
+            brain.host.tick_log.len(),
+            2,
+            "the answer re-tick must answer the re-ask: {:?}",
+            brain.host.tick_log
+        );
+        assert!(
+            brain.host.tick_log[1].contains("ToronCursor"),
+            "the re-ask re-enters as a ToronCursor answer: {:?}",
+            brain.host.tick_log
+        );
+        let audit = std::fs::read_to_string(brain.store.audit_file("w")).unwrap_or_default();
+        assert!(
+            !audit.contains("toron-cursor-ask-dropped"),
+            "an executed re-ask is not a loud drop: {audit}"
+        );
+    }
+
+    /// bd-cursor-reask-dropped-15ail: a broken reader that re-asks on every
+    /// answer is bounded, and the cut-off is loud rather than an endless loop.
+    #[tokio::test]
+    async fn toron_cursor_reask_loop_is_bounded_and_loud() {
+        let (mut brain, _rx, _tx) = test_brain(
+            "toron-cursor-reask-bound",
+            vec![
+                vec![Effect::ReadToronCursor {
+                    pin: "BlueRidge".into(),
+                }],
+                vec![Effect::ReadToronCursor {
+                    pin: "BlueRidge".into(),
+                }],
+                vec![Effect::ReadToronCursor {
+                    pin: "BlueRidge".into(),
+                }],
+            ],
+        );
+        brain
+            .on_toron_cursor("BlueRidge".into(), Some(0), 1_700_000_000)
+            .await;
+        assert_eq!(
+            brain.host.tick_log.len(),
+            2,
+            "two answer rounds, then the bound cuts the loop: {:?}",
+            brain.host.tick_log
+        );
         let audit = std::fs::read_to_string(brain.store.audit_file("w")).unwrap_or_default();
         assert!(
             audit.contains("toron-cursor-ask-dropped"),
-            "a dropped ask is loud, never silent: {audit}"
+            "the cut-off is a loud miss: {audit}"
         );
     }
 
@@ -3167,6 +3228,61 @@ mod tests {
                 Effect::Audit { kind, .. } if kind == "toron-cursor-unavailable"
             )),
             "the timeout ring is loud: {recent:?}"
+        );
+    }
+
+    /// bd-cursor-reask-dropped-15ail: the skew case through the production
+    /// dispatch with the REAL core and a fake clock. A future-dated mail
+    /// parks and asks once; the stale answer (host clock >5s behind the
+    /// event) rings it and never emits a second ask for anything to drop.
+    #[tokio::test]
+    async fn host_skew_mail_rings_once_without_a_second_ask() {
+        let now = 1_700_000_000u64;
+        let mut brain = drain_brain(now, Some(0), "skew");
+        let npub = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+        brain
+            .host
+            .model
+            .index
+            .insert_pin("BlueRidge".into(), Some(npub.to_string()));
+        brain
+            .host
+            .model
+            .statuses
+            .insert("BlueRidge".into(), "idle".into());
+        let watch = format!(
+            r#"{{"kind":9,"id":"wake-skew-host-1","pubkey":"senderpk","created_at":1800000000,"tags":[["p","{npub}"],["t","flywheel"],["h","thread-1"],["toron-kind","mail-delivered"],["thread","thread-1"],["importance","normal"],["from","SlateHarbor"],["mid","msg-skew-host-1"]],"content":"mail"}}"#
+        );
+        let from = brain.host.effects.len();
+        brain.dispatch(BrainMsg::Watch(watch)).await;
+        let recent = brain.host.recent(from);
+        assert_eq!(
+            recent
+                .iter()
+                .filter(|e| matches!(e, Effect::ReadToronCursor { .. }))
+                .count(),
+            1,
+            "one ask per burst, even under skew: {recent:?}"
+        );
+        assert_eq!(
+            recent
+                .iter()
+                .filter(|e| matches!(e, Effect::Prompt { pin, .. } if pin == "BlueRidge"))
+                .count(),
+            1,
+            "the stale answer rings the pinned mail exactly once: {recent:?}"
+        );
+        let toron_ticks = brain
+            .host
+            .effects
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i >= from)
+            .count();
+        assert!(
+            toron_ticks >= 2,
+            "ask and answer both re-tick the real core: {} ticks",
+            toron_ticks
         );
     }
 
