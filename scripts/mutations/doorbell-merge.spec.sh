@@ -25,8 +25,8 @@ mutation "W1  routine mail is dropped at parse again" \
 mutation "W2  the composed ring names only its head" \
     file=$CORE \
     expect=a_peer_wake_never_hides_a_captain_brief \
-    find='    format!("{head} + {}. {pull}", rest.join(" + "))' \
-    replace='    format!("{head}. {pull}")'
+    find='    format!("{head} + {}. {door}", rest.join(" + "))' \
+    replace='    format!("{head}. {door}")'
 
 mutation "W3  a peer line outranks the captain brief" \
     file=$CORE \

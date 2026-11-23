@@ -646,11 +646,6 @@ mod tests {
         );
     }
 
-    /// bd-idle-done-wake-not-delivered-gnjok: a tasked wake typed into an
-    /// IDLE or DONE pane must carry the exact read command. `toron next`
-    /// requires --project and --as; a bare word is a usage error, so an agent
-    /// that follows it never reads the mail and the doorbell calls it deaf.
-    /// This folds through the same program the live workspace uses.
     #[test]
     fn doorbell_wake_delivery_idle_line_names_the_read_command() {
         let cmds = fold_tasked_mail_at("idle");

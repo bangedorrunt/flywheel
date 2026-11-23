@@ -570,42 +570,28 @@ pub fn parse_rfc3339_micros(ts: &str) -> Result<i64, chrono::ParseError> {
     chrono::DateTime::parse_from_rfc3339(ts).map(|dt| dt.timestamp_micros())
 }
 
-/// One agent-facing wake line (bd-ofa1s). All text comes from `agent_text`.
-pub fn doorbell_line(class: EventClass, hint: &str) -> String {
+/// Render one agent-facing wake for its reader. `toron next` cannot read a
+/// mailbox without --project and --as, so the read door is rendered here,
+/// once, for both immediate and queued wakes.
+pub fn doorbell_line_for(class: EventClass, hint: &str, project: &str, pin: &str) -> String {
     if class == EventClass::P2p {
-        return p2p_line_from_hint(hint);
+        return p2p_line_from_hint(hint, project, pin);
     }
     agent_text::render(
         class,
         &agent_text::WakeCtx {
             command: hint,
+            project,
+            recipient: pin,
             ..Default::default()
         },
     )
 }
 
-/// Stamp the exact read door onto a rendered wake that only says
-/// `toron next` (bd-idle-done-wake-not-delivered-gnjok). `doorbell_line`
-/// renders generically because it has no reader; the one funnel that does —
-/// `route_or_queue` — owns the flags before ANY prompt, digest or queued
-/// line is emitted. `toron next` requires both flags, so a bare word made
-/// idle/done crews miss every tasked wake.
-pub fn with_read_flags(line: String, project: &str, pin: &str) -> String {
-    if project.is_empty() || pin.is_empty() {
-        return line;
-    }
-    const GENERIC: &str = "Read it with: toron next";
-    let Some(at) = line.find(GENERIC) else {
-        return line;
-    };
-    let tail = &line[at + GENERIC.len()..];
-    if tail.starts_with(" --project") || tail.starts_with(" --as") {
-        return line;
-    }
-    format!(
-        "{}{GENERIC} --project {project} --as {pin}{tail}",
-        &line[..at]
-    )
+/// Generic line for callers that do not know the reader; `route_or_queue`
+/// and the inbox arms render with [`doorbell_line_for`] instead.
+pub fn doorbell_line(class: EventClass, hint: &str) -> String {
+    doorbell_line_for(class, hint, "", "")
 }
 
 /// The hint that marks a system notice: a `PlanePMail` line carrying it is
@@ -705,34 +691,34 @@ pub fn composed_ring(queue: &[QueuedWake]) -> String {
     // Most urgent class first: a captain-side wake is never hidden behind a
     // peer or machine line.
     by_kind.sort_by_key(|w| std::cmp::Reverse(w.kind));
-    let head = by_kind[0]
-        .line
-        .split(". Read it with:")
-        .next()
-        .unwrap_or(&by_kind[0].line)
-        .trim_end()
-        .to_string();
+    // The read door comes from the rendered line, never rebuilt here: the
+    // renderer is the only place that knows how to name a reader.
+    let (head, door) = match by_kind[0].line.split_once(". Read it with: ") {
+        Some((head, tail)) => {
+            let command = tail.split_once(". Reply with:").map_or(tail, |(c, _)| c);
+            (
+                head.trim_end().to_string(),
+                format!("Read it with: {command}"),
+            )
+        }
+        None => (by_kind[0].line.clone(), String::new()),
+    };
     let rest: Vec<String> = by_kind
         .iter()
         .skip(1)
         .map(|w| format!("{} {}", w.count, w.kind.label()))
         .collect();
-    let lead = by_kind[0];
-    let project = if lead.project.is_empty() {
-        "<project>"
-    } else {
-        &lead.project
-    };
-    let pin = if lead.pin.is_empty() {
-        "<pin>"
-    } else {
-        &lead.pin
-    };
-    let pull = format!("Read it with: toron next --project {project} --as {pin}");
-    if rest.is_empty() {
-        return format!("{head}. {pull}");
+    if door.is_empty() {
+        return if rest.is_empty() {
+            head
+        } else {
+            format!("{head} + {}", rest.join(" + "))
+        };
     }
-    format!("{head} + {}. {pull}", rest.join(" + "))
+    if rest.is_empty() {
+        return format!("{head}. {door}");
+    }
+    format!("{head} + {}. {door}", rest.join(" + "))
 }
 
 /// The separator `parse_inbox_item` uses to carry a peer directive's verb,
@@ -741,7 +727,7 @@ pub const P2P_HINT_SEP: char = '\u{1f}';
 
 /// The peer line a `p2p:` mail rings: the same shape the CLI types, minus the
 /// mail watermark (the doorbell has no cursor for the recipient).
-pub fn p2p_line_from_hint(hint: &str) -> String {
+pub fn p2p_line_from_hint(hint: &str, project: &str, pin: &str) -> String {
     let mut parts = hint.split(P2P_HINT_SEP);
     match (parts.next(), parts.next(), parts.next()) {
         (Some(verb), Some(sender), Some(path)) => agent_text::render(
@@ -750,10 +736,18 @@ pub fn p2p_line_from_hint(hint: &str) -> String {
                 sender,
                 path,
                 command: verb,
+                project,
+                recipient: pin,
+            },
+        ),
+        _ => agent_text::render(
+            EventClass::P2p,
+            &agent_text::WakeCtx {
+                project,
+                recipient: pin,
                 ..Default::default()
             },
         ),
-        _ => agent_text::render(EventClass::P2p, &agent_text::WakeCtx::default()),
     }
 }
 
@@ -1420,9 +1414,9 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             } else {
                 (event_id.clone(), None)
             };
-            let line_out = doorbell_line(class, &hint);
             let created_us = watch_created_at(line).map(|s| (s as i64).saturating_mul(1_000_000));
             for pin in watch_targets(line, &next.index) {
+                let line_out = doorbell_line_for(class, &hint, &next.project, &pin);
                 // bd-yc6jf: the pull cursor is the one notion of consumed. A
                 // mail event at or below it was already pulled by toron next —
                 // no wake for an empty inbox. Ack-SLA and other urgent kinds
@@ -1522,7 +1516,12 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
             // A gap is ONE digest wake, never a prompt storm (U8).
             actions.push(DoorbellAction::Digest {
                 pin: pin.clone(),
-                line: doorbell_line(EventClass::PlanePMail, "events may have been missed"),
+                line: doorbell_line_for(
+                    EventClass::PlanePMail,
+                    "events may have been missed",
+                    &next.project,
+                    pin,
+                ),
                 why: "events-gap".into(),
             });
         }
@@ -1539,7 +1538,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 let Some((class, hint)) = parse_inbox_item(item) else {
                     continue;
                 };
-                let line_out = doorbell_line(class, &hint);
+                let line_out = doorbell_line_for(class, &hint, &next.project, pin);
                 let key = row_key(item, &line_out);
                 let thread = row_thread(item);
                 let created_us = row_created_us(item);
@@ -1570,7 +1569,7 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 let Some((class, hint)) = parse_inbox_item(item) else {
                     continue;
                 };
-                let line_out = doorbell_line(class, &hint);
+                let line_out = doorbell_line_for(class, &hint, &next.project, pin);
                 let key = row_key(item, &line_out);
                 let thread = row_thread(item);
                 let created_us = row_created_us(item);
@@ -1826,10 +1825,6 @@ fn route_or_queue(
         .get(pin)
         .map(String::as_str)
         .unwrap_or("unknown");
-    // bd-idle-done-wake-not-delivered-gnjok: the immediate-inject path never
-    // passes through composed_ring, so stamp the reader here. A queued wake
-    // gets the same door in its line, and composed_ring re-forms its own.
-    let line = with_read_flags(line, &project, pin);
     if !key.is_empty() && next.rung.contains(&key) {
         actions.push(DoorbellAction::Audit {
             kind: "already_rung".into(),
@@ -2557,15 +2552,20 @@ mod tests {
         let mut model = model_with("BlueRidge");
         model.project = "flywheel".into();
         model.statuses.insert("BlueRidge".into(), "working".into());
-        let line = "[wake] mail. toron next";
+        let line = super::doorbell_line_for(
+            EventClass::PlanePMail,
+            "toron next",
+            &model.project,
+            "BlueRidge",
+        );
         let mut actions = Vec::new();
         route_or_queue(
             &mut model,
             &mut actions,
             "BlueRidge",
-            wake_key(line),
+            wake_key(&line),
             None,
-            line.to_string(),
+            line,
             None,
             None,
         );
@@ -3022,7 +3022,7 @@ mod tests {
             DoorbellAction::Prompt { pin, line, .. } => {
                 assert_eq!(pin, "BlueRidge");
                 assert_eq!(
-                    line, "wake B. Read it with: toron next --project <project> --as <pin>",
+                    line, "wake B",
                     "one composed ring, and the NEWEST line of the class wins: a \
                      correction replaces the brief it corrects (bd-0uzrq.1)"
                 );
@@ -3471,9 +3471,19 @@ mod tests {
         );
 
         // The CLI's handoff for ONE of them has no id: it folds onto the text.
+        let handoff = super::doorbell_line_for(
+            EventClass::PlanePMail,
+            "toron next",
+            &model.project,
+            "BlueRidge",
+        );
         let (next, actions) = tick(
             &next,
-            &DoorbellMsg::PromptRefused { pin: "BlueRidge".into(), line: "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".into(), event_id: None },
+            &DoorbellMsg::PromptRefused {
+                pin: "BlueRidge".into(),
+                line: handoff,
+                event_id: None,
+            },
         );
         assert!(
             matches!(&actions[0], DoorbellAction::Audit { kind, .. } if kind == "dedup"),

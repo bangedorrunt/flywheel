@@ -169,8 +169,16 @@ pub fn render(class: EventClass, ctx: &WakeCtx<'_>) -> String {
 }
 
 /// A short digest line for a class that is folded, not paged immediately.
-pub fn digest(label: &str) -> String {
-    format!("{WAKE_PREFIX} {label}. Read it with: toron next")
+pub fn digest(label: &str, project: &str, recipient: &str) -> String {
+    format!(
+        "{WAKE_PREFIX} {label}. {}",
+        pull(&WakeCtx {
+            command: "toron next",
+            project,
+            recipient,
+            ..Default::default()
+        })
+    )
 }
 
 /// Classify a rendered line by its plain-English lead, never by jargon tokens.
@@ -250,7 +258,7 @@ pub fn golden_strings() -> Vec<String> {
     ]
     .into_iter()
     .map(|c| render(c, &ctx))
-    .chain([digest("system notice")])
+    .chain([digest("system notice", ctx.project, ctx.recipient)])
     .collect()
 }
 
@@ -302,6 +310,16 @@ mod tests {
         assert!(lines[4].contains("a request to release src/peer.rs"));
         assert!(lines[5].contains("a file reservation conflict on src/peer.rs"));
         assert!(lines[6].contains("src/peer.rs") && lines[6].contains("a request"));
+    }
+
+    #[test]
+    fn every_rendered_wake_names_its_read_command_flags() {
+        for line in golden_strings() {
+            assert!(
+                line.contains("--project flywheel") && line.contains("--as SlateHarbor"),
+                "the read door must work without guessing the reader: {line}"
+            );
+        }
     }
 
     /// bd-v7ucf: a holder mail is not a wake class — it has its own golden
