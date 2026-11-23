@@ -5709,12 +5709,15 @@ mod adr0013_spawn_effect_tests {
             } => (name, inputs, crew, execute, mode, project),
             _ => panic!("approved steer must run the goal delegate"),
         };
-        assert_eq!(name, "goal-direct");
+        assert_eq!(name, "ce-lfg");
         assert!(execute);
         assert_eq!(mode, "pane");
         assert_eq!(project.as_deref(), Some("flywheel"));
         assert_eq!(crew, None, "absent crew stays absent, never \"-\"");
-        assert!(inputs.unwrap_or_default().contains("\"objective\":\"o\""));
+        let inputs = inputs.unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(&inputs).expect("inputs JSON");
+        assert_eq!(parsed["objective"], "o");
+        assert_eq!(parsed["direct"], true);
     }
 
     /// bd-4fgc: the steer door is effectful (a MaterialContext fact plus a

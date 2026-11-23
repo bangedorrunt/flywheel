@@ -442,12 +442,26 @@ mod tests {
     /// Contract-passing reports per phase — the fake leaf every linked
     /// built-in dispatch lands on. The plan report PRE-injects dep_cycles=0
     /// so the test does not depend on a live `br` tracker.
-    fn report_runner() -> toron_workflow::engine::EffectRunner {
-        Arc::new(|inv: &toron_workflow::engine::ActionInvocation| {
+    fn phase_workflow(phase: &str) -> toron_workflow::schema::Workflow {
+        let yaml = format!(
+            "name: {phase}\nsteps:\n  - name: phase-{phase}\n    action: dispatch_job\n    assignee: x\n    spec:\n      phase: {phase}\n      profile: '@coder'\n      task: 'report for {phase}'\n"
+        );
+        serde_yaml::from_str(&yaml).expect("phase fixture parses")
+    }
+
+    fn report_runner(
+        fail_phase: Option<&'static str>,
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> toron_workflow::engine::EffectRunner {
+        Arc::new(move |inv: &toron_workflow::engine::ActionInvocation| {
             let phase = match &inv.action {
                 Action::DispatchJob { spec, .. } => spec.phase.clone().unwrap_or_default(),
                 _ => String::new(),
             };
+            calls.lock().unwrap().push(phase.clone());
+            if fail_phase == Some(phase.as_str()) {
+                return Ok(json!({ "evidence": "forced bad report" }));
+            }
             Ok(match phase.as_str() {
                 "resolve" => json!({
                     "target": "t", "non_goals": ["n"],
@@ -488,21 +502,26 @@ mod tests {
         // The merged ce-lfg replaced the old ship workflow; keep the gated
         // chain contract with a synthetic linear ship shape.
         let ship: toron_workflow::schema::Workflow = serde_yaml::from_str(
-            "name: ship\nsteps:\n  - name: resolve\n    action: call_workflow\n    workflow: ce-lfg\n    inputs: {}\n  - name: plan\n    action: call_workflow\n    workflow: ce-debug\n    inputs: {}\n  - name: implement\n    action: call_workflow\n    workflow: ce-lfg\n    inputs: {}\n  - name: review\n    action: call_workflow\n    workflow: ce-review\n    inputs: {}\n  - name: verify\n    action: call_workflow\n    workflow: ce-compound\n    inputs: {}\n",
+            "name: ship\nsteps:\n  - name: resolve\n    action: call_workflow\n    workflow: resolve\n    inputs: {}\n  - name: plan\n    action: call_workflow\n    workflow: plan\n    inputs: {}\n  - name: implement\n    action: call_workflow\n    workflow: implement\n    inputs: {}\n  - name: review\n    action: call_workflow\n    workflow: review\n    inputs: {}\n  - name: verify\n    action: call_workflow\n    workflow: verify\n    inputs: {}\n",
         )
         .expect("synthetic ship shape parses");
         let goal_direct = wfs.get("ce-lfg").expect("ce-lfg builtin").clone();
         let resolver: toron_workflow::WorkflowResolver = Arc::new(|n| {
-            crate::builtin_workflows::builtin_workflows()
-                .get(n)
-                .cloned()
+            if ["resolve", "plan", "implement", "review", "verify"].contains(&n) {
+                Some(phase_workflow(n))
+            } else {
+                crate::builtin_workflows::builtin_workflows()
+                    .get(n)
+                    .cloned()
+            }
         });
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let rt = tokio::runtime::Runtime::new().expect("rt");
         let _enter = rt.enter();
         let engine = toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
             crate::profile::ProfileCatalog::catalog_profile_resolver(),
             resolver.clone(),
-            Some(report_runner()),
+            Some(report_runner(None, calls.clone())),
         )
         .expect("local engine");
         let tmp = sandbox.root().to_path_buf();
@@ -529,21 +548,50 @@ mod tests {
             .expect("chain must not park")
             .expect("gated chain completes")
         });
-        assert!(
-            matches!(out["status"].as_str(), Some("completed" | "gate-warnings")),
-            "{out}"
-        );
+        assert_eq!(out["status"], "completed", "all reports pass: {out}");
         let gates = out["gates"].as_array().expect("gates array");
         assert_eq!(gates.len(), 5, "one gate per link: {gates:?}");
         assert!(
-            gates.iter().all(|g| g["ok"].is_boolean()),
-            "every §4.5 gate rendered a verdict: {gates:?}"
+            gates.iter().all(|g| g["ok"] == json!(true)),
+            "every §4.5 gate passed: {gates:?}"
         );
         let links: Vec<&str> = gates.iter().filter_map(|g| g["link"].as_str()).collect();
         assert_eq!(
             links,
             vec!["resolve", "plan", "implement", "review", "verify"]
         );
+
+        // A failing phase report must block the chain AT that gate, so a
+        // gate that always passes cannot satisfy this assertion.
+        unsafe { std::env::set_var("FLYWHEEL_SHIP_GATE_MODE", "block") };
+        let fail_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine_fail = toron_workflow::WorkflowEngine::local_with_resolvers_and_effect(
+            crate::profile::ProfileCatalog::catalog_profile_resolver(),
+            resolver.clone(),
+            Some(report_runner(Some("review"), fail_calls.clone())),
+        )
+        .expect("blocking engine");
+        let blocked = rt
+            .block_on(invoke_or_ship_chain(
+                &engine_fail,
+                &resolver,
+                &tmp,
+                "bd-cvv9-test",
+                &format!("bd-cvv9-block-{nanos}"),
+                "ship",
+                &ship,
+                json!({ "objective": "o", "data_shape": "d", "gate": "true" }),
+            ))
+            .expect_err("a failing gate blocks the chain");
+        assert!(
+            blocked.to_string().contains("blocked at link review"),
+            "chain stops at the failing gate: {blocked}"
+        );
+        assert!(
+            !fail_calls.lock().unwrap().iter().any(|p| p == "verify"),
+            "links after the failing gate never run"
+        );
+        unsafe { std::env::remove_var("FLYWHEEL_SHIP_GATE_MODE") };
 
         let out2 = rt.block_on(async {
             tokio::time::timeout(

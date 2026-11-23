@@ -5334,7 +5334,7 @@ mod steer_engine_tests {
     /// engine.invoke door; steer must never grow a second execution path.
     #[test]
     fn steer_targets_durable_run_arm() {
-        for (direct, expected) in [(true, "goal-direct"), (false, "goal")] {
+        for (direct, expected) in [(true, "ce-lfg"), (false, "ce-lfg")] {
             let cmd = steer_run_cmd(
                 "fix the flake",
                 direct,
@@ -5359,7 +5359,11 @@ mod steer_engine_tests {
                 panic!("expected a Run command");
             };
             assert_eq!(name, expected);
-            assert_eq!(inputs.as_deref(), Some(r#"{"objective":"fix the flake"}"#));
+            let parsed: serde_json::Value =
+                serde_json::from_str(inputs.as_deref().expect("inputs present"))
+                    .expect("inputs JSON");
+            assert_eq!(parsed["objective"], "fix the flake");
+            assert_eq!(parsed["direct"], direct);
             assert!(execute, "steer must execute, not record");
             assert_eq!(mode, "pane");
             assert!(!allow_worktree);
@@ -5414,8 +5418,11 @@ mod steer_engine_tests {
         else {
             panic!("expected a Run command");
         };
-        assert_eq!(name, "goal");
-        assert_eq!(inputs.as_deref(), Some(r#"{"objective":"fix the flake"}"#));
+        assert_eq!(name, "ce-lfg");
+        let parsed: serde_json::Value =
+            serde_json::from_str(inputs.as_deref().expect("inputs present")).expect("inputs JSON");
+        assert_eq!(parsed["objective"], "fix the flake");
+        assert_eq!(parsed["direct"], false);
         assert!(execute);
         assert_eq!(mode, "pane");
         assert!(!json);
@@ -5458,8 +5465,8 @@ mod steer_engine_tests {
             !workflow_briefs(false, false, Some("build"), true, true),
             "explicit --crew skips"
         );
-        let steer_ctx = steer_briefing_context("fix the flake", "goal").expect("steer ctx");
-        let wf_ctx = workflow_briefing_context("goal", Some(r#"{"objective":"fix the flake"}"#))
+        let steer_ctx = steer_briefing_context("fix the flake", "ce-lfg").expect("steer ctx");
+        let wf_ctx = workflow_briefing_context("ce-lfg", Some(r#"{"objective":"fix the flake"}"#))
             .expect("workflow ctx");
         assert_eq!(steer_ctx.source, "steer");
         assert_eq!(wf_ctx.source, "workflow");
@@ -5476,14 +5483,14 @@ mod steer_engine_tests {
     #[test]
     fn tier_pick_briefing_context_carries_tier() {
         let premium_ctx =
-            steer_briefing_context("plan the security migration with a perf budget", "goal")
+            steer_briefing_context("plan the security migration with a perf budget", "ce-lfg")
                 .expect("steer ctx");
         assert_eq!(
             premium_ctx.tier_suggestion.as_deref(),
             Some("@premium"),
             "frontier objective suggests the premium band"
         );
-        let plain_ctx = steer_briefing_context("fix the flake", "goal").expect("steer ctx");
+        let plain_ctx = steer_briefing_context("fix the flake", "ce-lfg").expect("steer ctx");
         assert_eq!(
             plain_ctx.tier_suggestion, None,
             "generic objective renders no tier suggestion"
@@ -5504,8 +5511,9 @@ mod steer_engine_tests {
             clock: Arc::new(crate::authority::SystemClock),
             monotonic: Arc::new(crate::authority::SystemMonotonicClock::default()),
         };
-        let mut ctx = steer_briefing_context("fix the borrow checker error in cargo build", "goal")
-            .expect("steer ctx");
+        let mut ctx =
+            steer_briefing_context("fix the borrow checker error in cargo build", "ce-lfg")
+                .expect("steer ctx");
         assert_eq!(
             ctx.profile_suggestion.as_deref(),
             Some("@rust-coder"),
@@ -5529,14 +5537,14 @@ mod steer_engine_tests {
     #[test]
     fn profile_pick_briefing_context_carries_suggestion() {
         let rust_ctx =
-            steer_briefing_context("fix the borrow checker error in cargo build", "goal")
+            steer_briefing_context("fix the borrow checker error in cargo build", "ce-lfg")
                 .expect("steer ctx");
         assert_eq!(
             rust_ctx.profile_suggestion.as_deref(),
             Some("@rust-coder"),
             "rust objective suggests rust-coder"
         );
-        let plain_ctx = steer_briefing_context("fix the flake", "goal").expect("steer ctx");
+        let plain_ctx = steer_briefing_context("fix the flake", "ce-lfg").expect("steer ctx");
         assert_eq!(
             plain_ctx.profile_suggestion, None,
             "generic objective renders no suggestion"
@@ -20107,8 +20115,10 @@ fn steer_run_cmd(
     role_model: &[String],
     role_harness: &[String],
 ) -> WorkflowCmd {
-    let wf_name = if direct { "goal-direct" } else { "goal" };
-    let inputs = serde_json::json!({ "objective": objective });
+    // bd-ihiqo.5: goal/goal-direct merged into ce-lfg; `direct` is now an
+    // input on that workflow, not a separate workflow name.
+    let wf_name = "ce-lfg";
+    let inputs = serde_json::json!({ "objective": objective, "direct": direct });
     WorkflowCmd::Run {
         name: wf_name.to_string(),
         inputs: Some(inputs.to_string()),
@@ -22459,16 +22469,6 @@ mod repair_recipe_tests {
                 .is_some_and(|task| task.contains("VERIFY")),
             "{name} carries the verification contract"
         );
-    }
-
-    #[ignore = "ce-debug has no ledger_path input; awaiting captain ruling on this property"]
-    #[test]
-    fn repair_recipe_ledger_path_is_used() {
-        let wf = crate::builtin_workflows::builtin_recipe("repair-until-verified").expect("recipe");
-        let has_ledger_input = wf.inputs.iter().any(|i| i.name == "ledger_path");
-        assert!(has_ledger_input, "ledger_path input must exist");
-        let has_ledger_in_task = format!("{:?}", wf.steps).contains("ledger_path");
-        assert!(has_ledger_in_task);
     }
 }
 

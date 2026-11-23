@@ -11,6 +11,7 @@ TEST_FILTER=(
     stage_contract_seed_phases_complete
     dispatch_resolves_effort_stage_over_profile
     ce_lfg_wave_exit_refuses_while_open
+    ship_routes_through_the_gated_chain_goal_direct_stays_plain
     statechart_report_fails_on_an_orphan_and_a_trap
     stage_contract_list_filters
 )
@@ -62,3 +63,9 @@ mutation "E6  stage list --phase ignores the phase" \
     expect=stage_contract_list_filters \
     find='        .filter(|r| r.phase.as_deref() == Some(phase))' \
     replace='        .filter(|_| true)'
+
+mutation "E7  a ship gate always passes" \
+    file=src/phase_chain.rs \
+    expect=ship_routes_through_the_gated_chain_goal_direct_stays_plain \
+    find='        let gate_ok = verdict.ok && evaluation_path.is_some();' \
+    replace='        let gate_ok = true;'
