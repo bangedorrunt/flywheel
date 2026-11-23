@@ -309,7 +309,7 @@ for r in rows:
         print(f"{r['pin']}\t{r['pane_id']}\t{str(r.get('harness', '')).lower()}")
 PY
 )" || die "cannot read the spawned seats from swarm status"
-    [ "$(printf '%s\n' "$seated" | grep -c .)" -ge 2 ] && break
+    printf '%s\n' "$seated" | grep -q $'\topencode' && break
     sleep 5
 done
 SPAWNED_PIN="$(printf '%s\n' "$seated" | grep $'\topencode' | head -1 | cut -f1)"
