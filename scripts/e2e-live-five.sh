@@ -182,6 +182,7 @@ fi
 
 PLANE_SESSION=""
 SPAWNED_PIN=""
+PI_PIN=""
 GROK_PIN=""
 # bd-833ya: spawn installs a per-project doorbell supervisor. Retiring the
 # seats alone leaves the project registered, and the next stack install boots
@@ -209,8 +210,8 @@ cleanup() {
     if [ -n "$SPAWNED_PIN" ] && [ "$KEEP" = 0 ]; then
         "$FLYWHEEL_BIN" retire "$SPAWNED_PIN" --project e2e-live-five --force-working >/dev/null 2>&1 || true
     fi
-    if [ -n "$GROK_PIN" ] && [ "$KEEP" = 0 ]; then
-        "$FLYWHEEL_BIN" retire "$GROK_PIN" --project e2e-live-five --force-working >/dev/null 2>&1 || true
+    if [ -n "$PI_PIN" ] && [ "$KEEP" = 0 ]; then
+        "$FLYWHEEL_BIN" retire "$PI_PIN" --project e2e-live-five --force-working >/dev/null 2>&1 || true
     fi
     if [ "$KEEP" = 0 ]; then
         retire_throwaway_project "$PROJECT"
@@ -290,10 +291,10 @@ export TORON_BIN
 # bd-znczi/rrlo2: a grok seat rides the no-door events pump; spawn it in the
 # SAME command so its registry row and token exist before the doorbell arms the
 # pump (the pump reads the registry once at daemon start).
-# bd-oo7zi: the operator-typing guard needs a REAL harness pane. bd-znczi/rrlo2:
-# a grok seat rides the no-door events pump and gives the guard its OWN pane —
-# the wake leg must never type into the box another leg is probing.
-spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --gk 1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
+# bd-oo7zi: the operator-typing guard needs a REAL harness pane. bd-live-wake-
+# pane-isolation: it gets its own pi pane, never the wake leg's opencode pane.
+# grok stays only for the no-door events witness (one seat, no extra API use).
+spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --pi 1 --gk 1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
     || die "flywheel spawn failed: $spawn_out"
 seated=""
 for _seat_ready in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do
@@ -313,8 +314,11 @@ PY
 done
 SPAWNED_PIN="$(printf '%s\n' "$seated" | grep $'\topencode' | head -1 | cut -f1)"
 SPAWNED_PANE="$(printf '%s\n' "$seated" | grep $'\topencode' | head -1 | cut -f2)"
+PI_PIN="$(printf '%s\n' "$seated" | grep $'\tpi' | head -1 | cut -f1)"
+PI_PANE="$(printf '%s\n' "$seated" | grep $'\tpi' | head -1 | cut -f2)"
 SPAWNED_SESSION="$(printf '%s\n' "$spawn_out" | sed -nE 's/.*(session:[^ ]+) created.*/\1/p' | head -1)"
 [ -n "$SPAWNED_PIN" ] || die "swarm status named no opencode pin"
+[ -n "$PI_PIN" ] || die "swarm status named no pi pin"
 [ -n "$SPAWNED_SESSION" ] || die "spawn did not name its workspace session"
 
 # bd-znczi: the events witness needs a NO-DOOR seat — only those get a daemon
@@ -370,9 +374,9 @@ for t in "${TESTS[@]}"; do
     log="/tmp/e2e-live-five-$STAMP-$(basename "$t" .rs).log"
     if [ "$t" = "tests/live_doorbell_operator_guard.rs" ]; then
         export FLYWHEEL_LIVE_SESSION="$SPAWNED_SESSION"
-        export FLYWHEEL_LIVE_PIN="$GROK_PIN"
-        export FLYWHEEL_LIVE_BLOCK="$GROK_PANE"
-        export FLYWHEEL_LIVE_AS="$GROK_PIN"
+        export FLYWHEEL_LIVE_PIN="$PI_PIN"
+        export FLYWHEEL_LIVE_BLOCK="$PI_PANE"
+        export FLYWHEEL_LIVE_AS="$PI_PIN"
     elif [ "$t" = "tests/live_opencode_api_wake.rs" ]; then
         export FLYWHEEL_LIVE_SESSION="$SPAWNED_SESSION"
         export FLYWHEEL_LIVE_PIN="$SPAWNED_PIN"
