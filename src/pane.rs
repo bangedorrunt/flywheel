@@ -5615,7 +5615,7 @@ mod tests {
                 assignee: "x".into(),
                 spec: toron_workflow::schema::DispatchSpec {
                     profile: Some("@coder".into()),
-                    stage: Some("ce-execute".into()),
+                    stage: Some("ce-work".into()),
                     ..Default::default()
                 },
                 channel: None,
@@ -5644,7 +5644,7 @@ mod tests {
                 step: "execute".into(),
                 role: "coder".into(),
                 pin: Some("Bravo".into()),
-                stage: Some("ce-execute".into()),
+                stage: Some("ce-work".into()),
                 spawn: false,
                 wait: false,
             }],
@@ -5716,7 +5716,7 @@ mod tests {
                     assignee: "x".into(),
                     spec: toron_workflow::schema::DispatchSpec {
                         profile: Some("@coder".into()),
-                        stage: Some("ce-execute".into()),
+                        stage: Some("ce-work".into()),
                         ..Default::default()
                     },
                     channel: None,
@@ -5768,7 +5768,7 @@ mod tests {
         )
         .expect("the bound step must reach the runner");
         assert_eq!(
-            out["step"], "ce-execute",
+            out["step"], "ce-work",
             "the stage must reach the runner: {out}"
         );
         let (agent, prompt) = seen.into_inner().expect("the prompt port ran");

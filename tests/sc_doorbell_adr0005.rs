@@ -342,12 +342,11 @@ fn sc_d4_peer_aware_command_attaches() {
 /// SC-D5: digest first line is dispatcher liveness; stale lock reloads.
 #[test]
 fn sc_d5_digest_and_stale_lock_named() {
-    let yaml = read("src/builtin_workflows.rs");
-    assert!(
-        yaml.contains("is the dispatcher up"),
-        "awareness-digest names dispatcher liveness"
-    );
     let src = read("src/doorbell.rs");
+    assert!(
+        src.contains("dispatcher: up") && src.contains("dispatcher: down"),
+        "the digest's first line must name dispatcher liveness"
+    );
     assert!(src.contains("dispatcher_status_line"));
     assert!(src.contains("LockAction::Reloaded"));
 }
