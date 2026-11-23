@@ -196,7 +196,7 @@ const BUG_FIX_ARGV: &[&str] = &[
     "run",
     "ce-debug",
     "--inputs",
-    r#"{"symptom":"the leak","repro":"exit 1","verify":"cargo test --offline --bin flywheel bug_fix_recipe"}"#,
+    r#"{"symptom":"the leak","repro":"exit 1","verify":"true"}"#,
     "--json",
 ];
 
@@ -234,6 +234,29 @@ fn bug_fix_cli_control_flow_reports_all_nodes() {
     assert_eq!(output["repro"]["action"], "dispatch_job", "repro action");
     assert!(output["fix"].is_object(), "fix output present: {v}");
     assert_eq!(output["prove"]["action"], "dispatch_job", "prove action");
+}
+
+/// bd-ihiqo.5: the repair loop must stop on the FIRST passing verify, not burn
+/// every `max_iterations` round. A guard-less loop runs all 3 fix rounds and
+/// exhausts `max`, so this fails if the `until` is removed.
+#[test]
+fn ce_debug_loop_exits_on_first_passing_verify() {
+    let _env = spawn_lock();
+    let roots = HermeticRoots::new();
+    let out = roots.cmd(BUG_FIX_ARGV).output().expect("workflow run");
+    assert!(
+        out.status.success(),
+        "loop run must exit 0: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json stdout");
+    let repair = &v["output"]["repair"];
+    assert_eq!(
+        repair["stopped"], "until",
+        "loop exits through the guard: {v}"
+    );
+    assert_eq!(repair["iterations"], 1, "one fix round, not max: {v}");
+    assert_eq!(v["output"]["verify"]["ok"], true, "verify reported ok: {v}");
 }
 
 /// Hermeticity, as an executable assertion (bd-hcfk).

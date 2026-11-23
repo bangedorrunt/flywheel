@@ -3218,8 +3218,12 @@ pub fn local_engine(
     profile: toron_workflow::ProfileResolver,
     workflow: toron_workflow::WorkflowResolver,
 ) -> Result<toron_workflow::WorkflowEngine> {
-    let recording_runner: toron_workflow::engine::EffectRunner =
-        std::sync::Arc::new(|inv| Ok(json!({ "action": inv.action.type_name() })));
+    let recording_runner: toron_workflow::engine::EffectRunner = std::sync::Arc::new(|inv| {
+        if inv.action.type_name() == "verify" {
+            return Ok(json!({ "ok": true, "exit": 0, "recorded": true }));
+        }
+        Ok(json!({ "action": inv.action.type_name() }))
+    });
     local_engine_with_journal(
         rt,
         runner,
