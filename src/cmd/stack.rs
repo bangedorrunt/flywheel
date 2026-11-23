@@ -345,7 +345,7 @@ fn binary_json(binary: &BinaryProbe) -> Value {
 /// the scan stays testable; the live wiring below feeds both halves.
 /// Rows for harnesses without an events door never count as tokenless —
 /// they ride the doorbell by design.
-fn tokenless_events_seats(
+pub(crate) fn tokenless_events_seats(
     rows: &[(String, String, String)],
     token_pins: &std::collections::HashSet<String>,
 ) -> Vec<(String, String, String)> {
@@ -362,7 +362,7 @@ fn tokenless_events_seats(
 /// file on disk. A seat is tokenless when its pin names no token file —
 /// matched by pin, never by project slug, so registry-key spellings
 /// cannot manufacture a false missing.
-fn events_seats_and_tokens() -> (
+pub(crate) fn events_seats_and_tokens() -> (
     Vec<(String, String, String)>,
     std::collections::HashSet<String>,
 ) {

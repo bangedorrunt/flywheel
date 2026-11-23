@@ -162,6 +162,56 @@ fn jobs_probe() -> (Probe, Vec<String>) {
     (probe, failed)
 }
 
+fn doorbell_probe() -> Probe {
+    let state_dir = crate::config::state_dir();
+    let projects = super::stack::events_seats_and_tokens()
+        .0
+        .iter()
+        .map(|(project, _, _)| project.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut detail = Vec::new();
+    let mut down = Vec::new();
+    for project in projects {
+        let state = crate::doorbell::dispatcher_token_for_project(&state_dir, &project);
+        detail.push(format!("{project}={state}"));
+        if state != "up" {
+            down.push(project);
+        }
+    }
+    if detail.is_empty() {
+        detail.push("no seated projects".into());
+    }
+    Probe {
+        name: "doorbell",
+        ok: down.is_empty(),
+        detail: detail.join("; "),
+        fix: "flywheel doorbell start <project> (or stack doctor --fix)".into(),
+    }
+}
+
+fn events_probe() -> Probe {
+    let (seats, tokens) = super::stack::events_seats_and_tokens();
+    let tokenless = super::stack::tokenless_events_seats(&seats, &tokens);
+    let ok = tokenless.is_empty();
+    Probe {
+        name: "events",
+        ok,
+        detail: if ok {
+            format!("{} events-door seats armed", seats.len())
+        } else {
+            format!(
+                "tokenless seats: {}",
+                tokenless
+                    .iter()
+                    .map(|(p, pin, _)| format!("{p}/{pin}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        },
+        fix: "flywheel stack install --operator (mints seat event tokens)".into(),
+    }
+}
+
 fn toron_probe(cfg: &Config) -> Probe {
     let addr = toron_addr(cfg);
     let ok = toron_reachable(&addr);
@@ -179,6 +229,8 @@ pub(crate) fn cmd_stack_doctor(cfg: &Config, json: bool, fix: bool) -> Result<()
     let (jobs, failed_jobs) = jobs_probe();
     probes.push(jobs);
     probes.push(toron_probe(cfg));
+    probes.push(doorbell_probe());
+    probes.push(events_probe());
 
     if fix {
         for label in &failed_jobs {
@@ -193,6 +245,8 @@ pub(crate) fn cmd_stack_doctor(cfg: &Config, json: bool, fix: bool) -> Result<()
             let (jobs, _) = jobs_probe();
             probes.push(jobs);
             probes.push(toron_probe(cfg));
+            probes.push(doorbell_probe());
+            probes.push(events_probe());
         }
     }
 

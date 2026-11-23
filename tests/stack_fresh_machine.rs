@@ -70,6 +70,34 @@ exit 0
     (sandbox, addr)
 }
 
+fn seed_seat(sandbox: &TestSandbox, with_doorbell: bool) {
+    let state = sandbox.root().join("state/flywheel");
+    std::fs::create_dir_all(state.join("agents")).expect("agents dir");
+    std::fs::create_dir_all(state.join("events-tokens")).expect("tokens dir");
+    let row = serde_json::json!([{
+        "pane_id": "block:probe",
+        "name": "probe-pane",
+        "harness": "opencode",
+        "mail_identity": "DoctorProbe",
+        "skills_injected": false,
+        "incarnation": 0
+    }]);
+    std::fs::write(state.join("agents/demo.json"), row.to_string()).expect("seat row");
+    std::fs::write(
+        state.join("events-tokens/demo-DoctorProbe.token"),
+        "probe-token",
+    )
+    .expect("event token");
+    if with_doorbell {
+        std::fs::create_dir_all(state.join("doorbell")).expect("doorbell dir");
+        let state_row = serde_json::json!({
+            "pid": std::process::id(), "project": "demo"
+        });
+        std::fs::write(state.join("doorbell/demo.json"), state_row.to_string())
+            .expect("doorbell state");
+    }
+}
+
 fn doctor(sandbox: &TestSandbox, addr: &str, fix: bool) -> std::process::Output {
     let mut cmd = sandbox.command(env!("CARGO_BIN_EXE_flywheel"));
     cmd.env("PATH", sandbox.path_env())
@@ -86,6 +114,7 @@ fn doctor(sandbox: &TestSandbox, addr: &str, fix: bool) -> std::process::Output 
 #[test]
 fn stack_doctor_probes_every_job_on_a_fresh_machine() {
     let (sandbox, addr) = fixture(false);
+    seed_seat(&sandbox, true);
     let out = doctor(&sandbox, &addr, false);
     let text = format!(
         "{}{}",
@@ -99,7 +128,7 @@ fn stack_doctor_probes_every_job_on_a_fresh_machine() {
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor json");
     assert_eq!(v["kind"], "flywheel-stack-doctor.v1");
     assert_eq!(v["ok"], true);
-    for name in ["binaries", "jobs", "toron"] {
+    for name in ["binaries", "jobs", "toron", "doorbell", "events"] {
         assert_eq!(
             v["probes"]
                 .as_array()
@@ -142,6 +171,26 @@ fn doctor_fix_reregisters_a_job_then_reprobes() {
     assert!(
         log.contains("bootstrap gui/") && log.contains("dev.flywheel.daemon.plist"),
         "the failed job must be bootstrapped from its plist: {log}"
+    );
+}
+
+#[test]
+fn doctor_fails_when_the_doorbell_dispatcher_is_down() {
+    let (sandbox, addr) = fixture(false);
+    seed_seat(&sandbox, false);
+    let out = doctor(&sandbox, &addr, false);
+    assert!(!out.status.success(), "a down dispatcher must fail doctor");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor json");
+    let doorbell = v["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "doorbell")
+        .expect("doorbell probe");
+    assert_eq!(doorbell["ok"], false);
+    assert!(
+        doorbell["detail"].as_str().unwrap().contains("demo=absent"),
+        "{doorbell}"
     );
 }
 
