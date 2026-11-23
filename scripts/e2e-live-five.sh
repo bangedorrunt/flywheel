@@ -284,10 +284,10 @@ export TORON_BIN
 # bd-oo7zi: the operator-typing guard needs a REAL harness pane: a bare zsh box
 # classifies as Unknown, which may_inject allows. Spawn one in THIS project only,
 # read its pin + pane_id from swarm status, and retire it in cleanup.
-# bd-oo7zi: the operator-typing guard needs a REAL harness pane. bd-live-wake-
-# pane-isolation: it types on the antigravity pane, never the wake leg's
-# opencode pane. antigravity is also the no-door events witness. No pi/grok.
-spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --kind antigravity=1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
+# bd-oo7zi: both live legs use a REAL opencode harness pane. The guard leg
+# clears its typed line on exit and the wake leg uses a short marker, so they
+# cannot contaminate each other. No pi, grok or antigravity seat is spawned.
+spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
     || die "flywheel spawn failed: $spawn_out"
 # Read pins and panes from the spawn receipt, not swarm status: once kill
 # clears the captain alias, the first spawned seat (opencode) is the captain
@@ -301,7 +301,7 @@ for m in re.finditer(r"state=Settled subject=flywheel-e2e-live-five-(\S+) \(pin=
 blocks = {}
 for m in re.finditer(r"^\s+(\S+) \(block:([^)]+)\)", text, re.M):
     blocks[m.group(1)] = m.group(2)
-kinds = {"opencode": "oc", "antigravity": "antigravity"}
+kinds = {"opencode": "oc"}
 for kind, suffix in kinds.items():
     block = blocks.get(kind, '')
     print(f"{pins.get(suffix, '')}\t{'block:' + block if block else ''}")
@@ -309,11 +309,10 @@ PY
 )" || die "cannot read the spawned seats from the spawn receipt"
 SPAWNED_PIN="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f1)"
 SPAWNED_PANE="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f2)"
-EVENTS_PIN="$(printf '%s\n' "$seated" | sed -n '2p' | cut -f1)"
-EVENTS_PANE="$(printf '%s\n' "$seated" | sed -n '2p' | cut -f2)"
+EVENTS_PIN="$SPAWNED_PIN"
 SPAWNED_SESSION="$(printf '%s\n' "$spawn_out" | sed -nE 's/.*(session:[^ ]+) created.*/\1/p' | head -1)"
 [ -n "$SPAWNED_PIN" ] || die "spawn receipt named no opencode pin"
-[ -n "$EVENTS_PIN" ] || die "spawn receipt named no gemini pin"
+
 [ -n "$SPAWNED_SESSION" ] || die "spawn did not name its workspace session"
 
 # A freshly spawned agent stays WORKING while it boots; the send door correctly
@@ -348,9 +347,9 @@ for t in "${TESTS[@]}"; do
     log="/tmp/e2e-live-five-$STAMP-$(basename "$t" .rs).log"
     if [ "$t" = "tests/live_doorbell_operator_guard.rs" ]; then
         export FLYWHEEL_LIVE_SESSION="$SPAWNED_SESSION"
-        export FLYWHEEL_LIVE_PIN="$EVENTS_PIN"
-        export FLYWHEEL_LIVE_BLOCK="$EVENTS_PANE"
-        export FLYWHEEL_LIVE_AS="$EVENTS_PIN"
+        export FLYWHEEL_LIVE_PIN="$SPAWNED_PIN"
+        export FLYWHEEL_LIVE_BLOCK="$SPAWNED_PANE"
+        export FLYWHEEL_LIVE_AS="$SPAWNED_PIN"
     elif [ "$t" = "tests/live_opencode_api_wake.rs" ]; then
         export FLYWHEEL_LIVE_SESSION="$SPAWNED_SESSION"
         export FLYWHEEL_LIVE_PIN="$SPAWNED_PIN"
