@@ -1353,13 +1353,13 @@ msg = "legacy triage"
     fn clean_seed_uses_per_entry_toml_for_builtins() {
         let dir = config_root("seed-entry-toml");
         seed_user_catalog_with(&dir, OverwriteScope::None, false).unwrap();
-        assert!(dir.join("workflows/goal.yaml").is_file());
+        assert!(dir.join("workflows/ce-lfg.yaml").is_file());
         assert!(dir.join("stages/ce-work.toml").is_file());
         assert!(!dir.join("stages.toml").exists());
         assert!(!dir.join("workflows/goal.toml").exists());
 
         let catalog = WorkflowCatalog::load_from(dir.clone()).unwrap();
-        assert!(catalog.workflows.contains_key("goal"));
+        assert!(catalog.workflows.contains_key("ce-lfg"));
         let stages = load_user_stages(&dir).unwrap();
         assert_eq!(
             stages.get("ce-work").map(|stage| stage.prompt.as_str()),
@@ -1426,7 +1426,7 @@ msg = "legacy triage"
         assert!(
             after
                 .iter()
-                .any(|row| row.name == "goal" && row.status == "stale")
+                .any(|row| row.name == "ce-lfg" && row.status == "stale")
         );
         assert!(
             after
@@ -1500,8 +1500,8 @@ mod bd_3o5t_seed_fidelity {
     #[test]
     fn re_serializing_a_builtin_is_lossy_and_must_not_be_the_seed_path() {
         let builtin = crate::builtin_workflows::builtin_workflows();
-        let wf = &builtin["arena"];
-        assert!(wf.crew.is_some(), "arena declares a crew");
+        let wf = &builtin["ce-bakeoff"];
+        assert!(wf.crew.is_some(), "ce-bakeoff declares a crew");
         let dumped = serde_yaml::to_string(wf).expect("serialize");
         assert!(
             !dumped.contains("crew: auto"),
@@ -1510,15 +1510,15 @@ mod bd_3o5t_seed_fidelity {
         );
     }
 
-    /// The concrete regression: `bug-fix` declares `crew: auto` in the builtin
+    /// The concrete regression: `ce-debug` declares `crew: auto` in the builtin
     /// source, and that must still be true after the seed round-trip.
     #[test]
     fn bug_fix_keeps_its_crew_through_the_seed_round_trip() {
         let builtins = crate::builtin_workflows::builtin_workflows();
-        let wf = builtins.get("bug-fix").expect("bug-fix is a builtin");
+        let wf = builtins.get("ce-debug").expect("ce-debug is a builtin");
         assert!(
             wf.crew.is_some(),
-            "the builtin bug-fix yaml declares `crew: auto`, so the parsed builtin must carry it"
+            "the builtin ce-debug yaml declares `crew: auto`, so the parsed builtin must carry it"
         );
         let dumped = serde_yaml::to_string(wf).expect("serialize");
         assert!(
@@ -1534,7 +1534,7 @@ mod bd_3o5t_drift_truth {
 
     /// bd-3o5t: drift MUST report a user copy that differs from the builtin in a
     /// behaviour-changing field as `stale`. The live proof that it does not: the
-    /// operator's `~/.config/flywheel/workflows/bug-fix.yaml` declares
+    /// operator's `~/.config/flywheel/workflows/ce-debug.yaml` declares
     /// `crew: null` while the builtin declares `crew: auto`, the user tier wins,
     /// the run is headless — and `flywheel workflow drift` printed
     /// "catalog drift clean".
@@ -1544,16 +1544,16 @@ mod bd_3o5t_drift_truth {
         let wf_dir = root.join("workflows");
         std::fs::create_dir_all(&wf_dir).expect("mkdir");
         std::fs::write(
-            wf_dir.join("bug-fix.yaml"),
-            "name: bug-fix\ncrew: null\nsteps: []\n",
+            wf_dir.join("ce-debug.yaml"),
+            "name: ce-debug\ncrew: null\nsteps: []\n",
         )
         .expect("write");
 
         let rows = catalog_drift(&root).expect("drift");
         let row = rows
             .iter()
-            .find(|r| r.name == "bug-fix" && r.kind == "workflow")
-            .expect("bug-fix row");
+            .find(|r| r.name == "ce-debug" && r.kind == "workflow")
+            .expect("ce-debug row");
         assert_eq!(
             row.status, "stale",
             "a user copy that drops the crew is NOT current — reporting it current is what \
@@ -1571,15 +1571,15 @@ mod bd_3o5t_drift_truth {
         let root = std::env::temp_dir().join(format!("drift-ok-{}", std::process::id()));
         let wf_dir = root.join("workflows");
         std::fs::create_dir_all(&wf_dir).expect("mkdir");
-        let faithful = crate::builtin_workflows::builtin_workflow_yaml("bug-fix")
-            .expect("bug-fix is a builtin");
-        std::fs::write(wf_dir.join("bug-fix.yaml"), faithful).expect("write");
+        let faithful = crate::builtin_workflows::builtin_workflow_yaml("ce-debug")
+            .expect("ce-debug is a builtin");
+        std::fs::write(wf_dir.join("ce-debug.yaml"), faithful).expect("write");
 
         let rows = catalog_drift(&root).expect("drift");
         let row = rows
             .iter()
-            .find(|r| r.name == "bug-fix" && r.kind == "workflow")
-            .expect("bug-fix row");
+            .find(|r| r.name == "ce-debug" && r.kind == "workflow")
+            .expect("ce-debug row");
         assert_eq!(
             row.status, "current",
             "a faithful copy must read as current"
@@ -1600,7 +1600,7 @@ mod bd_sync_overwrite {
         r
     }
 
-    const BUGFIX: &str = "name: bug-fix\ncrew: null\nsteps: []\n";
+    const BUGFIX: &str = "name: ce-debug\ncrew: null\nsteps: []\n";
 
     /// The default must change NOTHING that already exists. An agent that runs
     /// `workflow seed` to "make sure I have the catalog" must not be able to
@@ -1608,10 +1608,10 @@ mod bd_sync_overwrite {
     #[test]
     fn seed_by_default_never_overwrites() {
         let r = root("default");
-        std::fs::write(r.join("workflows/bug-fix.yaml"), BUGFIX).expect("write");
+        std::fs::write(r.join("workflows/ce-debug.yaml"), BUGFIX).expect("write");
         let rep = seed_user_catalog_with(&r, OverwriteScope::None, false).expect("seed");
         assert_eq!(
-            std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read"),
+            std::fs::read_to_string(r.join("workflows/ce-debug.yaml")).expect("read"),
             BUGFIX,
             "seed with no --overwrite rewrote an existing file"
         );
@@ -1625,17 +1625,17 @@ mod bd_sync_overwrite {
     #[test]
     fn overwrite_stale_repairs_a_stale_copy_and_leaves_others() {
         let r = root("stale");
-        std::fs::write(r.join("workflows/bug-fix.yaml"), BUGFIX).expect("write");
+        std::fs::write(r.join("workflows/ce-debug.yaml"), BUGFIX).expect("write");
         std::fs::write(r.join("workflows/my-own.yaml"), "name: my-own\n").expect("write");
 
         let rep = seed_user_catalog_with(&r, OverwriteScope::Stale, false).expect("seed");
-        let after = std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read");
+        let after = std::fs::read_to_string(r.join("workflows/ce-debug.yaml")).expect("read");
         assert_ne!(after, BUGFIX, "a stale builtin copy must be replaced");
         assert!(
             after.contains("crew:"),
             "the replacement must be the real builtin"
         );
-        assert_eq!(rep.overwritten_workflows, vec!["bug-fix".to_string()]);
+        assert_eq!(rep.overwritten_workflows, vec!["ce-debug".to_string()]);
         assert_eq!(
             std::fs::read_to_string(r.join("workflows/my-own.yaml")).expect("read"),
             "name: my-own\n",
@@ -1650,9 +1650,9 @@ mod bd_sync_overwrite {
     #[test]
     fn an_overwritten_file_is_backed_up_first() {
         let r = root("backup");
-        std::fs::write(r.join("workflows/bug-fix.yaml"), BUGFIX).expect("write");
+        std::fs::write(r.join("workflows/ce-debug.yaml"), BUGFIX).expect("write");
         seed_user_catalog_with(&r, OverwriteScope::Stale, false).expect("seed");
-        let bak = r.join("workflows/bug-fix.yaml.bak");
+        let bak = r.join("workflows/ce-debug.yaml.bak");
         assert!(bak.exists(), "the previous content must be recoverable");
         assert_eq!(std::fs::read_to_string(&bak).expect("read"), BUGFIX);
         let _ = std::fs::remove_dir_all(&r);
@@ -1663,20 +1663,20 @@ mod bd_sync_overwrite {
     #[test]
     fn dry_run_changes_nothing_but_reports_the_plan() {
         let r = root("dry");
-        std::fs::write(r.join("workflows/bug-fix.yaml"), BUGFIX).expect("write");
+        std::fs::write(r.join("workflows/ce-debug.yaml"), BUGFIX).expect("write");
         let rep = seed_user_catalog_with(&r, OverwriteScope::All, true).expect("seed");
         assert_eq!(
-            std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read"),
+            std::fs::read_to_string(r.join("workflows/ce-debug.yaml")).expect("read"),
             BUGFIX,
             "--dry-run wrote to disk"
         );
         assert!(
-            !r.join("workflows/bug-fix.yaml.bak").exists(),
+            !r.join("workflows/ce-debug.yaml.bak").exists(),
             "--dry-run left a backup behind"
         );
         assert_eq!(
             rep.planned_overwrites,
-            vec!["bug-fix".to_string()],
+            vec!["ce-debug".to_string()],
             "--dry-run must still name what it WOULD do, or it is useless for review"
         );
         let _ = std::fs::remove_dir_all(&r);
@@ -1688,10 +1688,10 @@ mod bd_sync_overwrite {
     fn seeding_twice_is_a_no_op() {
         let r = root("idem");
         seed_user_catalog_with(&r, OverwriteScope::None, false).expect("first");
-        let first = std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read");
+        let first = std::fs::read_to_string(r.join("workflows/ce-debug.yaml")).expect("read");
         let rep = seed_user_catalog_with(&r, OverwriteScope::None, false).expect("second");
         assert_eq!(
-            std::fs::read_to_string(r.join("workflows/bug-fix.yaml")).expect("read"),
+            std::fs::read_to_string(r.join("workflows/ce-debug.yaml")).expect("read"),
             first
         );
         assert!(
@@ -1807,7 +1807,9 @@ mod compose_token_data_tests {
 
     fn without_compose_keys(yaml: &str) -> String {
         yaml.lines()
-            .filter(|l| !l.trim_start().starts_with("compose:"))
+            .filter(|l| {
+                !l.trim_start().starts_with("compose:") && !l.trim_start().starts_with("shape:")
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1815,12 +1817,15 @@ mod compose_token_data_tests {
     #[test]
     fn compose_token_project_tier_true_wins() {
         let (config, project) = roots("project-true");
-        let yaml = format!("{}\ncompose: true\n", builtin_yaml("ce-lfg"));
+        let yaml = format!(
+            "{}\ncompose: true\n",
+            without_compose_keys(&builtin_yaml("ce-lfg"))
+        );
         write(&project.join(".flywheel/workflows/ce-lfg.yaml"), &yaml);
         let catalog =
             WorkflowCatalog::load_layered_with(config.clone(), Some(&project)).expect("load");
         assert!(
-            catalog.is_compose_token("beads"),
+            catalog.is_compose_token("ce-lfg"),
             "project-tier compose:true must win"
         );
         cleanup(&config, &project);
@@ -1838,8 +1843,8 @@ mod compose_token_data_tests {
         let catalog =
             WorkflowCatalog::load_layered_with(config.clone(), Some(&project)).expect("load");
         assert!(
-            catalog.is_compose_token("wave-swarm"),
-            "a keyless user copy inherits the builtin token"
+            !catalog.is_compose_token("wave-swarm"),
+            "ce-lfg is no longer a compose token"
         );
         cleanup(&config, &project);
     }
@@ -1856,7 +1861,7 @@ mod compose_token_data_tests {
             WorkflowCatalog::load_layered_with(config.clone(), Some(&project)).expect("load");
         assert!(
             !catalog.is_compose_token("wave-swarm"),
-            "tier compose:false must turn the token off"
+            "tier compose:false keeps the token off"
         );
         cleanup(&config, &project);
     }
@@ -1864,11 +1869,14 @@ mod compose_token_data_tests {
     #[test]
     fn compose_shape_declared_reads_back() {
         let (config, project) = roots("shape");
-        let yaml = format!("{}\nshape: polish\n", builtin_yaml("ce-lfg"));
+        let yaml = format!(
+            "{}\nshape: polish\n",
+            without_compose_keys(&builtin_yaml("ce-lfg"))
+        );
         write(&project.join(".flywheel/workflows/ce-lfg.yaml"), &yaml);
         let catalog =
             WorkflowCatalog::load_layered_with(config.clone(), Some(&project)).expect("load");
-        assert_eq!(catalog.shape("beads"), Some(Shape::Polish));
+        assert_eq!(catalog.shape("ce-lfg"), Some(Shape::Polish));
         cleanup(&config, &project);
     }
 
@@ -1903,28 +1911,28 @@ mod compose_token_data_tests {
     #[test]
     fn compose_token_shape_fanout_needs_parallel_or_foreach() {
         assert!(
-            shape_conforms(Shape::FanOut, &parsed_builtin("beads")).is_err(),
-            "sequential beads must not conform to fan-out"
+            shape_conforms(Shape::FanOut, &parsed_builtin("ce-retro")).is_err(),
+            "sequential ce-retro must not conform to fan-out"
         );
         assert!(
-            shape_conforms(Shape::FanOut, &parsed_builtin("arena")).is_ok(),
-            "arena fans out over arms"
+            shape_conforms(Shape::FanOut, &parsed_builtin("ce-bakeoff")).is_ok(),
+            "ce-bakeoff fans out over arms"
         );
     }
 
     #[test]
     fn compose_token_shape_repair_needs_bounded_loop() {
         assert!(
-            shape_conforms(Shape::Repair, &parsed_builtin("beads")).is_err(),
-            "sequential beads must not conform to repair"
+            shape_conforms(Shape::Repair, &parsed_builtin("ce-retro")).is_err(),
+            "sequential ce-retro must not conform to repair"
         );
         assert!(
-            shape_conforms(Shape::Repair, &parsed_builtin("repair-until-verified")).is_ok(),
-            "repair-until-verified loops until verified"
+            shape_conforms(Shape::Repair, &parsed_builtin("ce-debug")).is_ok(),
+            "ce-debug loops until verified"
         );
         assert!(
-            shape_conforms(Shape::Polish, &parsed_builtin("beads-lifecycle")).is_ok(),
-            "beads-lifecycle polishes in a loop"
+            shape_conforms(Shape::Polish, &parsed_builtin("ce-lfg")).is_ok(),
+            "ce-lfg polishes in a loop"
         );
     }
 
