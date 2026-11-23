@@ -284,6 +284,12 @@ export TORON_BIN
 # bd-oo7zi: the operator-typing guard needs a REAL harness pane: a bare zsh box
 # classifies as Unknown, which may_inject allows. Spawn one in THIS project only,
 # read its pin + pane_id from swarm status, and retire it in cleanup.
+# bd-live-guard-target-readiness: pin the captain alias BEFORE spawn. Once the
+# alias is absent, the first spawned seat becomes captain and swarm status
+# filters it out, so the guard leg cannot read its target's idle state.
+"$FLYWHEEL_BIN" arrive e2e-live-five --captain "$PIN" --as "$PIN" --skip-preflight >/dev/null 2>&1 \
+    || die "flywheel arrive could not pin the throwaway captain"
+
 # bd-oo7zi: both live legs use a REAL opencode harness pane. The guard leg
 # clears its typed line on exit and the wake leg uses a short marker, so they
 # cannot contaminate each other. No pi, grok or antigravity seat is spawned.
