@@ -360,6 +360,16 @@ fn proof_receipt_records_each_step_seconds() {
     assert!(status.success(), "proof receipt timing witness failed");
 }
 
+/// bd-p7oim: a green sibling suite at a pinned rev must be cached by rev, so a
+/// later proof at the same rev skips the slow suite but still records it.
+#[test]
+fn proof_sibling_suite_caches_by_rev() {
+    let status = sandboxed_bash(root(), "test-proof-sibling-cache.sh")
+        .status()
+        .expect("run scripts/test-proof-sibling-cache.sh");
+    assert!(status.success(), "sibling suite cache witness failed");
+}
+
 #[test]
 fn proof_claude_plugin_loads_and_installs_to_plugin_dir() {
     let status = sandboxed_bash(root(), "test-claude-plugin-load.sh")

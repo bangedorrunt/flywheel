@@ -133,6 +133,9 @@ fi
 KEEP=0
 NO_CACHE=0
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/flywheel/mutation-verdicts"
+# A sibling's workspace suite is pinned by its rev. A green proof writes one
+# marker per sibling so a later proof at the same rev skips the slow suite.
+SIBLING_TEST_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/flywheel/sibling-tests"
 # bd-b2yg7: green receipts are archived here so a landing can derive its
 # mutation base instead of trusting a pin that never advances.
 RECEIPT_ARCHIVE="${XDG_STATE_HOME:-$HOME/.local/state}/flywheel/clean-proof/receipts"
@@ -292,6 +295,8 @@ SHORT="$(git -C "$ROOT" rev-parse --short "$PROVEN_SHA")"
 # Sibling trees: pinned revisions from proof.toml, archived from git objects.
 SIBLING_RECORDS=""
 SIBLING_TEST_STEPS=""
+SIBLING_TEST_KEYS=""
+SIBLING_TEST_RAN=""
 while IFS='	' read -r rel pin; do
   [ -n "${rel:-}" ] || continue
   sib_repo="$(cd "$ROOT/$rel" && pwd)"
@@ -301,6 +306,8 @@ while IFS='	' read -r rel pin; do
   SIBLING_RECORDS="$SIBLING_RECORDS$rel=$pin
 "
   SIBLING_TEST_STEPS="$SIBLING_TEST_STEPS$sib_name
+"
+  SIBLING_TEST_KEYS="$SIBLING_TEST_KEYS$sib_name	$pin
 "
   echo "clean-proof: sibling $rel @ $pin"
 done < <(proof_siblings "$ROOT" "$PROVEN_SHA")
@@ -368,10 +375,26 @@ run_step() { # name cmd...
 # suite runs in this same export at its pinned rev, fail-fast before the
 # mutation stage, and is recorded as a receipt step.
 sibling_tests() { # reads sibling names on stdin
+  local sib_name sib_rev cache_file
   while IFS= read -r sib_name; do
     [ -n "$sib_name" ] || continue
     [ -z "$FAILED_STEP" ] || break
     [ -f "$TMP/$sib_name/Cargo.toml" ] || continue
+    sib_rev="$(awk -F '\t' -v n="$sib_name" '$1 == n { print $2; exit }' \
+      <<<"$SIBLING_TEST_KEYS")"
+    cache_file="$SIBLING_TEST_CACHE/$sib_name-$sib_rev.green"
+    if [ -n "$sib_rev" ] && [ -f "$cache_file" ]; then
+      echo "clean-proof: sibling-$sib_name-tests cached at $sib_rev"
+      STEP_NAMES="${STEP_NAMES}sibling-${sib_name}-tests
+"
+      STEP_STATUSES="${STEP_STATUSES}0
+"
+      STEP_SECS="${STEP_SECS}0
+"
+      continue
+    fi
+    SIBLING_TEST_RAN="$SIBLING_TEST_RAN$sib_name	$sib_rev
+"
     run_step "sibling-$sib_name-tests" env "CARGO_TARGET_DIR=$TMP/$sib_name/test-target" \
       "${MBX[@]}" test --manifest-path "$TMP/$sib_name/Cargo.toml" --workspace \
       --no-fail-fast || true
@@ -738,6 +761,15 @@ mail_red_owners "$RECEIPT" "$ROOT" "${CLEAN_PROOF_PROJECT:-flywheel}" \
 
 # bd-jp9z1.2: the witness for a freshly proved spec is THIS receipt, so the
 # entries are written only after it exists.
+if [ "$OK" -eq 0 ] && [ "$NO_CACHE" -eq 0 ] && [ -n "$SIBLING_TEST_RAN" ]; then
+  mkdir -p "$SIBLING_TEST_CACHE"
+  while IFS=$'\t' read -r sib rev; do
+    [ -n "$sib" ] || continue
+    : >"$SIBLING_TEST_CACHE/$sib-$rev.green"
+  done <<<"$SIBLING_TEST_RAN"
+  echo "clean-proof: cached $(printf '%s\n' "$SIBLING_TEST_RAN" | grep -c .) sibling suite(s) under $SIBLING_TEST_CACHE"
+fi
+
 if [ "$OK" -eq 0 ] && [ "$NO_CACHE" -eq 0 ] && [ -s "$CACHE_STORES" ]; then
   while IFS=$'\t' read -r store_key store_spec store_rows; do
     [ -n "$store_key" ] || continue
