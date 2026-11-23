@@ -1093,6 +1093,10 @@ pub struct Draining {
 
 /// How long a drain waits for the toron read before ringing toward delivery.
 pub const DRAIN_CURSOR_BOUND_US: u64 = 3_000_000;
+/// bd-slt2n: an events-door seat's pump may never arm (bad token, MCP refusal)
+/// or may not deliver inside the ack window. After this bound the doorbell
+/// types the wake itself, so a seat is never left silent by a dead pump.
+pub const EVENTS_ACK_BOUND_US: u64 = 30_000_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DoorbellModel {
@@ -1695,6 +1699,52 @@ pub fn tick(model: &DoorbellModel, msg: &DoorbellMsg) -> (DoorbellModel, Vec<Doo
                 });
                 ring_draining(&mut next, &mut actions, &pin, slot.wakes, None);
             }
+            // bd-slt2n: a pump that never arms or never delivers cannot be
+            // waited on forever. An idle events-door seat with a mail wake
+            // older than the ack window gets the typed fallback now.
+            let due: Vec<String> = next
+                .queues
+                .iter()
+                .filter(|(pin, wakes)| {
+                    next.events_door_pins.contains(*pin)
+                        && next.statuses.get(*pin).map(String::as_str) == Some("idle")
+                        && wakes.iter().any(|w| {
+                            !matches!(w.kind, WakeKind::Notice)
+                                && w.created_us.is_some_and(|t| {
+                                    now_us.saturating_sub(t.max(0) as u64) > EVENTS_ACK_BOUND_US
+                                })
+                        })
+                })
+                .map(|(pin, _)| pin.clone())
+                .collect();
+            for pin in due {
+                if let Some(wakes) = next.queues.get_mut(&pin) {
+                    let mut keep = Vec::new();
+                    for wake in wakes.drain(..) {
+                        if !matches!(wake.kind, WakeKind::Notice)
+                            && wake.created_us.is_some_and(|t| {
+                                now_us.saturating_sub(t.max(0) as u64) > EVENTS_ACK_BOUND_US
+                            })
+                            && !next.rung.contains(&wake.key)
+                        {
+                            next.rung.insert(wake.key.clone());
+                            actions.push(DoorbellAction::Prompt {
+                                pin: pin.clone(),
+                                line: wake.line.clone(),
+                                event_id: wake.event_id.clone(),
+                            });
+                            actions.push(DoorbellAction::Audit {
+                                kind: "events-ack-timeout".into(),
+                                pin: pin.clone(),
+                                detail: "events pump did not deliver; typed the wake".into(),
+                            });
+                        } else {
+                            keep.push(wake);
+                        }
+                    }
+                    *wakes = keep;
+                }
+            }
         }
         DoorbellMsg::PromptRefused {
             pin,
@@ -2072,6 +2122,35 @@ mod tests {
                 |a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "already-pulled")
             ),
             "no already-pulled audit for an events-door pin: {actions:?}"
+        );
+    }
+
+    /// bd-slt2n: the events pump never armed, so no fetch row ever arrived.
+    /// An idle events-door seat still gets the wake typed after the ack
+    /// window — fail toward delivery, never wait on a dead pump forever.
+    #[test]
+    fn events_pump_unarmed_falls_back_to_a_typed_wake() {
+        let mut model = DoorbellModel {
+            statuses: [("BlueRidge".into(), "idle".into())].into(),
+            ..Default::default()
+        };
+        model.events_door_pins.insert("BlueRidge".into());
+        let mut wake = QueuedWake::new(WakeKind::AtIdle, "m-unarmed", "[wake] a task for you");
+        wake.created_us = Some(1_700_000_000_000_000);
+        model.queues.insert("BlueRidge".into(), vec![wake]);
+        let now_us = 1_700_000_000_000_000 + EVENTS_ACK_BOUND_US + 1;
+        let (_, actions) = tick(&model, &DoorbellMsg::Sweep { now_us });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, DoorbellAction::Prompt { pin, .. } if pin == "BlueRidge")),
+            "a dead pump must fall back to the typed wake: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, DoorbellAction::Audit { kind, .. } if kind == "events-ack-timeout")
+            ),
+            "the fallback is audited: {actions:?}"
         );
     }
 
