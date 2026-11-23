@@ -41,6 +41,7 @@ pub(crate) mod slot;
 pub(crate) mod spawn;
 pub(crate) mod squad;
 pub(crate) mod stack;
+pub(crate) mod stack_doctor;
 pub(crate) mod stage;
 pub(crate) mod standing_orders;
 pub(crate) mod status;

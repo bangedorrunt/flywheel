@@ -25,6 +25,15 @@ pub(crate) enum StackCmd {
         #[arg(long)]
         check: bool,
     },
+    /// Probe the installed stack end to end; `--fix` re-registers jobs.
+    Doctor {
+        /// Machine-readable `flywheel-stack-doctor.v1`.
+        #[arg(long)]
+        json: bool,
+        /// Repair what can be repaired, then re-run the probes.
+        #[arg(long)]
+        fix: bool,
+    },
     /// Reinstall flywheel, doorbell, and toron from source, then verify them.
     Install {
         /// Print the install/restart plan without changing the host.
@@ -48,6 +57,9 @@ pub(crate) enum StackCmd {
 pub(crate) fn cmd_stack(cfg: &Config, cmd: &StackCmd) -> Result<()> {
     match cmd {
         StackCmd::Status { json, check } => stack_status(cfg, *json, *check),
+        StackCmd::Doctor { json, fix } => {
+            crate::cmd::stack_doctor::cmd_stack_doctor(cfg, *json, *fix)
+        }
         StackCmd::Install {
             dry_run,
             no_codesign,
@@ -70,7 +82,7 @@ struct BinaryProbe {
     error: Option<String>,
 }
 
-fn bin_dir() -> PathBuf {
+pub(crate) fn bin_dir() -> PathBuf {
     if let Some(root) = std::env::var_os("CARGO_INSTALL_ROOT") {
         return PathBuf::from(root).join("bin");
     }
@@ -225,7 +237,7 @@ fn toron_addr_from_url(url: &str) -> Option<String> {
     }
 }
 
-fn toron_addr(cfg: &Config) -> String {
+pub(crate) fn toron_addr(cfg: &Config) -> String {
     std::env::var("FLYWHEEL_TORON_URL")
         .ok()
         .filter(|s| !s.is_empty())
@@ -234,7 +246,7 @@ fn toron_addr(cfg: &Config) -> String {
         .unwrap_or_else(|| "127.0.0.1:18080".to_string())
 }
 
-fn toron_reachable(addr: &str) -> bool {
+pub(crate) fn toron_reachable(addr: &str) -> bool {
     let Ok(addrs) = addr.to_socket_addrs() else {
         return false;
     };
