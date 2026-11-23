@@ -658,7 +658,7 @@ def owner_for_step(failed, base):
 
 rows = []
 for row in receipt.get("mutations", []):
-    if not isinstance(row, dict) or row.get("verdict") != "RED":
+    if not isinstance(row, dict) or row.get("verdict") == "RED":
         continue
     spec = row.get("spec", "")
     target = spec
@@ -668,7 +668,7 @@ for row in receipt.get("mutations", []):
             if line.strip().startswith("file="):
                 target = line.strip().split("=", 1)[1].strip()
                 break
-    cause = f"{spec}#{row.get('id', '')} {row.get('expect_test', '')} RED"
+    cause = f"{spec}#{row.get('id', '')} {row.get('expect_test', '')} {row.get('verdict', '?')}"
     log = f"{logs}/mutations-{spec}.log" if logs else "(see receipt logs)"
     rerun = f"bash scripts/verify-mutations.sh scripts/mutations/{spec} --cargo mbx"
     rows.append((owner_for(target), f"{cause}\nlog: {log}\nrerun: {rerun}"))
@@ -689,7 +689,7 @@ for owner, bodies in sorted(batched.items()):
     if len(body) > 2000:
         body = body[:2000].rsplit("\n", 1)[0] + "\n... (truncated; see the log path above)"
     args = ["toron", "mail", "send", "--project", project, "--as", sender, "--to", owner,
-            "--subject", f"[clean-proof] {len(bodies)} red row(s)",
+            "--subject", f"[clean-proof] {len(bodies)} unproven row(s)",
             "--body", body]
     try:
         out = subprocess.run(args, cwd=repo, capture_output=True, text=True, check=False)

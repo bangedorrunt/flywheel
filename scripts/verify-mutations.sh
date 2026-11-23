@@ -762,6 +762,7 @@ main() {
             --json-out) JSON_OUT="$2"; shift ;;
             --list) LIST_ONLY=1 ;;
             --list-expect) LIST_ONLY=1; LIST_EXPECT=1 ;;
+            --list-find) LIST_ONLY=1; LIST_FIND=1 ;;
             --cache-key) CACHE_KEY="$2"; shift ;;
             --witness-out) WITNESS_OUT="$2"; shift ;;
             --cache-dir) CACHE_DIR="$2"; shift ;;
@@ -804,8 +805,12 @@ main() {
     if [ "${LIST_ONLY:-0}" = 1 ]; then
         local i
         for i in "${!M_FILE[@]}"; do
-            if [ "$LIST_EXPECT" -eq 1 ]; then
+            if [ "${LIST_EXPECT:-0}" -eq 1 ]; then
                 printf '%s\t%s\t%s\n' "$(mutation_id "${M_LABEL[$i]}")" "${M_EXPECT[$i]}" "${M_GREEN[$i]}"
+            elif [ "${LIST_FIND:-0}" -eq 1 ]; then
+                # bd-kddv7: the cache key needs the exact needle so it can
+                # hash only the enclosing fn, not the whole target file.
+                printf '%s\t%s\t%s\n' "$(mutation_id "${M_LABEL[$i]}")" "${M_FILE[$i]}" "${M_FIND[$i]}"
             else
                 printf '%s\t%s\n' "$(mutation_id "${M_LABEL[$i]}")" "${M_FILE[$i]}"
             fi

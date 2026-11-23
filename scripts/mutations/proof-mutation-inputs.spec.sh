@@ -4,14 +4,14 @@
 # also cold-built its own target dir. These mutants restore each regression.
 
 CARGO_ARGS=(--bin flywheel)
-TEST_FILTER=(the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings clean_proof_scopes_mutations_and_shares_one_target_dir proof_green_base_accepts_iso_stamped_receipts)
+TEST_FILTER=(the_cache_key_scopes_to_the_mutated_and_witness_fns clean_proof_scopes_mutations_and_shares_one_target_dir proof_green_base_accepts_iso_stamped_receipts)
 
 mutation "B1  the cache key uses the commit sha again" \
     file=scripts/mutation-cache.py \
-    expect=the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings \
-    find='    add(h, "driver:clean-proof.sh", read("scripts/clean-proof.sh"))
-    add(h, "driver:proof-lib.sh", read("scripts/proof-lib.sh"))' \
-    replace='    add(h, "driver", driver.encode())'
+    expect=the_cache_key_scopes_to_the_mutated_and_witness_fns \
+    find='    for name in missing:' \
+    replace='    add(h, "driver", driver.encode())
+    for name in missing:'
 
 mutation "B2  a stale base is pinned again" \
     file=proof.toml \

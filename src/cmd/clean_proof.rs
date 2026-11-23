@@ -393,72 +393,90 @@ impl CacheFixture {
     }
 }
 
-/// The key must move for every input a verdict depends on: the spec, a target,
-/// the file declaring the expect test, the harness, the lockfile, the driver,
-/// and the sibling pins. Each step compares against the key immediately before
-/// its own edit, so one input cannot stand in for another.
+/// bd-kddv7: the key covers only what a verdict depends on — the mutated
+/// fn, the expect test fn, the spec, the harness and the lockfile. An edit
+/// to an unrelated fn in the same file must NOT drop cached verdicts; sibling
+/// pins and driver scripts must NOT drop them either.
 #[test]
-fn the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings() {
+fn the_cache_key_scopes_to_the_mutated_and_witness_fns() {
     let fx = CacheFixture::new();
     let base = fx.key("driver-sha");
     assert_eq!(base.len(), 64, "the key is a sha256 hex string");
 
-    let step = |label: &str, edit: &dyn Fn()| {
-        let before = fx.key("driver-sha");
-        edit();
-        assert_ne!(before, fx.key("driver-sha"), "{label} must change the key");
-    };
+    let same = |label: &str| assert_eq!(base, fx.key("driver-sha"), "{label}");
+    let moved = |label: &str| assert_ne!(base, fx.key("driver-sha"), "{label}");
     let write = |rel: &str, body: &str| std::fs::write(fx.path().join(rel), body).unwrap();
 
-    step("a target byte", &|| {
-        write("src/x.rs", "fn f() { the_needle; }\n")
-    });
-    step("a spec byte", &|| {
-        write(
-            "scripts/mutations/demo.spec.sh",
-            "CARGO_ARGS=(--lib)\nTEST_FILTER=(demo)\n\nmutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    find='the_needle' \\\n    replace='something_else' \\\n    expect=a_test\n",
-        )
-    });
-    step("the test-declaring file", &|| {
-        write("src/t.rs", "#[test]\nfn a_test() { let _ = 1; }\n")
-    });
-    step("the harness", &|| {
-        let harness = std::fs::read_to_string(fx.path().join("scripts/verify-mutations.sh"))
-            .unwrap()
-            .replace(
-                "VERDICT_VACUOUS=\"VACUOUS\"",
-                "VERDICT_VACUOUS=\"VACUOUS2\"",
-            );
-        write("scripts/verify-mutations.sh", &harness)
-    });
-    step("the lockfile", &|| {
-        write("Cargo.lock", "[[package]]\nname = \"demo2\"\n")
-    });
-    step("a sibling pin", &|| {
-        write(
-            "proof.toml",
-            "[[sibling]]\npath = \"../toron\"\nrev = \"2222222222222222222222222222222222222222\"\n",
-        )
-    });
-    // bd-b2yg7: the driver rung is the CONTENT of the driver scripts, not a
-    // commit sha. A new commit with byte-identical scripts must hit the cache;
-    // an edit to the driver code must move the key.
-    write("scripts/clean-proof.sh", "driver v1\n");
+    same("baseline");
+    write("src/x.rs", "fn f() { the_needle }\nfn unrelated() { 1 }\n");
+    same("an unrelated fn in the target file");
+    write("src/t.rs", "#[test]\nfn a_test() {}\nfn other_test() {}\n");
+    same("an unrelated fn in the test file");
     write(
-        "scripts/proof-lib.sh",
-        concat!(include_str!("../../scripts/proof-lib.sh"), "\n# lib v1\n"),
+        "proof.toml",
+        "[[sibling]]\npath = \"../toron\"\nrev = \"2222222222222222222222222222222222222222\"\n",
     );
-    let before_driver = fx.key("driver-sha");
-    assert_eq!(
-        before_driver,
-        fx.key("another-driver"),
-        "a commit sha alone must not move the key"
-    );
+    same("a sibling pin bump");
     write("scripts/clean-proof.sh", "driver v2\n");
+    same("a driver script edit");
+    same("a driver sha");
+    assert_eq!(
+        base,
+        fx.key("another-driver"),
+        "a commit sha alone is not an input"
+    );
+
+    // Now the inputs that MUST move the key, each from the current state.
+    let before = fx.key("driver-sha");
+    write(
+        "src/x.rs",
+        "fn f() { other_needle }\nfn unrelated() { 1 }\n",
+    );
     assert_ne!(
-        before_driver,
+        before,
         fx.key("driver-sha"),
-        "a driver script byte must move the key"
+        "the mutated fn must move the key"
+    );
+
+    let before = fx.key("driver-sha");
+    write(
+        "src/t.rs",
+        "#[test]\nfn a_test() { let _ = 42; }\nfn other_test() {}\n",
+    );
+    assert_ne!(
+        before,
+        fx.key("driver-sha"),
+        "the expect test fn must move the key"
+    );
+
+    let before = fx.key("driver-sha");
+    write(
+        "scripts/mutations/demo.spec.sh",
+        "CARGO_ARGS=(--lib)\nTEST_FILTER=(demo)\n\n# note\nmutation \"D1  a decision\" \\\n    file=src/x.rs \\\n    find='other_needle' \\\n    replace='something' \\\n    expect=a_test\n",
+    );
+    assert_ne!(before, fx.key("driver-sha"), "the spec must move the key");
+
+    moved("the spec byte relative to baseline");
+    let before = fx.key("driver-sha");
+    let harness = std::fs::read_to_string(fx.path().join("scripts/verify-mutations.sh"))
+        .unwrap()
+        .replace(
+            "VERDICT_VACUOUS=\"VACUOUS\"",
+            "VERDICT_VACUOUS=\"VACUOUS2\"",
+        );
+    write("scripts/verify-mutations.sh", &harness);
+    assert_ne!(
+        before,
+        fx.key("driver-sha"),
+        "the harness must move the key"
+    );
+
+    let before = fx.key("driver-sha");
+    write("Cargo.lock", "[[package]]\nname = \"demo2\"\n");
+    assert_ne!(
+        before,
+        fx.key("driver-sha"),
+        "the lockfile must move the key"
     );
 }
 
@@ -799,9 +817,15 @@ fn red_rows_mail_the_owner_with_log_and_rerun() {
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::create_dir_all(repo.join("scripts/mutations")).unwrap();
     std::fs::write(repo.join("src/owned.rs"), "fn x() {}\n").unwrap();
+    std::fs::write(repo.join("src/owned2.rs"), "fn y() {}\n").unwrap();
     std::fs::write(
         repo.join("scripts/mutations/demo.spec.sh"),
         "# fixture\nfile=src/owned.rs\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("scripts/mutations/demo2.spec.sh"),
+        "# fixture\nfile=src/owned2.rs\n",
     )
     .unwrap();
     git_in(
@@ -809,6 +833,11 @@ fn red_rows_mail_the_owner_with_log_and_rerun() {
         &["add", "src/owned.rs", "scripts/mutations/demo.spec.sh"],
     );
     git_in(repo, &["commit", "-q", "-m", "fix: bd-owner1 demo"]);
+    git_in(
+        repo,
+        &["add", "src/owned2.rs", "scripts/mutations/demo2.spec.sh"],
+    );
+    git_in(repo, &["commit", "-q", "-m", "fix: bd-owner2 demo"]);
 
     let bin = repo.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -833,7 +862,7 @@ fn red_rows_mail_the_owner_with_log_and_rerun() {
     let receipt = repo.join("receipt.json");
     std::fs::write(
         &receipt,
-        r#"{"ok":false,"logs":"/logs","mutations":[{"spec":"demo.spec.sh","id":"D1","expect_test":"a_test","verdict":"RED"}]}"#,
+        r#"{"ok":false,"logs":"/logs","mutations":[{"spec":"demo.spec.sh","id":"D1","expect_test":"a_test","verdict":"RED"},{"spec":"demo2.spec.sh","id":"V1","expect_test":"b_test","verdict":"VACUOUS"}]}"#,
     )
     .unwrap();
     let mail_log = dir.path().join("mail.log");
@@ -872,16 +901,20 @@ fn red_rows_mail_the_owner_with_log_and_rerun() {
     );
     let mailed = std::fs::read_to_string(&mail_log).unwrap_or_default();
     assert!(
-        mailed.contains("--to CrewOwner"),
-        "owner got the mail: {mailed}"
+        !mailed.contains("--to CrewOwner"),
+        "a RED row is a caught mutant, not a failure: {mailed}"
     );
     assert!(
-        mailed.contains("/logs/mutations-demo.spec.sh.log"),
+        mailed.contains("--to CrewTwo"),
+        "the VACUOUS row's owner got the mail: {mailed}"
+    );
+    assert!(
+        mailed.contains("/logs/mutations-demo2.spec.sh.log"),
         "log path: {mailed}"
     );
     assert!(
         mailed.contains(
-            "bash scripts/verify-mutations.sh scripts/mutations/demo.spec.sh --cargo mbx"
+            "bash scripts/verify-mutations.sh scripts/mutations/demo2.spec.sh --cargo mbx"
         ),
         "exact rerun command: {mailed}"
     );
@@ -905,7 +938,7 @@ fn red_rows_mail_the_owner_with_log_and_rerun() {
     std::fs::write(&br, "#!/bin/sh\nprintf '%s' '{}'\n").unwrap();
     std::fs::write(
         &receipt,
-        r#"{"ok":false,"logs":"/logs","mutations":[{"spec":"demo.spec.sh","id":"D1","expect_test":"a_test","verdict":"RED"}]}"#,
+        r#"{"ok":false,"logs":"/logs","mutations":[{"spec":"demo.spec.sh","id":"D1","expect_test":"a_test","verdict":"VACUOUS"}]}"#,
     )
     .unwrap();
     std::fs::write(&mail_log, "").unwrap();
@@ -980,7 +1013,7 @@ fn red_rows_mail_the_owner_with_log_and_rerun() {
     std::fs::write(
         &receipt,
         format!(
-            "{{\"ok\":false,\"failed_step\":\"sibling-sib-tests\",\"siblings\":[{{\"path\":\"sib\",\"rev\":\"{srev}\"}}],\"logs\":\"/logs\",\"mutations\":[{{\"spec\":\"demo.spec.sh\",\"id\":\"D1\",\"expect_test\":\"{long}\",\"verdict\":\"RED\"}}]}}"
+            "{{\"ok\":false,\"failed_step\":\"sibling-sib-tests\",\"siblings\":[{{\"path\":\"sib\",\"rev\":\"{srev}\"}}],\"logs\":\"/logs\",\"mutations\":[{{\"spec\":\"demo.spec.sh\",\"id\":\"D1\",\"expect_test\":\"{long}\",\"verdict\":\"VACUOUS\"}}]}}"
         ),
     )
     .unwrap();

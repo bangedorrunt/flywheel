@@ -23,3 +23,9 @@ mutation "R3  a sibling step is resolved in the flywheel repo" \
     expect=red_rows_mail_the_owner_with_log_and_rerun \
     find='                scoped_repo = os.path.normpath(os.path.join(repo, sib["path"]))' \
     replace='                scoped_repo = repo'
+
+mutation "R4  caught RED rows are mailed as failures again" \
+    file=scripts/clean-proof.sh \
+    expect=red_rows_mail_the_owner_with_log_and_rerun \
+    find='    if not isinstance(row, dict) or row.get("verdict") == "RED":' \
+    replace='    if not isinstance(row, dict) or row.get("verdict") != "RED":'

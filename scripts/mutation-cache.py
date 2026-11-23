@@ -34,9 +34,107 @@ import subprocess
 import sys
 import tempfile
 
-HEADER = b"flywheel-mutation-key-v1\n"
+HEADER = b"flywheel-mutation-key-v2-hunk\n"
 RED = "RED"
 DEAD = "DEAD-CONFIRMED"
+
+
+def enclosing_fn(data: "bytes | None", needle: "bytes") -> "bytes | None":
+    """The smallest Rust fn body containing `needle`, else the whole file.
+
+    bd-kddv7: whole-file hashing made the cache miss whenever any commit
+    touched main.rs, even when the mutated hunk and its witness were
+    untouched. Locate the enclosing fn by the needle, then brace-match its
+    body (string/comment aware). Non-Rust files and needles outside a fn fall
+    back to the whole bytes, which is conservative.
+    """
+    if data is None or not needle:
+        return data
+    try:
+        text = data.decode("utf-8")
+        pos = text.find(needle.decode("utf-8", "replace"))
+    except UnicodeDecodeError:
+        return data
+    if pos < 0:
+        return data
+    starts = [
+        m.start()
+        for m in __import__("re").finditer(r"\bfn\s+\w+\s*[(<]", text[: pos + len(needle.decode("utf-8", "replace"))])
+    ]
+    if not starts:
+        return data
+    start = starts[-1]
+    # First `{` after the fn signature that is outside parentheses/strings.
+    depth = 0
+    open_at = None
+    i = start
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '/' and i + 1 < n and text[i + 1] == '/':
+            i = text.find('\n', i)
+            if i < 0:
+                return data
+            continue
+        if c == '/' and i + 1 < n and text[i + 1] == '*':
+            end = text.find('*/', i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        if c in ('"', "'"):
+            quote = c
+            i += 1
+            while i < n:
+                if text[i] == '\\':
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == '(':
+            depth += 1
+        elif c == ')':
+            depth = max(0, depth - 1)
+        elif c == '{' and depth == 0:
+            open_at = i
+            break
+        i += 1
+    if open_at is None:
+        return data
+    level = 0
+    i = open_at
+    while i < n:
+        c = text[i]
+        if c == '/' and i + 1 < n and text[i + 1] == '/':
+            i = text.find('\n', i)
+            if i < 0:
+                return data
+            continue
+        if c == '/' and i + 1 < n and text[i + 1] == '*':
+            end = text.find('*/', i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        if c in ('"', "'"):
+            quote = c
+            i += 1
+            while i < n:
+                if text[i] == '\\':
+                    i += 2
+                    continue
+                if text[i] == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == '{':
+            level += 1
+        elif c == '}':
+            level -= 1
+            if level == 0:
+                return text[start:i + 1].encode("utf-8")
+        i += 1
+    return data
 
 
 def die(msg: str) -> "None":
@@ -116,14 +214,37 @@ def spec_listing(root: str, listing_args: "list[str]") -> "tuple[list[str], list
     return targets, tests
 
 
+def spec_findings(root: str, spec: str) -> "list[tuple[str, str, bytes]]":
+    """(mutation id, target file, literal find text) through the harness."""
+    harness = os.path.join(root, "scripts/verify-mutations.sh")
+    out = subprocess.run(
+        ["bash", harness, spec, "--list-find"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        die(f"the harness cannot list mutation needles: {out.stderr.strip()}")
+    rows = []
+    for line in out.stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3:
+            rows.append((parts[0], parts[1], parts[2].encode("utf-8")))
+    return rows
+
+
 def key_for(read, root: str, spec: str, driver: str, declaring_of) -> str:
     listing_args = [spec]
     targets, tests = spec_listing(root, listing_args)
+    findings = spec_findings(root, spec)
     h = hashlib.sha256()
     h.update(HEADER)
     add(h, "spec:" + spec, read(spec))
-    for path in targets:
-        add(h, "target:" + path, read(path))
+    # bd-kddv7: hash the enclosing fn of each literal needle, not the whole
+    # target file. Two commits touching unrelated fns in one file now share a
+    # key; a change to the mutated fn or its witness still moves it.
+    for mid, path, needle in findings:
+        add(h, "mutated-fn:" + mid + ":" + path, enclosing_fn(read(path), needle))
     names = sorted({name for (_id, name, _green) in tests if name and name != "?"})
     declaring = set()
     missing = []
@@ -133,17 +254,18 @@ def key_for(read, root: str, spec: str, driver: str, declaring_of) -> str:
             missing.append(name)
         declaring.update(found)
     for path in sorted(declaring):
-        add(h, "testfile:" + path, read(path))
+        for name in names:
+            needle = ("fn " + name + "(").encode()
+            body = enclosing_fn(read(path), needle)
+            if body is not None:
+                add(h, "test-fn:" + name + ":" + path, body)
+                break
+        else:
+            add(h, "testfile:" + path, read(path))
     add(h, "harness", read("scripts/verify-mutations.sh"))
     add(h, "lock", read("Cargo.lock"))
-    # bd-b2yg7: the driver rung is the CONTENT of the driver scripts, not the
-    # proven commit sha. A landing that leaves these bytes alone must reuse the
-    # verdict; a change to the driver must move the key. `driver` is kept on the
-    # CLI for callers' compatibility but no longer seeds the hash.
-    add(h, "driver:clean-proof.sh", read("scripts/clean-proof.sh"))
-    add(h, "driver:proof-lib.sh", read("scripts/proof-lib.sh"))
-    for name, rev in siblings_from_proof_toml(read):
-        add(h, "sibling:" + name, rev.encode())
+    # bd-kddv7: sibling revs and driver scripts are deliberately NOT in the
+    # key. A proof.toml bump or a clean-proof edit must not drop every verdict.
     for name in missing:
         add(h, "test-missing", name.encode())
     return h.hexdigest()

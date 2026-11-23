@@ -946,7 +946,7 @@ owner = "scripts/clean-proof.sh"
 status = "proven"
 concurrent = false
 tests = [
-  "src/cmd/clean_proof.rs::the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings",
+  "src/cmd/clean_proof.rs::the_cache_key_scopes_to_the_mutated_and_witness_fns",
   "src/cmd/clean_proof.rs::a_cached_spec_hits_only_on_the_same_key_with_a_green_witness",
   "src/cmd/clean_proof.rs::the_key_from_a_revision_equals_the_key_from_its_checkout",
   "src/cmd/clean_proof.rs::clean_proof_computes_and_passes_a_cache_key",

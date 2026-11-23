@@ -11,27 +11,35 @@ PROOF=scripts/clean-proof.sh
 
 mutation "C1  the key ignores the target file" \
     file=$CACHE \
-    expect=the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings \
-    find='        add(h, "target:" + path, read(path))' \
+    expect=the_cache_key_scopes_to_the_mutated_and_witness_fns \
+    find='        add(h, "mutated-fn:" + mid + ":" + path, enclosing_fn(read(path), needle))' \
     replace='        (0)'
 
 mutation "C2  the key ignores the file that declares the expect test" \
     file=$CACHE \
-    expect=the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings \
-    find='        add(h, "testfile:" + path, read(path))' \
+    expect=the_cache_key_scopes_to_the_mutated_and_witness_fns \
+    find='        add(h, "test-fn:" + name + ":" + path, body)' \
     replace='        (0)'
 
 mutation "C3  the key ignores the mutation harness" \
     file=$CACHE \
-    expect=the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings \
+    expect=the_cache_key_scopes_to_the_mutated_and_witness_fns \
     find='    add(h, "harness", read("scripts/verify-mutations.sh"))' \
     replace='    (0)'
 
-mutation "C4  the key ignores the driver scripts" \
+mutation "C4  a sibling pin moves the key again" \
     file=$CACHE \
-    expect=the_cache_key_covers_spec_target_test_harness_lock_driver_and_siblings \
-    find='    add(h, "driver:clean-proof.sh", read("scripts/clean-proof.sh"))' \
-    replace='    (0)'
+    expect=the_cache_key_scopes_to_the_mutated_and_witness_fns \
+    find='    for name in missing:' \
+    replace='    for name, rev in siblings_from_proof_toml(read):
+        add(h, "sibling:" + name, rev.encode())
+    for name in missing:'
+
+mutation "C7  whole-file hashing is restored" \
+    file=$CACHE \
+    expect=the_cache_key_scopes_to_the_mutated_and_witness_fns \
+    find='                return text[start:i + 1].encode("utf-8")' \
+    replace='                return data'
 
 mutation "C5  a missing witness still counts as a hit" \
     file=$CACHE \
