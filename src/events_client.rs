@@ -77,6 +77,7 @@ impl UreqRpc {
     fn post_once(
         &self,
         token: &str,
+        method: &str,
         body: &str,
         last_event_id: Option<&str>,
     ) -> Result<ureq::Response, Box<ureq::Error>> {
@@ -86,6 +87,7 @@ impl UreqRpc {
             .set("Content-Type", "application/json")
             .set("Accept", "application/json, text/event-stream")
             .set("MCP-Protocol-Version", "2026-07-28")
+            .set("mcp-method", method)
             .set("Authorization", &format!("Bearer {token}"));
         if let Some(id) = last_event_id {
             req = req.set("Last-Event-ID", id);
@@ -93,11 +95,16 @@ impl UreqRpc {
         req.send_string(body).map_err(Box::new)
     }
 
-    fn post(&self, body: &str, last_event_id: Option<&str>) -> Result<ureq::Response, String> {
+    fn post(
+        &self,
+        method: &str,
+        body: &str,
+        last_event_id: Option<&str>,
+    ) -> Result<ureq::Response, String> {
         let path = std::path::Path::new(&self.token_path);
         post_with_token_reread(
             path,
-            |token| self.post_once(token, body, last_event_id),
+            |token| self.post_once(token, method, body, last_event_id),
             |e| matches!(**e, ureq::Error::Status(401, _)),
         )
     }
@@ -116,7 +123,7 @@ impl EventsRpc for UreqRpc {
             "params": with_client_caps(params),
         })
         .to_string();
-        let resp = self.post(&body, last_event_id)?;
+        let resp = self.post(method, &body, last_event_id)?;
         let parsed: serde_json::Value = resp
             .into_string()
             .map_err(|e| format!("toron events response unreadable: {e}"))?
@@ -139,7 +146,7 @@ impl EventsRpc for UreqRpc {
             "params": with_client_caps(params),
         })
         .to_string();
-        let resp = self.post(&body, last_event_id)?;
+        let resp = self.post("events/stream", &body, last_event_id)?;
         use std::io::BufRead as _;
         let reader = std::io::BufReader::new(resp.into_reader());
         for line in reader.lines() {
@@ -191,6 +198,10 @@ pub fn with_client_caps(params: serde_json::Value) -> serde_json::Value {
         .unwrap()
         .entry("_meta")
         .or_insert_with(|| serde_json::json!({}));
+    let meta_obj = meta.as_object_mut().unwrap();
+    meta_obj
+        .entry("io.modelcontextprotocol/protocolVersion")
+        .or_insert_with(|| serde_json::Value::String("2026-07-28".to_string()));
     let caps = meta
         .as_object_mut()
         .unwrap()
@@ -668,5 +679,36 @@ mod tests {
         assert_eq!(result.unwrap(), "ok");
         assert_eq!(seen, vec!["revoked", "fresh"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-rrlo2: toron's events surface refuses requests without the protocol
+    /// version and the extension declaration in `_meta`.
+    #[test]
+    fn events_requests_declare_the_protocol_version() {
+        let params = super::with_client_caps(serde_json::json!({}));
+        let meta = params.get("_meta").expect("_meta on every events request");
+        assert_eq!(
+            meta.get("io.modelcontextprotocol/protocolVersion")
+                .and_then(serde_json::Value::as_str),
+            Some("2026-07-28"),
+            "events need the 2026-07-28 protocol version: {meta}"
+        );
+        assert!(
+            meta.get("io.modelcontextprotocol/clientCapabilities")
+                .and_then(|c| c.get("extensions"))
+                .and_then(|e| e.get("io.modelcontextprotocol/events"))
+                .is_some(),
+            "events need the extension declaration: {meta}"
+        );
+    }
+
+    /// bd-rrlo2: the events router also reads the method from a header.
+    #[test]
+    fn events_requests_carry_the_mcp_method_header() {
+        let src = include_str!("events_client.rs");
+        assert!(
+            src.contains(".set(\"mcp-method\", method)"),
+            "post_once must send the mcp-method header"
+        );
     }
 }
