@@ -308,7 +308,8 @@ for m in re.finditer(r"^\s+(\S+) \(block:([^)]+)\)", text, re.M):
     blocks[m.group(1)] = m.group(2)
 kinds = {"opencode": "oc", "claude": "claude", "gemini": "gemini"}
 for kind, suffix in kinds.items():
-    print(f"{pins.get(suffix, '')}\t{blocks.get(kind, '')}")
+    block = blocks.get(kind, '')
+    print(f"{pins.get(suffix, '')}\t{'block:' + block if block else ''}")
 PY
 )" || die "cannot read the spawned seats from the spawn receipt"
 SPAWNED_PIN="$(printf '%s\n' "$seated" | sed -n '1p' | cut -f1)"
