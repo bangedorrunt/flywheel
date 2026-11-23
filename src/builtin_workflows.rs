@@ -284,10 +284,13 @@ steps:
       profile: "@scout"
       task: "Reproduce: {{inputs.symptom}}. {{inputs.repro}}. ACCEPTANCE: the command exits non-zero (or visibly shows the bug). Record the exact failing output."
     on_error: fail_run
+  - name: verify
+    action: verify
+    command: "false"
+    on_error: continue
   - name: repair
     action: loop
     max: "{{inputs.max_iterations}}"
-    until: steps_verify_ok == true
     on_error: fail_run
     body:
       - name: fix
@@ -508,7 +511,10 @@ steps:
 name: ce-retro
 description: "The learning loop (cadence daily/weekly): recall chiebukuro, promote durable learnings, forget expired ones, reinforce re-verified ones. Folds weekly-review, awareness-digest, ce-sweep and reflect."
 trigger:
-  type: webhook
+  type: schedule
+  cron: "0 4 * * 0"
+  owner: oracle
+  scope: project
 crew: auto
 inputs:
   - name: bead

@@ -104,14 +104,14 @@ fn json(out: &Output) -> serde_json::Value {
 }
 
 /// Gate: `cron list` resolves the tiers with precedence project > global >
-/// built-in and shows source + scope. The built-in tier is `weekly-review`
+/// built-in and shows source + scope. The built-in tier is `ce-retro`
 /// (compiled-in schedule-triggered workflow, owner oracle, scope project).
 #[test]
 fn list_precedence_project_shadows_global_shadows_builtin() {
     let h = hermetic();
 
     write_global(&h, "alpha", "housekeeper", "30 3 * * 0");
-    write_global(&h, "weekly-review", "housekeeper", "0 4 * * 0");
+    write_global(&h, "ce-retro", "housekeeper", "0 4 * * 0");
 
     let v = json(&run(
         &h,
@@ -129,14 +129,14 @@ fn list_precedence_project_shadows_global_shadows_builtin() {
     assert_eq!(by_name("alpha")["source"], "global");
     assert_eq!(by_name("alpha")["owner"], "housekeeper");
     assert_eq!(
-        by_name("weekly-review")["source"],
+        by_name("ce-retro")["source"],
         "global",
         "global shadows builtin"
     );
-    assert_eq!(by_name("weekly-review")["owner"], "housekeeper");
+    assert_eq!(by_name("ce-retro")["owner"], "housekeeper");
 
     write_project(&h, "alpha", "scout", "0 2 * * 0");
-    write_project(&h, "weekly-review", "scout", "0 4 * * 0");
+    write_project(&h, "ce-retro", "scout", "0 4 * * 0");
     let v = json(&run(&h, &["cron", "list", "--json", &project_flag(&h)]));
     let by_name = |n: &str| {
         v["crons"]
@@ -154,11 +154,11 @@ fn list_precedence_project_shadows_global_shadows_builtin() {
     );
     assert_eq!(by_name("alpha")["owner"], "scout");
     assert_eq!(
-        by_name("weekly-review")["source"],
+        by_name("ce-retro")["source"],
         "project",
         "project shadows global+builtin"
     );
-    assert_eq!(by_name("weekly-review")["owner"], "scout");
+    assert_eq!(by_name("ce-retro")["owner"], "scout");
 
     let v = json(&run(
         &h,
@@ -174,8 +174,8 @@ fn list_precedence_project_shadows_global_shadows_builtin() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|c| c["name"] == "weekly-review")
-        .expect("builtin weekly-review");
+        .find(|c| c["name"] == "ce-retro")
+        .expect("builtin ce-retro");
     assert_eq!(wr["source"], "builtin");
     assert_eq!(wr["owner"], "oracle");
     assert_eq!(
@@ -317,7 +317,7 @@ fn pause_builtin_fails() {
         &[
             "cron",
             "pause",
-            "weekly-review",
+            "ce-retro",
             "--project",
             "/nonexistent-proj",
         ],
@@ -377,7 +377,7 @@ fn remove_reveals_lower_tier() {
         &[
             "cron",
             "remove",
-            "weekly-review",
+            "ce-retro",
             "--project",
             "/nonexistent-proj",
         ],

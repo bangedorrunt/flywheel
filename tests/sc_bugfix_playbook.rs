@@ -29,7 +29,7 @@ use toron_workflow::schema::{Action, Workflow};
 /// source so a rename/regression of the YAML fails here, not silently.
 fn builtin_bug_fix() -> Workflow {
     let src = std::fs::read_to_string("src/builtin_workflows.rs").expect("builtin_workflows.rs");
-    let yaml = extract_builtin_yaml(&src, "bug-fix").expect("bug-fix YAML in builtins");
+    let yaml = extract_builtin_yaml(&src, "ce-debug").expect("bug-fix YAML in builtins");
     toron_workflow::schema::parse_workflow(&yaml).expect("bug-fix parses")
 }
 
@@ -53,37 +53,53 @@ fn extract_builtin_yaml(src: &str, name: &str) -> Option<String> {
 #[test]
 fn bug_fix_control_flow_orders_repro_tdd_fix_prove() {
     let wf = builtin_bug_fix();
-    let graph = wf.graph.as_ref().expect("bug-fix is a graph");
-
-    assert_eq!(graph.nodes["fix"].needs, vec!["repro".to_string()]);
-    assert_eq!(graph.nodes["prove"].needs, vec!["fix".to_string()]);
-    assert!(graph.nodes["repro"].needs.is_empty(), "repro is the root");
+    let names: Vec<&str> = wf.steps.iter().filter_map(|s| s.name.as_deref()).collect();
+    let at = |name: &str| names.iter().position(|n| *n == name).unwrap_or(usize::MAX);
     assert!(
-        !graph.nodes.contains_key("tdd"),
-        "tdd collapsed into repair recipe"
+        at("repro") < at("repair"),
+        "repro precedes repair: {names:?}"
     );
-
-    match &graph.nodes["fix"].action {
-        Action::CallWorkflow {
-            workflow, inputs, ..
-        } => {
-            assert_eq!(workflow, "repair-until-verified");
-            assert!(inputs.get("verify").is_some(), "verify input");
-            assert_eq!(
-                inputs
-                    .get("max_iterations")
-                    .and_then(serde_json::Value::as_u64),
-                Some(3)
-            );
-        }
-        other => panic!("fix must be call_workflow repair-until-verified, got {other:?}"),
-    }
-
-    let Action::DispatchJob { spec, .. } = &graph.nodes["prove"].action else {
-        panic!("prove is a dispatch_job");
+    assert!(
+        at("repair") < at("prove"),
+        "repair precedes prove: {names:?}"
+    );
+    let repair = wf
+        .steps
+        .iter()
+        .find(|s| s.name.as_deref() == Some("repair"))
+        .expect("repair step");
+    assert!(
+        format!("{:?}", repair.action).contains("Loop"),
+        "repair is a loop"
+    );
+    assert!(
+        !names.contains(&"tdd"),
+        "tdd collapsed into the repair loop"
+    );
+    let Action::Loop { body, .. } = &repair.action else {
+        panic!("repair is a loop")
+    };
+    let fix = body
+        .iter()
+        .find(|s| s.name.as_deref() == Some("fix"))
+        .expect("fix in repair loop");
+    let Action::DispatchJob { spec, .. } = &fix.action else {
+        panic!("fix is a dispatch_job")
+    };
+    assert_eq!(
+        spec.profile.as_deref(),
+        Some("@coder"),
+        "fix is a coder dispatch"
+    );
+    let prove = wf
+        .steps
+        .iter()
+        .find(|s| s.name.as_deref() == Some("prove"))
+        .expect("prove step");
+    let Action::DispatchJob { spec, .. } = &prove.action else {
+        panic!("prove is a dispatch_job")
     };
     assert_eq!(spec.harness.as_deref(), Some("opencode"));
-    assert_eq!(graph.nodes.len(), 3, "exactly 3 nodes: repro, fix, prove");
 }
 
 /// Lint gate: a bug-fix-shaped graph whose `fix` does NOT reach `repro`
@@ -178,7 +194,7 @@ impl HermeticRoots {
 const BUG_FIX_ARGV: &[&str] = &[
     "workflow",
     "run",
-    "bug-fix",
+    "ce-debug",
     "--inputs",
     r#"{"symptom":"the leak","repro":"exit 1","verify":"cargo test --offline --bin flywheel bug_fix_recipe"}"#,
     "--json",

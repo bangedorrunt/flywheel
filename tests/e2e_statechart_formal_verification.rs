@@ -160,7 +160,7 @@ fn test_cli_workflow_verify_json_contract() {
     );
     assert!(chart_names.contains(&"P2PNegotiation"));
     assert!(
-        chart_names.contains(&"wave-swarm"),
+        chart_names.contains(&"ce-lfg"),
         "wave-swarm verifies as the lowered workflow: {chart_names:?}"
     );
 
@@ -194,13 +194,13 @@ fn test_cli_workflow_verify_single_named_chart() {
     let out = env.run(&["workflow", "verify", "SwarmLifecycle", "--json"]);
     assert!(!out.status.success(), "the retired chart must not verify");
 
-    let out = env.run(&["workflow", "verify", "wave-swarm", "--json"]);
+    let out = env.run(&["workflow", "verify", "ce-lfg", "--json"]);
     assert!(out.status.success());
     let json = stdout_json(&out);
     assert_eq!(json["ok"], true);
     let charts = json["charts"].as_array().unwrap();
     assert_eq!(charts.len(), 1);
-    assert_eq!(charts[0]["name"], "wave-swarm");
+    assert_eq!(charts[0]["name"], "ce-lfg");
 
     // Verify P2PNegotiation alone
     let out = env.run(&["workflow", "verify", "P2PNegotiation", "--json"]);

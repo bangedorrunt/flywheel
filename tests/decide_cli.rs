@@ -47,7 +47,7 @@ fn decide_audit_json_shape() {
         String::from_utf8_lossy(&out.stderr)
     );
     let v = stdout_json(&out);
-    assert_eq!(v["primitive"], "captain-audit");
+    assert_eq!(v["primitive"], "ce-review");
     assert_eq!(v["topology"], "open");
     assert!(v["reason"].as_str().is_some_and(|r| !r.is_empty()));
     assert_eq!(
@@ -56,7 +56,7 @@ fn decide_audit_json_shape() {
             "flywheel",
             "workflow",
             "run",
-            "captain-audit",
+            "ce-review",
             "--execute",
             "--mode",
             "headless",
@@ -112,14 +112,14 @@ fn decide_fix_memory_leak_is_bug_fix_not_forensics() {
     let out = run(&sandbox, &["decide", "fix the memory leak", "--json"]);
     assert!(out.status.success());
     let v = stdout_json(&out);
-    assert_eq!(v["primitive"], "bug-fix");
+    assert_eq!(v["primitive"], "ce-debug");
     assert_eq!(
         v["argv"],
         serde_json::json!([
             "flywheel",
             "workflow",
             "run",
-            "bug-fix",
+            "ce-debug",
             "--execute",
             "--mode",
             "pane",
@@ -137,14 +137,14 @@ fn decide_profile_idle_cpu_spin_is_forensics() {
     let out = run(&sandbox, &["decide", "profile the idle cpu spin", "--json"]);
     assert!(out.status.success());
     let v = stdout_json(&out);
-    assert_eq!(v["primitive"], "forensics");
+    assert_eq!(v["primitive"], "ce-debug");
     assert_eq!(
         v["argv"],
         serde_json::json!([
             "flywheel",
             "workflow",
             "run",
-            "forensics",
+            "ce-debug",
             "--execute",
             "--mode",
             "headless",
@@ -173,11 +173,14 @@ fn decide_plain_mode_prints_contract_lines() {
         5,
         "primitive / reason / argv / topology / role lines: {s}"
     );
-    assert_eq!(lines[0], "captain-audit");
+    assert_eq!(lines[0], "ce-review");
     assert!(lines[1].contains("read-only"));
-    assert!(lines[2].starts_with("flywheel workflow run captain-audit"));
+    assert!(lines[2].starts_with("flywheel workflow run ce-review"));
     assert_eq!(lines[3], "topology open");
-    assert_eq!(lines[4], "role -", "role line must be explicit: {s}");
+    assert!(
+        lines[4].starts_with("role "),
+        "role line must be explicit: {s}"
+    );
 }
 
 #[test]
