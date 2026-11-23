@@ -2635,9 +2635,20 @@ pub(crate) fn lint_flywheel_tier(
     wf: &toron_workflow::schema::Workflow,
     project_root: Option<&std::path::Path>,
 ) -> usize {
+    lint_flywheel_tier_in(name, wf, project_root, None)
+}
+
+pub(crate) fn lint_flywheel_tier_in(
+    name: &str,
+    wf: &toron_workflow::schema::Workflow,
+    project_root: Option<&std::path::Path>,
+    config_root: Option<&std::path::Path>,
+) -> usize {
     let profiles = profile::ProfileCatalog::load().unwrap_or_default();
     let project_stages = project_root.map(|r| r.join(".flywheel").join("stages.toml"));
-    let stages = stages::StageLibrary::load_layered(project_stages.as_deref()).unwrap_or_default();
+    let stages =
+        stages::StageLibrary::load_layered_with_config(project_stages.as_deref(), config_root)
+            .unwrap_or_default();
     let declared_inputs: std::collections::HashSet<&str> =
         wf.inputs.iter().map(|i| i.name.as_str()).collect();
     let mut blocking = 0;
@@ -3357,6 +3368,13 @@ steps:
     /// (lint_workflow) + flywheel tier (profile/stage/inputs resolution).
     #[test]
     fn every_builtin_passes_full_lint_gate() {
+        let config_root =
+            std::env::temp_dir().join(format!("fw-lint-gate-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&config_root);
+        std::fs::create_dir_all(&config_root).expect("empty config root");
+        let gate = |name: &str, wf: &toron_workflow::schema::Workflow| {
+            lint_flywheel_tier_in(name, wf, None, Some(&config_root))
+        };
         for (name, wf) in builtin_workflows::builtin_workflows() {
             let engine = toron_workflow::lint_workflow(&wf);
             assert!(
@@ -3364,12 +3382,28 @@ steps:
                 "built-in {name} fails engine lint: {:?}",
                 engine.issues
             );
-            let tier = lint_flywheel_tier(&name, &wf, None);
+            let tier = gate(&name, &wf);
             assert_eq!(
                 tier, 0,
                 "built-in {name} fails flywheel-tier lint (profile/stage/inputs)"
             );
         }
+        // Negative control: a bad override planted in the INJECTED root must
+        // be seen. Without this the test could pass while reading config_dir().
+        let poison = config_root.join("stages.toml");
+        std::fs::write(
+            &poison,
+            "[stages.ce-work]\nreads = [\"steps.no-such-step\"]\n",
+        )
+        .expect("plant override");
+        let wfs = builtin_workflows::builtin_workflows();
+        let wf = wfs.get("ce-lfg").expect("ce-lfg cataloged");
+        let blocked = gate("ce-lfg", wf);
+        assert!(
+            blocked > 0,
+            "the gate must read the injected config root, not config_dir(): {blocked}"
+        );
+        let _ = std::fs::remove_dir_all(&config_root);
     }
 
     /// ADR-0021 D3 reads gate: a workflow that dispatches judge-arms with

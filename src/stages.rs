@@ -393,9 +393,21 @@ impl StageLibrary {
     /// [`load`] plus the project tier (ADR-0022 §3.8): pass the project's
     /// `.flywheel/stages.toml` path when one may exist.
     pub fn load_layered(project_stages: Option<&std::path::Path>) -> Result<Self> {
+        let default_root = config_dir();
+        Self::load_layered_with_config(project_stages, Some(&default_root))
+    }
+
+    /// A test can pass an empty config root, so the operator's stage overrides
+    /// cannot change the result of a built-in gate.
+    pub fn load_layered_with_config(
+        project_stages: Option<&std::path::Path>,
+        config_root: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        let default_root = config_dir();
+        let root = config_root.unwrap_or(&default_root);
         let mut lib = Self::compiled_in();
         lib.apply_embedded_repo_data()?;
-        lib.override_from_toml()?;
+        lib.override_from_toml_at(root)?;
         if let Some(path) = project_stages {
             lib.apply_toml_path(path, Tier::Project)?;
         }
@@ -592,8 +604,7 @@ impl StageLibrary {
     /// Apply the user `stages.toml` override, then per-entry user files.
     /// Per-entry files are the preferred format and win over the legacy
     /// aggregate when both contain the same stage.
-    fn override_from_toml(&mut self) -> Result<()> {
-        let config_root = config_dir();
+    fn override_from_toml_at(&mut self, config_root: &std::path::Path) -> Result<()> {
         self.apply_toml_path(&config_root.join("stages.toml"), Tier::User)?;
         let entries = config_root.join("stages");
         if !entries.is_dir() {
