@@ -183,7 +183,7 @@ fi
 PLANE_SESSION=""
 SPAWNED_PIN=""
 PI_PIN=""
-GROK_PIN=""
+EVENTS_PIN=""
 # bd-833ya: spawn installs a per-project doorbell supervisor. Retiring the
 # seats alone leaves the project registered, and the next stack install boots
 # that supervisor back up. Drop both the registration and the unit.
@@ -293,8 +293,8 @@ export TORON_BIN
 # pump (the pump reads the registry once at daemon start).
 # bd-oo7zi: the operator-typing guard needs a REAL harness pane. bd-live-wake-
 # pane-isolation: it gets its own pi pane, never the wake leg's opencode pane.
-# grok stays only for the no-door events witness (one seat, no extra API use).
-spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --pi 1 --gk 1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
+# The no-door events witness uses gemini — no grok seat is spawned at all.
+spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --pi 1 --kind gemini=1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
     || die "flywheel spawn failed: $spawn_out"
 seated=""
 for _seat_ready in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do
@@ -323,24 +323,20 @@ SPAWNED_SESSION="$(printf '%s\n' "$spawn_out" | sed -nE 's/.*(session:[^ ]+) cre
 
 # bd-znczi: the events witness needs a NO-DOOR seat — only those get a daemon
 # events pump and an events-<pin>.jsonl journal row (pi/opencode ride their own
-# MCP config instead). Find the grok seat spawned above.
-GROK_PIN="$(FLYWHEEL_BIN="$FLYWHEEL_BIN" "$PYTHON_BIN" - <<'PY'
+# MCP config instead). gemini is no-door; no grok seat is used.
+EVENTS_PIN="$(FLYWHEEL_BIN="$FLYWHEEL_BIN" "$PYTHON_BIN" - <<'PY'
 import json, os, subprocess
 doc = json.loads(subprocess.check_output([
     os.environ["FLYWHEEL_BIN"], "swarm", "status", "e2e-live-five", "--json"
 ], text=True))
 rows = doc.get("seats", doc if isinstance(doc, list) else [])
 for r in rows:
-    if str(r.get("harness", "")).lower() == "grok" and r.get("pin") and r.get("pane_id"):
-        print(f"{r['pin']}\t{r['pane_id']}")
+    if str(r.get("harness", "")).lower() == "gemini" and r.get("pin"):
+        print(r["pin"])
         break
 PY
-)" || die "cannot read the grok seat from swarm status"
-GROK_SEATED="$GROK_PIN"
-GROK_PIN="${GROK_SEATED%%$'\t'*}"
-GROK_PANE="${GROK_SEATED##*$'\t'}"
-[ -n "$GROK_PIN" ] || die "swarm status named no grok seat"
-[ -n "$GROK_PANE" ] || die "the grok seat has no pane"
+)" || die "cannot read the gemini seat from swarm status"
+[ -n "$EVENTS_PIN" ] || die "swarm status named no gemini seat"
 
 # A freshly spawned agent stays WORKING while it boots; the send door correctly
 # refuses "not at a prompt". Poll ITS status until it is idle (up to 2 min).
@@ -389,7 +385,7 @@ for t in "${TESTS[@]}"; do
         export FLYWHEEL_LIVE_AS="$AS"
     fi
     if [ "$t" = "tests/live_events_delivery.rs" ]; then
-        export FLYWHEEL_LIVE_EVENTS_PIN="$GROK_PIN"
+        export FLYWHEEL_LIVE_EVENTS_PIN="$EVENTS_PIN"
     else
         unset FLYWHEEL_LIVE_EVENTS_PIN
     fi
