@@ -5667,6 +5667,121 @@ mod tests {
         assert_eq!(out["agent"], "bravo-seat", "runner must reach Bravo: {out}");
     }
 
+    /// bd-3ann1: the real planner → binding → pane-runner path carries the
+    /// execution stage and the BEAD header all the way to the prompt that a
+    /// bound seat receives. The port observes the actual prompt, not a spec.
+    #[test]
+    fn compose_join_carries_stage_and_bead_header_to_the_runner() {
+        use std::cell::RefCell;
+        let _g = crate::config::lock_env();
+        let project = format!("pane-join-stage-{}", std::process::id());
+        let path = std::env::temp_dir().join(format!("{project}.toml"));
+        std::fs::write(&path, "[profiles.coder]\nharness = \"pi\"\n").unwrap();
+        let catalog = ProfileCatalog::load_from(Some(&path)).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let entries = as_live(vec![
+            crew_row("w1:p1", "alpha-seat", "coder", "Alpha", ""),
+            crew_row("w2:p2", "bravo-seat", "coder", "Bravo", ""),
+        ]);
+        let seats: Vec<crate::seat_binder::LiveSeat> = entries
+            .entries()
+            .iter()
+            .map(|e| crate::seat_binder::LiveSeat {
+                pin: e.mail_identity.clone().unwrap_or_else(|| e.name.clone()),
+                role: e.profile.clone().unwrap_or_else(|| "crew".into()).into(),
+                harness: e.harness.clone().unwrap_or_default().into(),
+                model: e.model.clone(),
+                mode: e.mode.clone(),
+                effort: e.effort.clone(),
+                placement: crate::seat_binder::SeatPlacement::Pane,
+                idle: true,
+                fresh_session: false,
+                idle_since_ms: None,
+            })
+            .collect();
+
+        let wf = toron_workflow::schema::Workflow {
+            name: "joined".into(),
+            description: None,
+            trigger: None,
+            policy: None,
+            guard: None,
+            steps: vec![toron_workflow::schema::Step {
+                name: Some("execute".into()),
+                guard: None,
+                on_error: toron_workflow::schema::StepOnError::Continue,
+                build_slot: false,
+                action: Action::DispatchJob {
+                    assignee: "x".into(),
+                    spec: toron_workflow::schema::DispatchSpec {
+                        profile: Some("@coder".into()),
+                        stage: Some("ce-execute".into()),
+                        ..Default::default()
+                    },
+                    channel: None,
+                    await_: None,
+                    no_claim_timeout: 600,
+                    result_timeout: None,
+                },
+            }],
+            graph: None,
+            inputs: Vec::new(),
+            crew: None,
+            principles: Vec::new(),
+        };
+        let plan = crate::compose_join::plan_join(
+            &wf,
+            &seats,
+            &crate::compose_join::JoinRoles::default(),
+            8,
+        );
+        assert!(
+            plan.steps[0].pin.is_some(),
+            "a live crew must be bound: {plan:?}"
+        );
+        let bound = crate::compose_join::apply_join_bindings(&wf, &plan, Some("bd-42"));
+
+        let seen: RefCell<Option<(String, String)>> = RefCell::new(None);
+        let port = |agent: &str, prompt: &str| -> anyhow::Result<()> {
+            *seen.borrow_mut() = Some((agent.to_string(), prompt.to_string()));
+            Ok(())
+        };
+        let reads = std::collections::BTreeMap::new();
+        let ctx = DispatchContext {
+            scope: DispatchScope {
+                run_id: "run-join",
+                node_path: "execute",
+            },
+            reads: &reads,
+            prompt_port: Some(&port),
+        };
+        let out = pane_dispatch_scoped(
+            &catalog,
+            &project,
+            "wf",
+            &json!({}),
+            &entries,
+            &bound.steps[0].action,
+            None,
+            Some(&ctx),
+        )
+        .expect("the bound step must reach the runner");
+        assert_eq!(
+            out["step"], "ce-execute",
+            "the stage must reach the runner: {out}"
+        );
+        let (agent, prompt) = seen.into_inner().expect("the prompt port ran");
+        assert_eq!(
+            agent, "alpha-seat",
+            "the bound live seat receives it: {agent}"
+        );
+        assert!(
+            prompt.starts_with("BEAD: bd-42"),
+            "the bound work order must lead the typed prompt: {prompt}"
+        );
+    }
+
     /// Test fixture: defaults layered with `[profiles.reviewer] harness = H`
     /// (built-in reviewer's harness is EMPTY — slot-inherit — which never
     /// conflicts, so the pin path needs an explicit harness to fire).
