@@ -78,7 +78,7 @@ pub fn pin_idle(status_json: &str, pin: &str) -> Option<bool> {
 /// A real harness pane can drift back to `working` between the two probes;
 /// wait for idle before either send so the status gate is not what we test.
 fn wait_idle(project: &str, pin: &str) {
-    for _ in 0..24 {
+    for _ in 0..48 {
         let out = Command::new(env!("CARGO_BIN_EXE_flywheel"))
             .args(["swarm", "status", project, "--json"])
             .output()
