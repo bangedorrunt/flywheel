@@ -411,28 +411,13 @@ mod tests {
             .expect("an operator shell has no crew pin");
     }
 
-    /// A sibling that leaks pane state must not turn an operator shell into
-    /// a crew pane. Set the leak WITHOUT a guard (that is how a panicking
-    /// sibling leaves it), prove it changes the fleet guard's answer, then
-    /// show lock_env() scrubs it and the operator path opens again.
+    /// A leaked pane must not turn an operator shell into a crew pane. The
+    /// whole test holds the crate-wide env lock: mutating env before taking
+    /// it raced a sibling in a clean full-suite run.
     #[test]
     fn fleet_guard_env_leak_is_scrubbed_by_the_sandbox() {
         let cfg = crate::config::Config::default();
         let project = format!("fleet-guard-leak-{}", std::process::id());
-        let prev_agent = std::env::var_os("AGENT_NAME");
-        let prev_pane = std::env::var_os("FLYWHEEL_PANE");
-
-        unsafe {
-            std::env::remove_var("AGENT_NAME");
-            std::env::set_var("FLYWHEEL_PANE", "1");
-        }
-        let leaked = super::guard_fleet_mutation(&cfg, Some(&project), false, "stack install")
-            .expect_err("a leaked pane makes the unpinned shell look like a crew pane");
-        assert!(
-            format!("{leaked}").contains("no pin"),
-            "interference must be real: {leaked}"
-        );
-
         let _g = crate::config::lock_env();
         assert!(
             std::env::var_os("FLYWHEEL_PANE").is_none(),
@@ -442,17 +427,20 @@ mod tests {
             std::env::var_os("AGENT_NAME").is_none(),
             "the sandbox scrubs a leaked pin"
         );
+
+        unsafe {
+            std::env::set_var("FLYWHEEL_PANE", "1");
+        }
+        let leaked = super::guard_fleet_mutation(&cfg, Some(&project), false, "stack install")
+            .expect_err("a leaked pane makes the unpinned shell look like a crew pane");
+        assert!(
+            format!("{leaked}").contains("no pin"),
+            "interference must be real: {leaked}"
+        );
+
+        unsafe { std::env::remove_var("FLYWHEEL_PANE") };
         super::guard_fleet_mutation(&cfg, Some(&project), false, "stack install")
             .expect("outside a pane an unpinned identity is the operator shell");
-
-        match prev_pane {
-            Some(v) => unsafe { std::env::set_var("FLYWHEEL_PANE", v) },
-            None => unsafe { std::env::remove_var("FLYWHEEL_PANE") },
-        }
-        match prev_agent {
-            Some(v) => unsafe { std::env::set_var("AGENT_NAME", v) },
-            None => unsafe { std::env::remove_var("AGENT_NAME") },
-        }
     }
 
     /// bd-0uzrq.24: an unset AGENT_NAME is the operator's shell only OUTSIDE a
