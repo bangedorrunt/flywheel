@@ -295,7 +295,9 @@ export TORON_BIN
 # the wake leg must never type into the box another leg is probing.
 spawn_out="$("$FLYWHEEL_BIN" spawn e2e-live-five --oc 1 --gk 1 --model harness-default --escape --yes --retire-orphans 2>&1)" \
     || die "flywheel spawn failed: $spawn_out"
-seated="$(FLYWHEEL_BIN="$FLYWHEEL_BIN" "$PYTHON_BIN" - <<'PY'
+seated=""
+for _seat_ready in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do
+    seated="$(FLYWHEEL_BIN="$FLYWHEEL_BIN" "$PYTHON_BIN" - <<'PY'
 import json, os, subprocess
 doc = json.loads(subprocess.check_output([
     os.environ["FLYWHEEL_BIN"], "swarm", "status", "e2e-live-five", "--json"
@@ -306,6 +308,9 @@ for r in rows:
         print(f"{r['pin']}\t{r['pane_id']}\t{str(r.get('harness', '')).lower()}")
 PY
 )" || die "cannot read the spawned seats from swarm status"
+    [ "$(printf '%s\n' "$seated" | grep -c .)" -ge 2 ] && break
+    sleep 5
+done
 SPAWNED_PIN="$(printf '%s\n' "$seated" | grep $'\topencode' | head -1 | cut -f1)"
 SPAWNED_PANE="$(printf '%s\n' "$seated" | grep $'\topencode' | head -1 | cut -f2)"
 SPAWNED_SESSION="$(printf '%s\n' "$spawn_out" | sed -nE 's/.*(session:[^ ]+) created.*/\1/p' | head -1)"
