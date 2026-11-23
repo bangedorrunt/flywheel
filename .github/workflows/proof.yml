@@ -93,6 +93,16 @@ jobs:
         with: { toolchain: nightly-2026-08-20 }
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: 'flywheel\ntoron\nelm-effect-rs' }
+      - name: Checkout beads (br CLI, GS-025)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: bangedorrunt/beads, path: beads }
+      - name: Build br + toron CLIs onto PATH
+        run: |
+          cargo build -p beads --bin br --manifest-path beads/Cargo.toml
+          cargo build -p toron-cli --bin toron --manifest-path toron/Cargo.toml
+          echo "$GITHUB_WORKSPACE/beads/target/debug" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toron/target/debug" >> "$GITHUB_PATH"
+          which br toron
       - uses: taiki-e/install-action@f7203e66315af55e5c0f3e20a099b4d9bb5f6bba # v2.62.0
         with: { tool: cargo-nextest }
       - name: Test shard ${{ matrix.shard }}/4
@@ -115,12 +125,26 @@ jobs:
         with: { toolchain: nightly-2026-08-20, components: rustfmt,clippy }
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: 'flywheel\ntoron\nelm-effect-rs' }
-      - name: Needles, sandbox, clippy, jargon (unit test)
+      - name: Checkout beads (br CLI, GS-025)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: bangedorrunt/beads, path: beads }
+      - name: Build br + toron CLIs onto PATH
+        run: |
+          cargo build -p beads --bin br --manifest-path beads/Cargo.toml
+          cargo build -p toron-cli --bin toron --manifest-path toron/Cargo.toml
+          echo "$GITHUB_WORKSPACE/beads/target/debug" >> "$GITHUB_PATH"
+          echo "$GITHUB_WORKSPACE/toron/target/debug" >> "$GITHUB_PATH"
+          which br toron
+      - name: Needles, sandbox, clippy, fmt, jargon, ledger gates
         working-directory: flywheel
         run: |
           bash scripts/verify-needles.sh
           bash scripts/check-test-sandbox.sh
-          cargo clippy -p flywheel --bin flywheel --tests -- -D warnings
+          bash scripts/check-peer-aware-sot.sh
+          bash scripts/check-beads-ledger.sh --history
+          cargo check --workspace
+          cargo clippy --all-targets -- -D warnings
+          cargo fmt --check
           cargo test -p flywheel --bin flywheel no_jargon_in_any_agent_facing_string
 
   mutations:
