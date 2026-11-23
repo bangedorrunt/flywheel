@@ -127,6 +127,7 @@ fn composed_join_dispatches_the_bound_step_to_the_live_pin() {
             "--join",
             "--run",
             "--yes",
+            "--retire-orphans",
             "--project",
             &project,
         ],
