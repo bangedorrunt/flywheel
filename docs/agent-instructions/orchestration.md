@@ -79,9 +79,9 @@ chains, maximum depth (`8` including the root), or exhausted child budget
 the child and the lineage is carried in the serialized trigger for replay.
 
 
-A **stage** is one prompt (`send --stage`). The verify-phase `ce-evaluate`
-stage is advisory and structured; the following host `VerifySink` owns the
-verdict. A **compose token** (`wave-swarm`, `repair-until-verified`) expands to a compiled-in
+A **stage** is one prompt (`send --stage`). The verify-phase `ce-verify`
+(formerly `ce-evaluate`) stage is advisory and structured; the gate exit owns
+the pass/fail verdict and the host `VerifySink` records it. A **compose token** (`wave-swarm`, `repair-until-verified`) expands to a compiled-in
 workflow when used as a bare `--parts` name. A **profile** is role →
 harness/model; `crew: auto` counts `@roles`. `flywheel squad`
 is a group of profiles (spawn shape) — say "squad," not

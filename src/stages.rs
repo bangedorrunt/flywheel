@@ -12,7 +12,7 @@
 //!
 //! governed-by: ADR-0005 Spec 2a, P3.3; ADR-0009
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -637,11 +637,33 @@ impl StageLibrary {
             .unwrap_or_else(|| name.to_string())
     }
 
+    /// Return a stage deprecation notice once per alias name per process.
+    pub(crate) fn should_emit_stage_deprecation(
+        seen: &mut BTreeSet<String>,
+        name: &str,
+        canonical: &str,
+    ) -> Option<String> {
+        if canonical == name || !seen.insert(name.to_string()) {
+            return None;
+        }
+        Some(format!(
+            "flywheel: stage '{name}' is deprecated; use '{canonical}' (one release)"
+        ))
+    }
+
     /// The full stage record for a name.
     pub fn get_stage(&self, name: &str) -> Option<&Stage> {
         let canonical = self.canonical(name);
         if canonical != name {
-            eprintln!("flywheel: stage '{name}' is deprecated; use '{canonical}' (one release)");
+            static SEEN_DEPRECATIONS: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> =
+                std::sync::OnceLock::new();
+            let lock = SEEN_DEPRECATIONS.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()));
+            let msg = lock.lock().ok().and_then(|mut seen| {
+                Self::should_emit_stage_deprecation(&mut seen, name, &canonical)
+            });
+            if let Some(msg) = msg {
+                eprintln!("{msg}");
+            }
         }
         self.stages.get(&canonical)
     }
@@ -2487,5 +2509,17 @@ mod unused_stage_gate_tests {
             Some(super::StageReach::Compose),
             "ce-explore is reached by a compose token"
         );
+    }
+
+    #[test]
+    fn stage_deprecation_notice_emits_once_per_name() {
+        let mut seen = std::collections::BTreeSet::new();
+        let first = StageLibrary::should_emit_stage_deprecation(&mut seen, "ce-execute", "ce-work");
+        assert!(first.is_some());
+        let second =
+            StageLibrary::should_emit_stage_deprecation(&mut seen, "ce-execute", "ce-work");
+        assert!(second.is_none());
+        let same = StageLibrary::should_emit_stage_deprecation(&mut seen, "ce-work", "ce-work");
+        assert!(same.is_none());
     }
 }

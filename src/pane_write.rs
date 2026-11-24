@@ -82,14 +82,36 @@ pub enum PaneOp {
 }
 
 /// The constant wake line for a watermark (redesign §4.1, §6A.4).
+#[must_use]
 pub fn wake_line(_wm: Wm, urgency: Urgency) -> String {
+    wake_line_for(_wm, urgency, "", "", "")
+}
+
+/// Render a wake line with explicit project, recipient, and sender context so
+/// `toron next` and `toron mail send` carry `--project` and `--as` flags.
+#[must_use]
+pub fn wake_line_for(
+    _wm: Wm,
+    urgency: Urgency,
+    project: &str,
+    recipient: &str,
+    sender: &str,
+) -> String {
     // bd-ofa1s: plain English, no machine ids in prose. The watermark stays
     // available to the typed `Wm` carrier for dedupe (bd-tdpix).
     let class = match urgency {
         Urgency::Normal => doorbell_core::EventClass::PlanePMail,
         Urgency::Urgent => doorbell_core::EventClass::PlanePUrgent,
     };
-    doorbell_core::agent_text::render(class, &doorbell_core::agent_text::WakeCtx::default())
+    doorbell_core::agent_text::render(
+        class,
+        &doorbell_core::agent_text::WakeCtx {
+            recipient,
+            project,
+            sender,
+            ..Default::default()
+        },
+    )
 }
 
 /// P2P multiplayer reactive wake dispatch line (bd-p2p-multiplayer-mesh-xf1da).
@@ -463,6 +485,21 @@ mod tests {
         assert_eq!(a, wake_line(Wm(41), Urgency::Normal));
         assert_eq!(a, wake_line(Wm(42), Urgency::Normal));
         assert!(!a.contains("41") && !a.contains("42"));
+    }
+
+    #[test]
+    fn wake_line_for_includes_project_and_pin_flags() {
+        let line = wake_line_for(
+            Wm(7),
+            Urgency::Urgent,
+            "flywheel",
+            "DustyHollow",
+            "AmberFalcon",
+        );
+        assert!(line.contains("toron next --project flywheel --as DustyHollow"));
+        assert!(
+            line.contains("toron mail send --project flywheel --as DustyHollow --to AmberFalcon")
+        );
     }
 
     fn walk(root: &std::path::Path, rel: &str, out: &mut Vec<(String, String)>) {

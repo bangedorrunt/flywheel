@@ -791,6 +791,24 @@ fn rex_quote_env_value(v: &str) -> String {
     }
 }
 
+/// Compose the step prompt from an optional stage contract and an optional
+/// task string so a workflow step with both never drops the stage rules.
+#[must_use]
+pub(crate) fn compose_dispatch_prompt(
+    stage_prompt: Option<&str>,
+    task: Option<&str>,
+    fallback: &str,
+) -> String {
+    let stage = stage_prompt.map(str::trim).filter(|s| !s.is_empty());
+    let task = task.map(str::trim).filter(|s| !s.is_empty());
+    match (stage, task) {
+        (Some(stage), Some(task)) => format!("{stage}\n\nTASK: {task}"),
+        (Some(stage), None) => stage.to_string(),
+        (None, Some(task)) => task.to_string(),
+        (None, None) => fallback.to_string(),
+    }
+}
+
 /// Build the one-string rex launch command. `session.new_split` has no env
 /// map, so the pane env rides as an `env K=V` prefix (LinenQuill). `plane_*`
 /// integration env belongs to the hc plane and is dropped — a rex pane
@@ -1815,13 +1833,16 @@ pub fn pane_dispatch_scoped(
             }
         }
     }
-    let mut base = match headless::dispatch_spec_task(spec) {
-        Some(task) if !task.trim().is_empty() => task.to_string(),
-        _ => match headless::dispatch_spec_stage(spec) {
-            Some(s) => crate::stage_prompt(s)?,
-            None => headless::base_prompt_for(wf_name, inputs),
-        },
+    let stage_prompt = match headless::dispatch_spec_stage(spec) {
+        Some(s) => Some(crate::stage_prompt(s)?),
+        None => None,
     };
+    let fallback = headless::base_prompt_for(wf_name, inputs);
+    let mut base = compose_dispatch_prompt(
+        stage_prompt.as_deref(),
+        headless::dispatch_spec_task(spec),
+        &fallback,
+    );
     for key in ["plan", "project"] {
         if let Some(extra) = headless::spec_extra(spec, key, inputs) {
             base.push_str("\n\n");
@@ -3702,6 +3723,24 @@ mod tests {
             no_claim_timeout: 600,
             context: None,
         }
+    }
+
+    #[test]
+    fn compose_dispatch_prompt_preserves_stage_when_task_is_present() {
+        let both = compose_dispatch_prompt(Some("STAGE RULES"), Some("do work"), "fallback");
+        assert_eq!(both, "STAGE RULES\n\nTASK: do work");
+        assert_eq!(
+            compose_dispatch_prompt(Some("  STAGE RULES  "), None, "fallback"),
+            "STAGE RULES"
+        );
+        assert_eq!(
+            compose_dispatch_prompt(None, Some("  do work  "), "fallback"),
+            "do work"
+        );
+        assert_eq!(
+            compose_dispatch_prompt(Some("  "), Some(""), "fallback"),
+            "fallback"
+        );
     }
 
     /// The durable spawn launcher is a PLANE door (backends.md: spawn, crew

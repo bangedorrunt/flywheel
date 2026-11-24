@@ -478,7 +478,13 @@ impl PromptDispatch {
         } else {
             crate::pane_write::Urgency::Normal
         };
-        crate::pane_write::wake_line(crate::pane_write::Wm(wm), urgency)
+        crate::pane_write::wake_line_for(
+            crate::pane_write::Wm(wm),
+            urgency,
+            &self.project,
+            &self.pin,
+            &self.sender,
+        )
     }
 
     pub(crate) fn confirmation(&self, wm: u64) -> Value {
@@ -1784,8 +1790,8 @@ mod tests {
         );
         let wake = dispatch.wake_line(42);
         assert!(
-            wake.contains("toron next"),
-            "wake must be compliant: {wake}"
+            wake.contains("toron next --project flywheel --as BlackGorge"),
+            "wake must include --project and --as: {wake}"
         );
         let confirmation = dispatch.confirmation(42);
         assert_eq!(confirmation["pin"], "BlackGorge");
