@@ -22,6 +22,9 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   CARGO_BIN: cargo
+  # CI first-run base: last local green (6009acb7) mapped through the history
+  # rewrite; local clean-proof derives its own base and keeps proof.toml clean.
+  MUTATION_BASE: 83db630ba936552c64bee88f9e6254992c172c24
 
 jobs:
   prepare:
@@ -53,7 +56,7 @@ jobs:
         run: |
           all="$(find scripts/mutations -maxdepth 1 -name '*.spec.sh' -printf '%f\n' | sed 's#\.spec\.sh$##' | jq -Rsc 'split("\n") | map(select(length>0))')"
           echo "all=$all" >> "$GITHUB_OUTPUT"
-          base="$(awk '/^\[mutations\]/{inside=1; next} /^\[/{inside=0} inside && /^base = /{gsub(/"/,"",$3); print $3}' proof.toml)"
+          base="${MUTATION_BASE:-}"
           [ -n "$base" ] || { echo "proof.toml needs [mutations] base for CI" >&2; exit 1; }
           git cat-file -e "$base^{commit}" || { echo "mutation base $base is not a commit" >&2; exit 1; }
           echo "base=$base" >> "$GITHUB_OUTPUT"

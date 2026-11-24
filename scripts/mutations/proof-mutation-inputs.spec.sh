@@ -16,7 +16,7 @@ mutation "B1  the cache key uses the commit sha again" \
 mutation "B2  a stale base is pinned again" \
     file=proof.toml \
     expect=clean_proof_scopes_mutations_and_shares_one_target_dir \
-    find='base = "83db630ba936552c64bee88f9e6254992c172c24"' \
+    find='# base = "<sha>"' \
     replace='base = "d243d21948ed7d6c4b424b30455fa7dcd04c1001"'
 
 mutation "B3  each mutation export cold-builds again" \
