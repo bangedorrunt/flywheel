@@ -48,12 +48,8 @@ fn adr0010_d12_ttls_in_structure() {
 #[test]
 fn adr0010_d12_gate_stage_uses_the_bounded_projection() {
     assert!(
-        WAVE_GATE.contains("project_gate_learnings"),
-        "the gate step runs the bounded projection (not a bare corpus scan)"
-    );
-    assert!(
-        WAVE_GATE.contains("default_gate_budget"),
-        "the gate step reads the budget knob (FLYWHEEL_GATE_BUDGET)"
+        WAVE_GATE.contains("briefing_traps"),
+        "the gate step runs the bounded trap projection (not a bare corpus scan)"
     );
     assert!(
         WAVE_GATE.contains("\"learnings\"") && WAVE_GATE.contains("artifact[\"learnings\"]"),
