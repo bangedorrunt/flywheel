@@ -34,6 +34,7 @@ PATH_VALUE="$TMP/fakeshim:$TMP/bin:/usr/bin:/bin"
 status() {
   env -i HOME="$TMP/home" XDG_STATE_HOME="$TMP/state" XDG_CONFIG_HOME="$TMP/config" \
     CARGO_INSTALL_ROOT="$TMP/cargo" CARGO_CMD=cargo FLYWHEEL_SOURCE="$TMP/src" \
+    DOORBELL_URL="http://127.0.0.1:1" \
     PATH="$PATH_VALUE" bash "$ROOT/scripts/stack.sh" status --check 2>&1
 }
 
@@ -47,6 +48,7 @@ pass "status --check reports an invalid side plist"
 set +e
 out="$(env -i HOME="$TMP/home" XDG_STATE_HOME="$TMP/state" XDG_CONFIG_HOME="$TMP/config" \
   CARGO_INSTALL_ROOT="$TMP/cargo" CARGO_CMD=cargo FLYWHEEL_SOURCE="$TMP/src" \
+  DOORBELL_URL="http://127.0.0.1:1" \
   PATH="$PATH_VALUE" bash "$ROOT/scripts/stack.sh" install --operator --no-restart \
   --no-codesign --skip-toron 2>&1)"
 install_rc=$?
