@@ -12,6 +12,8 @@
 //! surface + budget-cap fail-closed gate in the Compose arm), ADR-0026
 
 #![cfg_attr(not(feature = "serve"), allow(dead_code))]
+// clap's derive generates the frames; the lint is nursery on newer nightlies.
+#![allow(unknown_lints, clippy::large_unopt_stack_frames)]
 
 mod adr0021_gates;
 mod agent_ref;
