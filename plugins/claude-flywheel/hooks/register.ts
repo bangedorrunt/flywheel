@@ -64,6 +64,15 @@ export const register = (on: any, deps: RegisterDeps = {}) => {
     }
   };
 
+  const spawnChild = (
+    $: any,
+    argv: readonly string[],
+    env: Record<string, string | undefined>,
+  ): Child =>
+    deps.spawn
+      ? asChild(deps.spawn(argv, env))
+      : asChild($.process.spawn({ argv, env }) as Child);
+
   const consume = async ($, child: Child, subscriptionId: string) => {
     let buffer = "";
     try {
@@ -76,7 +85,14 @@ export const register = (on: any, deps: RegisterDeps = {}) => {
           buffer = buffer.slice(at + 1);
           if (!line) continue;
           const frame = decodeFrame(line, subscriptionId);
-          if (!frame || !claimEvent(RUNG, frame.id)) continue;
+          if (!frame) continue;
+          const claimed = await claimEvent(
+            (argv, env) => spawnChild($, argv, env),
+            RUNG,
+            frame.id,
+            deps.flywheelBin,
+          );
+          if (!claimed) continue;
           // bd-krzqu: the host exposes no busy flag. Track the turn ourselves
           // from the turn.start/complete/abort hooks registered below.
           const idle = !busy;
@@ -119,9 +135,7 @@ export const register = (on: any, deps: RegisterDeps = {}) => {
       pin,
       "--follow",
     ];
-    const child = deps.spawn
-      ? asChild(deps.spawn(argv, env))
-      : asChild($.process.spawn({ argv, env }) as Child);
+    const child = spawnChild($, argv, env);
     void consume($, child, pin);
   };
 

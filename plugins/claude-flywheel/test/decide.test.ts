@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -88,10 +88,38 @@ test("delivery stops after three failed checks", () => {
   assert.doesNotMatch(statusHealthy(), /stopped/);
 });
 
-test("exactly one claimer of a bus event id delivers", () => {
-  const dir = mkdtempSync(join(tmpdir(), "fw-claude-claim-"));
-  assert.equal(claimEvent(dir, "evt-42"), true);
-  assert.equal(claimEvent(dir, "evt-42"), false);
+test("exactly one claimer of a bus event id delivers", async () => {
+  const seen = new Set<string>();
+  const spawn: SpawnFn = (argv) => {
+    const key = `${argv[3]}:${argv[5]}`;
+    const first = !seen.has(key);
+    seen.add(key);
+    return {
+      stdout: (async function* (): AsyncGenerator<Piece> {
+        yield { stream: "stdout", text: first ? "claimed\n" : "duplicate\n" };
+      })(),
+    };
+  };
+  assert.equal(await claimEvent(spawn, "/tmp/rung", "evt-42"), true);
+  assert.equal(await claimEvent(spawn, "/tmp/rung", "evt-42"), false);
+});
+
+test("plugin hooks and src use only relative imports or claude-code (no node:* imports)", () => {
+  const root = new URL("..", import.meta.url);
+  for (const sub of ["hooks", "src"]) {
+    const dir = new URL(sub + "/", root);
+    for (const file of readdirSync(dir)) {
+      if (!file.endsWith(".ts")) continue;
+      const src = readFileSync(new URL(file, dir), "utf8");
+      for (const m of src.matchAll(/\bfrom\s+["']([^"']+)["']/g)) {
+        const spec = m[1];
+        assert.ok(
+          spec.startsWith("./") || spec.startsWith("../") || spec === "claude-code",
+          `${sub}/${file} imports disallowed specifier: ${spec}`,
+        );
+      }
+    }
+  }
 });
 
 test("decodeFrame reads the real proxy frame, not an occurrence", () => {
@@ -138,7 +166,18 @@ interface Harness {
 
 function harnessSpawn(frames: string[]): { spawn: SpawnFn; h: Harness } {
   const h: Harness = { submits: [], appends: [], statuses: [], retried: null, handlers: {}, spawnArgv: null };
+  const claimed = new Set<string>();
   const spawn: SpawnFn = (argv, _env) => {
+    if (argv[1] === "__claim-wake") {
+      const key = `${argv[3]}:${argv[5]}`;
+      const won = !claimed.has(key);
+      claimed.add(key);
+      return {
+        stdout: (async function* (): AsyncGenerator<Piece> {
+          yield { stream: "stdout", text: won ? "claimed\n" : "duplicate\n" };
+        })(),
+      };
+    }
     h.spawnArgv = argv;
     return {
       stdout: (async function* (): AsyncGenerator<Piece> {
@@ -201,14 +240,27 @@ test("turn.start defers mid-turn; turn.complete restores idle", async () => {
   const gate = new Promise<void>((r) => { emit = r; });
   const midHarness = (() => {
     const h: Harness = { submits: [], appends: [], statuses: [], retried: null, handlers: {}, spawnArgv: null };
-    const spawn: SpawnFn = () => ({
-      stdout: (async function* (): AsyncGenerator<Piece> {
-        await gate;
-        for (const f of [urgentLine("evt-mid"), frameLine({ event_id: "evt-normal" })]) {
-          yield { stream: "stdout", text: f + "\n" };
-        }
-      })(),
-    });
+    const claimed = new Set<string>();
+    const spawn: SpawnFn = (argv) => {
+      if (argv[1] === "__claim-wake") {
+        const key = `${argv[3]}:${argv[5]}`;
+        const won = !claimed.has(key);
+        claimed.add(key);
+        return {
+          stdout: (async function* (): AsyncGenerator<Piece> {
+            yield { stream: "stdout", text: won ? "claimed\n" : "duplicate\n" };
+          })(),
+        };
+      }
+      return {
+        stdout: (async function* (): AsyncGenerator<Piece> {
+          await gate;
+          for (const f of [urgentLine("evt-mid"), frameLine({ event_id: "evt-normal" })]) {
+            yield { stream: "stdout", text: f + "\n" };
+          }
+        })(),
+      };
+    };
     return { h, spawn };
   })();
   const regMid = (await import("../hooks/register.ts?turn-mid")).register;
@@ -225,15 +277,37 @@ test("turn.start defers mid-turn; turn.complete restores idle", async () => {
 
   // After turn.complete: normal mail submits again.
   freshEnv();
-  const after = harnessSpawn([frameLine({ event_id: "evt-after" })]);
+  let emitAfter!: () => void;
+  const gateAfter = new Promise<void>((r) => { emitAfter = r; });
+  const afterClaimed = new Set<string>();
+  const afterH: Harness = { submits: [], appends: [], statuses: [], retried: null, handlers: {}, spawnArgv: null };
+  const afterSpawn: SpawnFn = (argv) => {
+    if (argv[1] === "__claim-wake") {
+      const key = `${argv[3]}:${argv[5]}`;
+      const won = !afterClaimed.has(key);
+      afterClaimed.add(key);
+      return {
+        stdout: (async function* (): AsyncGenerator<Piece> {
+          yield { stream: "stdout", text: won ? "claimed\n" : "duplicate\n" };
+        })(),
+      };
+    }
+    return {
+      stdout: (async function* (): AsyncGenerator<Piece> {
+        await gateAfter;
+        yield { stream: "stdout", text: frameLine({ event_id: "evt-after" }) + "\n" };
+      })(),
+    };
+  };
   const regAfter = (await import("../hooks/register.ts?turn-after")).register;
-  regAfter((name, fn) => { after.h.handlers[name] = fn; }, { spawn: after.spawn });
-  const $after = make$(after.h);
-  await after.h.handlers["session.start"]($after, {}, async (e) => e);
-  await after.h.handlers["turn.start"]($after, {}, async (e) => e);
-  await after.h.handlers["turn.complete"]($after, {}, async (e) => e);
+  regAfter((name, fn) => { afterH.handlers[name] = fn; }, { spawn: afterSpawn });
+  const $after = make$(afterH);
+  await afterH.handlers["session.start"]($after, {}, async (e) => e);
+  await afterH.handlers["turn.start"]($after, {}, async (e) => e);
+  await afterH.handlers["turn.complete"]($after, {}, async (e) => e);
+  emitAfter();
   await new Promise((r) => setTimeout(r, 50));
-  assert.equal(after.h.submits.length, 1, "normal mail submits once idle");
+  assert.equal(afterH.submits.length, 1, "normal mail submits once idle");
   resetEnv();
 });
 

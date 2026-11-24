@@ -809,6 +809,67 @@ pub(crate) fn compose_dispatch_prompt(
     }
 }
 
+const REX_MAX_INLINE_CMD_BYTES: usize = 768;
+
+/// Render a self-deleting POSIX wrapper script for long Rex launch commands
+/// that would exceed macOS termios `MAX_CANON` (1024 B) if typed inline.
+#[must_use]
+pub(crate) fn rex_launch_script_contents(
+    env: &BTreeMap<String, String>,
+    kind: &str,
+    args: &[String],
+) -> String {
+    let inner = rex_env_command(env, kind, args);
+    format!("#!/bin/sh\nrm -f \"$0\"\nexec {inner}\n")
+}
+
+/// Prepare a Rex pane launch command, spilling to `<state_dir>/launch/<key>.sh`
+/// when the inline `env ...` command exceeds `REX_MAX_INLINE_CMD_BYTES`.
+pub(crate) fn prepare_rex_launch_command(
+    state_dir: &std::path::Path,
+    seat_key: &str,
+    env: &BTreeMap<String, String>,
+    kind: &str,
+    args: &[String],
+) -> Result<String> {
+    let inline = rex_env_command(env, kind, args);
+    if inline.len() <= REX_MAX_INLINE_CMD_BYTES {
+        return Ok(inline);
+    }
+    let launch_dir = state_dir.join("launch");
+    std::fs::create_dir_all(&launch_dir)
+        .with_context(|| format!("create rex launch dir {}", launch_dir.display()))?;
+    let safe: String = seat_key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect();
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let script_path = launch_dir.join(format!("{safe}-{suffix}.sh"));
+    let body = rex_launch_script_contents(env, kind, args);
+    std::fs::write(&script_path, body)
+        .with_context(|| format!("write rex launch script {}", script_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 0700 {}", script_path.display()))?;
+    }
+    Ok(format!(
+        "sh {}",
+        rex_quote_env_value(&script_path.to_string_lossy())
+    ))
+}
+
 /// Build the one-string rex launch command. `session.new_split` has no env
 /// map, so the pane env rides as an `env K=V` prefix (LinenQuill). `plane_*`
 /// integration env belongs to the hc plane and is dropped — a rex pane
@@ -3722,6 +3783,34 @@ mod tests {
             await_: true,
             no_claim_timeout: 600,
             context: None,
+        }
+    }
+
+    #[test]
+    fn prepare_rex_launch_command_spills_long_env_to_executable_script() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut short_env = BTreeMap::new();
+        short_env.insert("AGENT_NAME".to_string(), "DustyHollow".to_string());
+        let short_cmd =
+            prepare_rex_launch_command(dir.path(), "DustyHollow", &short_env, "claude", &[])
+                .expect("short cmd");
+        assert!(!short_cmd.starts_with("sh "), "{short_cmd}");
+
+        let mut long_env = short_env;
+        long_env.insert("PATH".to_string(), "/usr/bin:".repeat(120));
+        let spilled =
+            prepare_rex_launch_command(dir.path(), "DustyHollow", &long_env, "claude", &[])
+                .expect("spilled cmd");
+        assert!(spilled.starts_with("sh "), "{spilled}");
+        let script_path = spilled.strip_prefix("sh ").unwrap().trim_matches('\'');
+        let body = std::fs::read_to_string(script_path).expect("script written");
+        assert!(body.starts_with("#!/bin/sh\nrm -f \"$0\"\nexec env "));
+        assert!(body.contains("AGENT_NAME=DustyHollow"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(script_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o700, 0o700);
         }
     }
 

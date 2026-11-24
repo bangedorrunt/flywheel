@@ -204,6 +204,14 @@ pub(crate) fn cmd_add_rex(
             }
             let identity = mail_identity.as_deref().unwrap_or(&name);
             let (mut add_args, env_model_pin) = add_model_launch(&kind, model)?;
+            if crate::harness_registry::canonical(&kind) == "claude" {
+                let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    format!("{home}/.local/share")
+                });
+                add_args.push("--plugin-dir".to_string());
+                add_args.push(format!("{data_home}/flywheel/plugins/claude-flywheel"));
+            }
             if crate::needs_in_arg_prime(&kind) {
                 add_args.push(crate::boot_prime_line().to_string());
             }
@@ -216,23 +224,38 @@ pub(crate) fn cmd_add_rex(
                 .pane_split(&prev, "down", Some(&cwd))
                 .map_err(|e| anyhow!("add {name}: rex split failed: {e:#}"))?;
             prev = split_pane.pane_id.clone();
-            let command = crate::pane::rex_env_command(&pane_env, &kind, &add_args);
+            if let Err(e) = crate::pane::wait_rex_shell_ready(
+                &*backend,
+                &prev,
+                &name,
+                &prev,
+                Duration::from_secs(15),
+            ) {
+                eprintln!("flywheel: warn: {name} shell readiness check: {e:#}");
+            }
+            let command = crate::pane::prepare_rex_launch_command(
+                &crate::config::state_dir(),
+                identity,
+                &pane_env,
+                &kind,
+                &add_args,
+            )?;
             if let Err(e) = backend.pane_run(&prev, &command) {
                 bail!("add {name}: rex run failed on {prev}: {e:#}");
             }
             if let Err(e) = backend.agent_rename(&prev, Some(identity)) {
                 eprintln!("flywheel: warn: add rename {prev} → {identity} failed: {e:#}");
             }
-            if let Err(e) = backend.agent_wait(
-                &prev,
-                &[
-                    crate::hc::AgentStatus::Idle,
-                    crate::hc::AgentStatus::Working,
-                ],
-                Some(90_000),
-            ) {
-                eprintln!("flywheel: warn: {name} not ready within 90s of add: {e:#}");
-            }
+            backend
+                .agent_wait(
+                    &prev,
+                    &[
+                        crate::hc::AgentStatus::Idle,
+                        crate::hc::AgentStatus::Working,
+                    ],
+                    Some(90_000),
+                )
+                .map_err(|e| anyhow!("add {name}: agent did not reach ready in {prev}: {e:#}"))?;
             if settle_secs > 0 {
                 std::thread::sleep(Duration::from_secs(settle_secs));
             }

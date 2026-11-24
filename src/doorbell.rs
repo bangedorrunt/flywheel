@@ -111,7 +111,7 @@ pub fn preferred_workspace(
 /// One-line identity prime. Injected even with `--no-peer-aware` (D1 item 1).
 pub fn identity_prime(name: &str, mail_identity: &str) -> String {
     format!(
-        "You are {name}. Your mail identity is {mail_identity}. Before any spawn: flywheel arrive <project> --as {mail_identity} then flywheel briefing \"<objective>\" --json. Guard will block unattributed/unreserved commits."
+        "MODE crew -- You are {name}. Your mail identity is {mail_identity}. Do not run flywheel briefing (you are crew, not captain). Guard will block unattributed/unreserved commits."
     )
 }
 

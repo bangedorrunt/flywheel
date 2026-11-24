@@ -13,7 +13,7 @@ pub const RUNG_DIR: &str = "wake-rung";
 /// so no language sweeps another's marker early (bd-tdpix review).
 pub const WAKE_RUNG_TTL_SECS: u64 = 86_400;
 
-fn marker_path(state_dir: &Path, event_id: &str) -> PathBuf {
+fn marker_path_in(dir: &Path, event_id: &str) -> PathBuf {
     let mut safe: String = event_id
         .chars()
         .map(|c| {
@@ -28,21 +28,25 @@ fn marker_path(state_dir: &Path, event_id: &str) -> PathBuf {
     if safe.is_empty() {
         safe.push_str("empty");
     }
-    state_dir.join(RUNG_DIR).join(format!("{safe}.rung"))
+    dir.join(format!("{safe}.rung"))
 }
 
-/// True only for the FIRST claimer of `event_id`. `create_new` is
-/// O_CREAT|O_EXCL: a racing writer gets AlreadyExists and loses the claim.
-pub fn claim(state_dir: &Path, event_id: &str) -> bool {
-    let dir = state_dir.join(RUNG_DIR);
-    if std::fs::create_dir_all(&dir).is_err() {
+/// True only for the FIRST claimer of `event_id` directly inside `dir`.
+pub fn claim_in_dir(dir: &Path, event_id: &str) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
         return false;
     }
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(marker_path(state_dir, event_id))
+        .open(marker_path_in(dir, event_id))
         .is_ok()
+}
+
+/// True only for the FIRST claimer of `event_id`. `create_new` is
+/// O_CREAT|O_EXCL: a racing writer gets AlreadyExists and loses the claim.
+pub fn claim(state_dir: &Path, event_id: &str) -> bool {
+    claim_in_dir(&state_dir.join(RUNG_DIR), event_id)
 }
 
 /// Remove markers older than `max_age_secs` (best effort), returning how many.

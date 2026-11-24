@@ -1,25 +1,42 @@
-// bd-tdpix wake-rung, node spelling: O_CREAT|O_EXCL, exactly one claimer per
-// bus event id across Rust and TypeScript. The plugin claims BEFORE delivery.
+// bd-tdpix wake-rung, restricted-loader safe: delegate O_CREAT|O_EXCL to
+// `flywheel __claim-wake` via the host spawn primitive so zero `node:*` imports
+// are required inside Claude Code's plugin loader.
 
-import { closeSync, mkdirSync, openSync } from "node:fs";
-import { join } from "node:path";
-
-export function markerPath(dir: string, eventId: string): string {
-  const safe = [...eventId]
-    .map((c) => (/[A-Za-z0-9_-]/.test(c) ? c : "_"))
-    .slice(0, 120)
-    .join("");
-  return join(dir, `${safe || "empty"}.rung`);
+export interface ClaimPiece {
+  stream: string;
+  text: string;
 }
 
-export function claimEvent(dir: string, eventId: string): boolean {
-  mkdirSync(dir, { recursive: true });
-  try {
-    const fd = openSync(markerPath(dir, eventId), "wx");
-    closeSync(fd);
-    return true;
-  } catch (e: any) {
-    if (e?.code === "EEXIST") return false;
-    throw e;
+export interface ClaimChild {
+  stdout: AsyncIterable<ClaimPiece>;
+}
+
+export type ClaimSpawnFn = (
+  argv: readonly string[],
+  env: Record<string, string | undefined>,
+) => ClaimChild | AsyncIterable<ClaimPiece>;
+
+const asClaimChild = (c: ClaimChild | AsyncIterable<ClaimPiece>): ClaimChild =>
+  Symbol.asyncIterator in c ? { stdout: c as AsyncIterable<ClaimPiece> } : c;
+
+export function claimArgv(
+  dir: string,
+  eventId: string,
+  flywheelBin = "flywheel",
+): readonly string[] {
+  return [flywheelBin, "__claim-wake", "--dir", dir, "--event-id", eventId];
+}
+
+export async function claimEvent(
+  spawn: ClaimSpawnFn,
+  dir: string,
+  eventId: string,
+  flywheelBin = "flywheel",
+): Promise<boolean> {
+  const child = asClaimChild(spawn(claimArgv(dir, eventId, flywheelBin), {}));
+  let out = "";
+  for await (const piece of child.stdout) {
+    if (piece.stream === "stdout") out += piece.text;
   }
+  return out.trim() === "claimed";
 }

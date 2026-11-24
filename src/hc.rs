@@ -98,6 +98,7 @@ pub fn plane_launch_env(
     // reads it to refuse a pane that unset AGENT_NAME instead of mistaking it
     // for the operator's own shell. The operator's shell never carries it.
     env.insert("FLYWHEEL_PANE".to_string(), "1".to_string());
+    env.insert("FLYWHEEL_CREW".to_string(), "1".to_string());
     // bd-tdpix: ONE rung marker TTL for every language, so the pi extension
     // never sweeps a doorbell/opencode marker early.
     env.insert(

@@ -2279,6 +2279,15 @@ enum Commands {
         #[arg(long)]
         memory: Option<String>,
     },
+    /// internal: atomically claim a wake-rung marker in `dir` for `event_id`
+    /// without requiring Node `node:fs` in restricted plugin loaders.
+    #[command(name = "__claim-wake", hide = true)]
+    __ClaimWake {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        event_id: String,
+    },
     /// internal: wake one seat through its harness API (bd-f888z). Resolves the
     /// pin's recorded session and calls the one dispatch seam; used by the live
     /// API-wake test. Prints the route taken and the derived msg id.
@@ -4386,6 +4395,14 @@ fn main() {
             wiki.as_deref(),
             memory.as_deref(),
         ),
+        Some(Commands::__ClaimWake { dir, event_id }) => {
+            if crate::wake_rung::claim_in_dir(dir, event_id) {
+                println!("claimed");
+            } else {
+                println!("duplicate");
+            }
+            Ok(())
+        }
         Some(Commands::__CheckReply {
             project,
             name,
