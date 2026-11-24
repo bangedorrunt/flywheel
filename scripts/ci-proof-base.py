@@ -44,7 +44,6 @@ def git_ok(repo, *args):
 
 def discover(current, fallback, repo):
     env = dict(os.environ)
-    env.setdefault("GH_TOKEN", env.get("GITHUB_TOKEN", ""))
     out = subprocess.run(
         [
             "gh", "run", "list", "--workflow", "Proof", "--status", "success",
@@ -53,7 +52,11 @@ def discover(current, fallback, repo):
         cwd=repo, capture_output=True, text=True, env=env,
     )
     if out.returncode != 0:
-        print("ci-proof-base: gh run list failed; using fallback", file=sys.stderr)
+        print(
+            "ci-proof-base: gh run list failed; using fallback: "
+            + out.stderr.strip(),
+            file=sys.stderr,
+        )
         print(fallback)
         return
     runs = json.loads(out.stdout)

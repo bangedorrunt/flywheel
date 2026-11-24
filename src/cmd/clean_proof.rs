@@ -1246,3 +1246,78 @@ fn ci_proof_base_prefers_the_newest_green_receipt() {
         "newest eligible green receipt wins over the fallback"
     );
 }
+
+/// bd-b1j9d: discovery must actually use gh + a green receipt artifact; a
+/// silent fallback was how bd-n6kyt landed without deriving its base.
+#[test]
+fn ci_proof_base_discovers_a_green_receipt_through_gh() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let root = repo.path();
+    let run = |args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .expect("git")
+                .success(),
+            "git {args:?} failed"
+        );
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "ci@example.com"]);
+    run(&["config", "user.name", "ci"]);
+    std::fs::write(root.join("marker.txt"), "base\n").expect("write marker");
+    run(&["add", "marker.txt"]);
+    run(&["commit", "-q", "-m", "base"]);
+    let sha = String::from_utf8_lossy(
+        &Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse")
+            .stdout,
+    )
+    .trim()
+    .to_string();
+
+    let bin = tempfile::tempdir().expect("fake bin");
+    let fake = format!(
+        "#!/bin/sh\ncase \"$1 $2\" in\n  'run list') echo '[{{\"databaseId\":7,\"headSha\":\"{sha}\",\"createdAt\":\"2026-11-24T00:00:00Z\",\"status\":\"completed\",\"conclusion\":\"success\"}}]' ;;\n  'run download') shift $(( $# - 1 )); mkdir -p \"$1\"; printf '%s' '{{\"ok\":true,\"sha\":\"{sha}\"}}' > \"$1/proof-receipt.json\" ;;\nesac\n"
+    );
+    std::fs::write(bin.path().join("gh"), fake).expect("write fake gh");
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(bin.path().join("gh"))
+        .unwrap()
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(bin.path().join("gh"), perms).unwrap();
+
+    let script = repo_root().join("scripts/ci-proof-base.py");
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("python3")
+        .arg(script)
+        .arg("discover")
+        .arg("--current-run")
+        .arg("99")
+        .arg("--fallback")
+        .arg("fallback-sha")
+        .arg("--repo")
+        .arg(root)
+        .env("PATH", path)
+        .env("GH_TOKEN", "dummy")
+        .output()
+        .expect("run discovery");
+    assert!(
+        out.status.success(),
+        "discovery failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), sha);
+}

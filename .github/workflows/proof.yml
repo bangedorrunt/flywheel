@@ -22,6 +22,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
   CARGO_BIN: cargo
+  GH_TOKEN: ${{ github.token }}
   # CI first-run base: last local green (6009acb7) mapped through the history
   # rewrite; local clean-proof derives its own base and keeps proof.toml clean.
   MUTATION_BASE: 83db630ba936552c64bee88f9e6254992c172c24
