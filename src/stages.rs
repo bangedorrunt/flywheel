@@ -429,7 +429,7 @@ impl StageLibrary {
             ),
             (
                 "ce-work",
-                "Build the TARGET until its VERIFY command passes. Run VERIFY at HEAD first: already green means already done, so say so and stop. TDD: write the failing test, make it pass, prove the test can fail (a mutation or a deliberate break you revert), then make one simplifying pass and re-run VERIFY. Trace the change from its production caller; code nothing calls is not done. Your crew rules cover leases, committing only your paths and mailing the captain. When a bead is bound, claim it first (`br update <id> --claim --actor <your pin>`) and cite its id in the commit; the captain lands it with `ship land`, so never close it yourself. Never self-answer an ask-user finding: restoring accepted behaviour proceeds, an expansion parks for the captain. Reply with ONLY {\"commit_sha\": \"...\", \"commit_message\": \"...\", \"bead\": \"bd-… or null\", \"gate\": {\"command\": \"<VERIFY>\", \"exit\": 0, \"output\": \"<tail>\"}}.",
+                "Build the TARGET until its VERIFY command passes. Run VERIFY at HEAD first: already green means already done, so say so and stop. TDD: write the failing test, make it pass, prove the test can fail (a mutation or a deliberate break you revert), then make one simplifying pass and re-run VERIFY. Trace the change from its production caller; code nothing calls is not done. Your crew rules cover leases, committing only your paths and mailing the captain. When a bead is bound, cite its id in the commit; the captain owns bead claims and lands it with `ship land`, so run 0 `br` commands yourself. Never self-answer an ask-user finding: restoring accepted behaviour proceeds, an expansion parks for the captain. Reply with ONLY {\"commit_sha\": \"...\", \"commit_message\": \"...\", \"bead\": \"bd-… or null\", \"gate\": {\"command\": \"<VERIFY>\", \"exit\": 0, \"output\": \"<tail>\"}}.",
             ),
             (
                 "ce-review",
@@ -1717,10 +1717,13 @@ mod tests {
     fn ce_work_claims_with_the_pin_and_never_closes() {
         let lib = StageLibrary::compiled_in();
         let work = lib.resolve("ce-work").expect("ce-work resolves");
-        assert!(work.contains("--claim --actor"), "{work}");
+        assert!(work.contains("cite its id"), "{work}");
         assert!(work.contains("ship land"), "{work}");
         for forbidden in [
+            "br update",
+            "--claim",
             "br close",
+            "br create",
             "--to closed",
             "--status=in_progress --assignee",
             "ask the captain for the bead id",

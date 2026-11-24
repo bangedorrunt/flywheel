@@ -30,7 +30,7 @@ mutation "R2  ce-verify drops the seam check" \
 mutation "R3  ce-work teaches a crew-side close" \
     file=src/stages.rs \
     expect=ce_work_claims_with_the_pin_and_never_closes \
-    find='so never close it yourself.' \
+    find='so run 0 `br` commands yourself.' \
     replace='then run br close <id>.'
 
 mutation "R4  an unbacked REJECT passes with no findings" \
