@@ -1144,7 +1144,8 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let seq = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("flywheel-profile-test-{seq}"));
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("flywheel-profile-test-{pid}-{seq}"));
         fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("profiles.toml");
         fs::write(&path, contents).expect("write temp profiles.toml");

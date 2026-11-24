@@ -58,7 +58,7 @@ STUB
 chmod +x "$TMP/bin/fakecargo"
 
 sum_of() { shasum -a 1 src/a.rs | awk '{print $1}'; }
-mtime_of() { stat -f %m src/a.rs 2>/dev/null || stat -c %Y src/a.rs; }
+mtime_of() { stat -c %Y src/a.rs 2>/dev/null || stat -f %m src/a.rs; }
 
 sum_before="$(sum_of)"
 mtime_before="$(mtime_of)"

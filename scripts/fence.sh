@@ -38,8 +38,13 @@ PATHS=""
 MODULES=0
 PIN="${FLYWHEEL_FENCE_PIN:-${AGENT_NAME:-crew}}"
 SWEEP_AGE_SECS="${FENCE_SWEEP_AGE_SECS:-14400}" # 4h: another crew's export is never young
-CARGO="${FENCE_CARGO:-mbx +nightly-aarch64-apple-darwin}"
-RUSTFMT="${FENCE_RUSTFMT:-rustup run nightly-aarch64-apple-darwin rustfmt --edition 2024}"
+if command -v mbx >/dev/null 2>&1; then
+    CARGO="${FENCE_CARGO:-mbx +nightly-aarch64-apple-darwin}"
+    RUSTFMT="${FENCE_RUSTFMT:-rustup run nightly-aarch64-apple-darwin rustfmt --edition 2024}"
+else
+    CARGO="${FENCE_CARGO:-cargo}"
+    RUSTFMT="${FENCE_RUSTFMT:-rustfmt --edition 2024}"
+fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
