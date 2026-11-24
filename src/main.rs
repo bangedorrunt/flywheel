@@ -811,6 +811,7 @@ enum ProofCmd {
     },
 }
 
+#[allow(clippy::large_enum_variant)] // clap derives one variant per verb
 #[derive(Subcommand)]
 enum Commands {
     /// Background proof train: status of the newest HEAD proof (bd-7qhz0)

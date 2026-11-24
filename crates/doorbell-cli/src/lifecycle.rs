@@ -1829,6 +1829,7 @@ fn run_reload_plan_in(
 }
 
 fn install_rendered(_cfg: &Config, body: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
     {
         let home = std::env::var("HOME").context("HOME unset")?;
         let dir = PathBuf::from(home).join("Library").join("LaunchAgents");

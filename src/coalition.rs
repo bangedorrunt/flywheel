@@ -423,7 +423,7 @@ impl CoalitionStore {
                     .join(", ")
             );
         }
-        if !members.contains(&captain.to_string()) {
+        if !members.iter().any(|m| m == captain) {
             bail!("captain {captain} must be a member of the coalition");
         }
 
@@ -646,7 +646,7 @@ impl CoalitionStore {
                 manifest.status
             );
         }
-        if manifest.members.contains(&agent.to_string()) {
+        if manifest.members.iter().any(|m| m == agent) {
             return Ok(manifest);
         }
         let project = member_project.unwrap_or(&self.project).to_string();
@@ -700,7 +700,7 @@ impl CoalitionStore {
                 manifest.status
             );
         }
-        if !manifest.members.contains(&agent.to_string()) {
+        if !manifest.members.iter().any(|m| m == agent) {
             return Ok(manifest);
         }
         let project = self.project_of(&manifest, agent);
@@ -820,7 +820,7 @@ impl CoalitionStore {
         note: Option<&str>,
     ) -> Result<RequestReleaseResult> {
         let manifest = self.require_active_member(id, agent)?;
-        if !manifest.members.contains(&target_agent.to_string()) {
+        if !manifest.members.iter().any(|m| m == target_agent) {
             bail!("negotiate target {target_agent} is not a coalition member");
         }
         let project = self.project_of(&manifest, target_agent);
@@ -1083,7 +1083,7 @@ impl CoalitionStore {
                 manifest.status
             );
         }
-        if !manifest.members.contains(&agent.to_string()) {
+        if !manifest.members.iter().any(|m| m == agent) {
             bail!("agent {agent} is not a member of coalition {id}");
         }
         Ok(manifest)

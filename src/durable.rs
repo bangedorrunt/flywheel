@@ -2618,7 +2618,7 @@ fn render_peer_contacts(doc: Option<&Value>, me: &str) -> String {
                 continue;
             }
             let entry = by_holder.entry(holder.to_string()).or_default();
-            if !entry.contains(&path.to_string()) {
+            if !entry.iter().any(|p| p == path) {
                 entry.push(path.to_string());
             }
         }

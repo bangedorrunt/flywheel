@@ -13,6 +13,7 @@ use crate::{config, profile};
 /// collab. A coalition = NIP-29 channel + goal workflow run + manifest.
 /// Manual collab reuses P11.2 (soft-conflict freeze + request-release) — no
 /// auto-proposer here (P11.3b).
+#[allow(clippy::large_enum_variant)] // clap derives one variant per verb
 #[derive(Subcommand)]
 pub(crate) enum CoalitionCmd {
     /// Register an agent identity in the coalition's toron project (members
@@ -417,7 +418,7 @@ pub(crate) fn cmd_coalition(cmd: &CoalitionCmd) -> Result<()> {
                             "--member-project expects <member>=<project>, got {kv:?}"
                         ));
                     }
-                    if !members.contains(&member.to_string()) {
+                    if !members.iter().any(|m| m == member) {
                         return Err(anyhow!(
                             "--member-project member {member} is not in crew {crews:?}"
                         ));

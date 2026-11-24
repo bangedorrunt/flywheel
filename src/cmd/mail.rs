@@ -9,6 +9,7 @@ use crate::mail;
 use crate::output::print_json;
 use crate::state;
 
+#[allow(clippy::large_enum_variant)] // clap derives one variant per verb
 #[derive(Subcommand)]
 pub(crate) enum MailCmd {
     /// fetch inbox (default: config identity; override with --as / FLYWHEEL_MAIL_AS / AGENT_NAME)

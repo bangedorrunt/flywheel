@@ -45,7 +45,9 @@ pub fn addr_alive(addr: &str) -> bool {
 /// How the daemon is currently supervised / running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DaemonState {
-    /// Running under launchd (macOS).
+    /// Running under launchd (macOS). Built only inside the macOS branch of
+    /// `detect_state`; Linux sees the match arm but never constructs it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     RunningLaunchd,
     /// Running under systemd (Linux). Constructed only inside the
     /// `cfg(target_os = "linux")` branch of [`detect_state`], so on macOS the
@@ -359,7 +361,9 @@ fn install_unit(state: &Path, spec: &UnitSpec<'_>) -> anyhow::Result<()> {
     let label = spec.label;
     let binary = std::env::current_exe()?;
     std::fs::create_dir_all(state)?;
+    #[cfg(target_os = "macos")]
     let out_log = state.join(format!("{}.out.log", spec.stem));
+    #[cfg(target_os = "macos")]
     let err_log = state.join(format!("{}.err.log", spec.stem));
     #[cfg(target_os = "macos")]
     {
@@ -843,6 +847,10 @@ fn spawn_pidfile(state: &Path, port: u16) -> anyhow::Result<()> {
 /// port holder is refused unless `force`.
 pub fn stop(state: &Path, addr: &str, force: bool) -> anyhow::Result<()> {
     let pidfile = state.join("flywheel.pid");
+    // Linux stops through systemd; these inputs only drive the macOS and
+    // generic fallback branches. Mark them used here so -D warnings is clean.
+    #[cfg(not(target_os = "macos"))]
+    let _ = (addr, force, &pidfile);
     #[cfg(target_os = "macos")]
     {
         let uid = current_uid();

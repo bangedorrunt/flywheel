@@ -26,6 +26,7 @@ use crate::{
 /// Unified workflow commands (ADR-0005 Spec 5 / P3.7). `lint` is the
 /// fail-stop gate every run must pass; `crew <name>` previews the auto-crew
 /// a workflow would spawn.
+#[allow(clippy::large_enum_variant)] // clap derives one variant per verb
 #[derive(Subcommand)]
 pub(crate) enum WorkflowCmd {
     /// List catalog + built-in workflows (name, source, trigger, crew).

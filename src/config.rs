@@ -970,7 +970,9 @@ pub fn is_captain_child(
     if pin == captain_pin {
         return false;
     }
-    captain_attributed_pins(registry, captain_pin).contains(&pin.to_string())
+    captain_attributed_pins(registry, captain_pin)
+        .iter()
+        .any(|p| p == pin)
 }
 
 /// Registry after applying `policy` for a dead captain.
