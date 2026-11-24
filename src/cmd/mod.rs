@@ -4,6 +4,8 @@
 pub(crate) mod agent;
 pub(crate) mod artifacts;
 pub(crate) mod backend;
+pub(crate) mod blocked_by;
+pub(crate) mod build_break_statechart;
 pub(crate) mod captain;
 pub(crate) mod checkpoint;
 #[cfg(test)]

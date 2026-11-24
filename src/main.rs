@@ -178,9 +178,10 @@ use cmd::{
     AgentCmd, ArtifactsCmd, BackendCmd, CaptainCmd, CheckpointCmd, CoalitionCmd, ConfigCmd,
     CrewCmd, CronCmd, DoorbellCmd, JudgmentCmd, LedgerCmd, LoopCmd, MailCmd, MemoryCmd, ModelCmd,
     PeerCmd, PolicyCmd, PrinciplesCmd, ProfileCmd, RunsCmd, ShipCmd, SlotCmd, SquadCmd, StackCmd,
-    StageCmd, StandingOrdersCmd, SwarmCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd, cmd_agent,
-    cmd_analytics, cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint, cmd_commit,
-    cmd_config, cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject,
+    StageCmd, StandingOrdersCmd, SwarmCmd, WorkCmd, WorkflowCmd, WorktreeCmd, XprojCmd,
+    blocked_by::cmd_blocked_by,
+    cmd_agent, cmd_analytics, cmd_audit, cmd_backend, cmd_captain, cmd_changes, cmd_checkpoint,
+    cmd_commit, cmd_config, cmd_crew, cmd_doorbell_digest, cmd_doorbell_gc, cmd_doorbell_inject,
     cmd_doorbell_introduce, cmd_doorbell_re_inject, cmd_doorbell_roster, cmd_doorbell_start,
     cmd_doorbell_status, cmd_doorbell_stop, cmd_doorbell_subscribe, cmd_history,
     cmd_internal_doorbell, cmd_judgment, cmd_ledger, cmd_mail, cmd_memory, cmd_models, cmd_peer,
@@ -1853,6 +1854,24 @@ enum Commands {
         /// Install as the operator: bypass the captain-only fleet guard.
         #[arg(long)]
         operator: bool,
+    },
+    /// Mail the holder of the file a failed build blames (bd-6xu6r)
+    BlockedBy {
+        /// Build log with a compiler error; stdin when omitted
+        #[arg(long)]
+        log: Option<String>,
+        /// The pin that saw the failure (never alerted about its own file)
+        #[arg(long)]
+        caller: String,
+        /// Project whose reservations name the file's holder
+        #[arg(long, default_value = "flywheel")]
+        project: String,
+        /// Print the action instead of sending mail
+        #[arg(long)]
+        dry_run: bool,
+        /// Machine-readable result
+        #[arg(long)]
+        json: bool,
     },
     /// One operator door for the installed flywheel, doorbell, and toron
     /// stack, with `--json`/`--check`; `install` delegates to the audited
@@ -4150,6 +4169,13 @@ fn main() {
             crate::authority::guard_fleet_mutation(&cfg, None, *operator, "flywheel upgrade")
                 .and_then(|()| cmd_upgrade())
         }
+        Some(Commands::BlockedBy {
+            log,
+            caller,
+            project,
+            dry_run,
+            json,
+        }) => cmd_blocked_by(&cfg, log.as_deref(), caller, project, *json, *dry_run),
         Some(Commands::Stack { cmd }) => cmd_stack(&cfg, cmd),
         Some(Commands::Ship { cmd }) => cmd_ship(&cfg, cmd),
         Some(Commands::Commit {

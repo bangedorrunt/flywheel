@@ -2166,6 +2166,7 @@ fn project_workflow_names(root: &Path) -> BTreeSet<String> {
 }
 
 fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> Result<()> {
+    use crate::cmd::build_break_statechart::build_build_break_machine;
     use crate::elm::brief_statechart::build_brief_machine;
     use crate::elm::captain_watch_statechart::build_captain_watch_machine;
     use crate::elm::deadlock_watch_statechart::build_deadlock_watch_machine;
@@ -2271,6 +2272,27 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             "a final state",
             is_final,
             export_tla.then(|| machine.to_tla_named("DeadlockWatch")),
+            None,
+            &ChartFindings::default(),
+        )
+    }
+
+    fn verify_build_break(export_tla: bool) -> WorkflowVerifyChartReport {
+        use toron_core::kernel::StateNodeType;
+        let machine = build_build_break_machine();
+        let topology = machine.topology();
+        let is_final = |state: &_| {
+            topology
+                .nodes
+                .get(state)
+                .is_some_and(|node| node.node_type == StateNodeType::Final)
+        };
+        chart_report(
+            "BuildBreak",
+            &topology,
+            "a final state",
+            is_final,
+            export_tla.then(|| machine.to_tla_named("BuildBreak")),
             None,
             &ChartFindings::default(),
         )
@@ -2478,6 +2500,14 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     if want_all
         || matches!(
             want.as_str(),
+            "buildbreak" | "build-break" | "build-break-statechart"
+        )
+    {
+        reports.push(verify_build_break(export_tla));
+    }
+    if want_all
+        || matches!(
+            want.as_str(),
             "resultmail" | "result-mail" | "result-mail-statechart"
         )
     {
@@ -2549,7 +2579,7 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     }
     if reports.is_empty() {
         bail!(
-            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, LeaseWaitlist, DirtyLease, Brief, ResultMail, CaptainWatch, DeadlockWatch, WorkUnit, or a workflow name)",
+            "unknown statechart {} (expected P2PNegotiation, Seat, Plan, LeaseWaitlist, DirtyLease, BuildBreak, Brief, ResultMail, CaptainWatch, DeadlockWatch, WorkUnit, or a workflow name)",
             name.unwrap_or("")
         );
     }
