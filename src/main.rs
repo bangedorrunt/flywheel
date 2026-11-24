@@ -23255,7 +23255,7 @@ mod robot_capabilities_text {
         let block = &src[start..start + end];
         for needle in [
             // (1) ship land: --repo and the retried HEAD race
-            "ship land <bead> --sha <40hex> --receipt <file> [--project <p>] [--as <pin>] [--message <m>] [--repo <dir>]",
+            "ship land <bead> --sha <40hex> [--receipt <file>] [--project <p>] [--as <pin>] [--message <m>] [--repo <dir>]",
             "the HEAD-lock race other lanes cause is retried",
             // (2) swarm apply: --yes and the plan-of-record semantics
             "[--count <role>=<n>] [--yes] [--dry-run] [--json] | seat adopt <pin> --pane <block>",

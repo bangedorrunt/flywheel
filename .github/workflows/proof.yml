@@ -69,7 +69,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { repository: bangedorrunt/elm-effect-rs, path: elm-effect-rs, ref: '${{ needs.prepare.outputs.elm_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with: { toolchain: nightly-2026-08-20, components: rustfmt,clippy }
+        with: { components: rustfmt,clippy }
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: 'flywheel\ntoron\nelm-effect-rs' }
       - name: Build once
@@ -90,7 +90,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { repository: bangedorrunt/elm-effect-rs, path: elm-effect-rs, ref: '${{ needs.prepare.outputs.elm_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with: { toolchain: nightly-2026-08-20 }
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: 'flywheel\ntoron\nelm-effect-rs' }
       - name: Checkout beads (br CLI, GS-025)
@@ -112,7 +111,7 @@ jobs:
         with: { tool: cargo-nextest }
       - name: Test shard ${{ matrix.shard }}/4
         working-directory: flywheel
-        run: cargo nextest run -p flywheel --bin flywheel --partition count:${{ matrix.shard }}/4
+        run: cargo nextest run --no-fail-fast -p flywheel --bin flywheel --partition count:${{ matrix.shard }}/4
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with: { name: 'proof-test-${{ matrix.shard }}', path: 'flywheel/target/nextest/**/*.xml' }
 
@@ -127,7 +126,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { repository: bangedorrunt/elm-effect-rs, path: elm-effect-rs, ref: '${{ needs.prepare.outputs.elm_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with: { toolchain: nightly-2026-08-20, components: rustfmt,clippy }
+        with: { components: rustfmt,clippy }
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: 'flywheel\ntoron\nelm-effect-rs' }
       - name: Checkout beads (br CLI, GS-025)
@@ -172,7 +171,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { repository: bangedorrunt/elm-effect-rs, path: elm-effect-rs, ref: '${{ needs.prepare.outputs.elm_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with: { toolchain: nightly-2026-08-20 }
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: 'flywheel\ntoron\nelm-effect-rs' }
       - name: Mutation spec ${{ matrix.spec }}

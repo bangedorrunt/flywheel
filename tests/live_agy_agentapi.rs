@@ -76,11 +76,11 @@ fn an_addressed_mail_rides_agentapi_with_no_pane_keystrokes() {
     send(&project, &pin, &marker, None);
     let rows = route_rows(&state_dir, &pin, from);
     assert!(
-        rows.contains(&"intent:api".to_string()),
+        rows.iter().any(|r| r == "intent:api"),
         "the api route must be journaled before invoke: {rows:?}"
     );
     assert!(
-        rows.contains(&"outcome:api".to_string()),
+        rows.iter().any(|r| r == "outcome:api"),
         "one mail via agentapi, no Inject fallback: {rows:?}"
     );
     assert!(
@@ -101,7 +101,7 @@ fn a_failed_agentapi_falls_back_to_inject_and_journals_both() {
     send(&project, &pin, &marker, Some("/usr/bin/false"));
     let rows = route_rows(&state_dir, &pin, from);
     assert!(
-        rows.contains(&"intent:api".to_string()),
+        rows.iter().any(|r| r == "intent:api"),
         "the api intent must still be journaled: {rows:?}"
     );
     assert!(
