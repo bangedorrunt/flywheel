@@ -1924,7 +1924,7 @@ mod tests {
     async fn bounded_invoke_enforces_wall_clock_cap() {
         let runner: toron_workflow::engine::EffectRunner =
             std::sync::Arc::new(|_inv: &toron_workflow::engine::ActionInvocation| {
-                std::thread::sleep(std::time::Duration::from_millis(700));
+                std::thread::sleep(std::time::Duration::from_millis(1500));
                 Ok(serde_json::json!({ "ok": true }))
             });
         let engine = toron_workflow::WorkflowEngine::local_with_effect_runner(Some(runner))
@@ -1935,7 +1935,7 @@ mod tests {
         .expect("parse");
         let err = bounded_invoke(&engine, "wallclock-cap-test", wf, serde_json::json!({}), 1)
             .await
-            .expect_err("two 700ms leaves cannot fit a 1s cap");
+            .expect_err("a 1.5s leaf cannot fit a 1s cap, run in series or in parallel");
         assert!(
             err.to_string().contains("wall-clock budget"),
             "error names the cap: {err:#}"
