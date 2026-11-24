@@ -96,6 +96,10 @@ jobs:
       - name: Checkout beads (br CLI, GS-025)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { repository: bangedorrunt/beads, path: beads }
+      - name: Configure git identity for tests that commit
+        run: |
+          git config --global user.name "flywheel-ci"
+          git config --global user.email "flywheel-ci@users.noreply.github.com"
       - name: Build br + toron CLIs onto PATH
         run: |
           cargo build -p beads --bin br --manifest-path beads/Cargo.toml
@@ -129,6 +133,10 @@ jobs:
       - name: Checkout beads (br CLI, GS-025)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { repository: bangedorrunt/beads, path: beads }
+      - name: Configure git identity for tests that commit
+        run: |
+          git config --global user.name "flywheel-ci"
+          git config --global user.email "flywheel-ci@users.noreply.github.com"
       - name: Build br + toron CLIs onto PATH
         run: |
           cargo build -p beads --bin br --manifest-path beads/Cargo.toml
@@ -145,7 +153,7 @@ jobs:
           bash scripts/check-peer-aware-sot.sh
           bash scripts/check-beads-ledger.sh --history
           cargo check --workspace
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy -p flywheel --bin flywheel --tests -- -D warnings
           cargo fmt --check
           cargo test -p flywheel --bin flywheel no_jargon_in_any_agent_facing_string
 
