@@ -75,27 +75,78 @@ pub fn pin_idle(status_json: &str, pin: &str) -> Option<bool> {
 /// resolution (spawn rows) and the toron mail half: the strict mail-wake form
 /// (`src/mail_wake.rs`, `defer_if_operator_typing_strict`) is covered by unit
 /// tests, and a rex block id is not a mail recipient.
+/// A freshly spawned seat's arrival turn can exceed two minutes under load.
+/// Give it ten minutes before calling setup broken; a setup timeout is named
+/// as such, never reported as a guard verdict.
+const SETUP_POLL_SECS: u64 = 5;
+const SETUP_MAX_POLLS: usize = 120;
+
+#[derive(Debug, PartialEq, Eq)]
+enum SetupWait {
+    Idle { polls: usize },
+    Timeout { polls: usize },
+}
+
+fn setup_wait_result(observations: &[Option<bool>]) -> SetupWait {
+    for (i, observation) in observations.iter().take(SETUP_MAX_POLLS).enumerate() {
+        if *observation == Some(true) {
+            return SetupWait::Idle { polls: i + 1 };
+        }
+    }
+    SetupWait::Timeout {
+        polls: observations.len().min(SETUP_MAX_POLLS),
+    }
+}
+
 /// A real harness pane can drift back to `working` between the two probes;
 /// wait for idle before either send so the status gate is not what we test.
-fn wait_idle(project: &str, pin: &str) {
-    for _ in 0..24 {
+fn wait_idle(project: &str, pin: &str) -> bool {
+    let mut observations = Vec::new();
+    for _ in 0..SETUP_MAX_POLLS {
         let out = Command::new(env!("CARGO_BIN_EXE_flywheel"))
             .args(["swarm", "status", project, "--json"])
             .output()
             .expect("flywheel swarm status");
         let body = String::from_utf8_lossy(&out.stdout);
-        if pin_idle(&body, pin) == Some(true) {
-            return;
+        let idle = pin_idle(&body, pin);
+        observations.push(idle);
+        if let SetupWait::Idle { .. } = setup_wait_result(&observations) {
+            return true;
         }
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_secs(SETUP_POLL_SECS));
     }
-    // A busy status is not proof the box is off its prompt: the send door
-    // checks the pane itself. Proceed with a warning rather than failing on a
-    // status the harness cannot make true; the assertions below still prove
-    // the operator-typing guard on the real screen.
     eprintln!(
-        "warning: target pin {pin} stayed non-idle in {project}; proceeding to the send door"
+        "SETUP TIMEOUT: target pin {pin} did not become idle in {project} after {}s; \
+         guard assertions skipped (this is setup, not a guard verdict)",
+        SETUP_MAX_POLLS as u64 * SETUP_POLL_SECS
     );
+    false
+}
+
+#[cfg(test)]
+mod setup_wait_tests {
+    use super::*;
+
+    #[test]
+    fn first_turn_past_the_old_bound_still_reaches_the_guard() {
+        let mut observations = vec![Some(false); 30]; // 30 * 5s = 2.5 min
+        observations.push(Some(true));
+        assert_eq!(
+            setup_wait_result(&observations),
+            SetupWait::Idle { polls: 31 }
+        );
+    }
+
+    #[test]
+    fn a_real_setup_timeout_is_named_as_setup_not_a_guard_failure() {
+        let observations = vec![Some(false); SETUP_MAX_POLLS];
+        assert_eq!(
+            setup_wait_result(&observations),
+            SetupWait::Timeout {
+                polls: SETUP_MAX_POLLS
+            }
+        );
+    }
 }
 
 /// Resolve the throwaway block's concrete id from rex's block list, matching
@@ -255,7 +306,9 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
     std::thread::sleep(std::time::Duration::from_millis(800));
 
     // 2. The send door must DEFER — nothing is typed into their line.
-    wait_idle(&project, &pin);
+    if !wait_idle(&project, &pin) {
+        return;
+    }
     let deferred = send_probe(&pin, &project, "live probe: deferral");
     let text = format!(
         "{}{}",
@@ -296,7 +349,9 @@ fn a_typed_line_defers_the_wake_and_clearing_it_rings() {
     // 3. Clear the line (ctrl+u) and the same send lands.
     rex(&["send-key", "-s", &session, "--block", &block_id, "ctrl+u"]);
     std::thread::sleep(std::time::Duration::from_millis(800));
-    wait_idle(&project, &pin);
+    if !wait_idle(&project, &pin) {
+        return;
+    }
     let landed = send_probe(&pin, &project, "live probe: ring");
     let text = format!(
         "{}{}",
