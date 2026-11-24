@@ -126,6 +126,7 @@ fn resolve_asker(
 /// once per wait older than `--wait-minutes`. Quiet (exit 0, summary on
 /// stdout) when there is nothing new.
 pub(crate) fn cmd_deadlock_check(project: &str, wait_minutes: u64) -> Result<()> {
+    eprintln!("flywheel: deprecated (D3/R6): removed: mail the holder");
     let cfg = crate::config::Config::load().unwrap_or_default();
     let mail =
         crate::mail::Mail::from_config(Some(&cfg.toron_mail_config()))?.ok_or_else(|| {
