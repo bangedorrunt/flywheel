@@ -476,6 +476,15 @@ fn stack_status(cfg: &Config, json_output: bool, check: bool) -> Result<()> {
         .and_then(|value| value.pointer("/build/restart_required"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let wake_publish_failures = toron
+        .as_ref()
+        .and_then(|value| {
+            value
+                .get("wake_publish_failures")
+                .or_else(|| value.pointer("/metrics/wake_publish_failures"))
+                .and_then(Value::as_u64)
+        })
+        .unwrap_or(0);
 
     let unspawnable_jobs = flywheel_jobs_unable_to_spawn();
     let required_binaries_bad = binaries[0].error.is_some() || binaries[2].error.is_some();
@@ -514,6 +523,7 @@ fn stack_status(cfg: &Config, json_output: bool, check: bool) -> Result<()> {
                 "status": toron,
                 "error": toron_error,
                 "restart_required": toron_restart_required,
+                "wake_publish_failures": wake_publish_failures,
             },
             "launchd": { "unable_to_spawn": unspawnable_jobs },
             "events_tokens": {
@@ -630,6 +640,9 @@ fn stack_status(cfg: &Config, json_output: bool, check: bool) -> Result<()> {
                 );
                 if toron_restart_required {
                     println!("restart required: true (a replaced build is still running)");
+                }
+                if wake_publish_failures > 0 {
+                    println!("wake publish failures: {wake_publish_failures}");
                 }
             }
             None => println!(
