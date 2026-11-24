@@ -141,6 +141,14 @@ restart_label() {
       run launchctl bootstrap "gui/$uid" "$plist"
       return 0
     fi
+    # bd-rgs02: launchd needs a beat to finish the bootout. Bootstrapping in
+    # the same instant returns "Bootstrap failed: 5: Input/output error" even
+    # though a later bootstrap of the same plist succeeds. Wait for the job
+    # to leave the plane before bringing it back (bounded: never hang install).
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      launchctl print "$domain" >/dev/null 2>&1 || break
+      sleep 0.2
+    done
     # bd-rgs02: a bootstrap failure (e.g. launchd I/O error 5) must name the
     # job and show why, then let the OTHER jobs restart. The final doctor
     # fails the install, so one bad job cannot hide the rest of the report.

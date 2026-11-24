@@ -119,9 +119,23 @@ fn re_register(label: &str) -> std::result::Result<(), String> {
     let uid = unsafe { libc_getuid() };
     let plist = launch_agent_dir().join(format!("{label}.plist"));
     if plist.is_file() {
+        let domain = format!("gui/{uid}/{label}");
         let _ = Command::new("launchctl")
-            .args(["bootout", &format!("gui/{uid}/{label}")])
+            .args(["bootout", &domain])
             .status();
+        // Same settle window as scripts/stack.sh: bootstrap immediately after
+        // bootout returns launchd I/O error 5. Wait for the job to leave the
+        // plane, bounded so --fix can never hang.
+        for _ in 0..10 {
+            let present = Command::new("launchctl")
+                .args(["print", &domain])
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if !present {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         let out = Command::new("launchctl")
             .args([
                 "bootstrap",
@@ -383,6 +397,22 @@ fn toron_probe(cfg: &Config) -> Probe {
     }
 }
 
+/// A job is not healthy the instant launchd accepts its bootstrap: the daemon
+/// still has to bind its port. Poll with a deadline so --fix never hangs and
+/// never reports a FAIL purely because it probed too early.
+fn wait_for_port(addr: &str, secs: u64) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if toron_reachable(addr) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 pub(crate) fn cmd_stack_doctor(cfg: &Config, json: bool, fix: bool) -> Result<()> {
     let mut probes = Vec::new();
     probes.push(binaries_probe());
@@ -402,6 +432,14 @@ pub(crate) fn cmd_stack_doctor(cfg: &Config, json: bool, fix: bool) -> Result<()
             }
         }
         if !failed_jobs.is_empty() {
+            // Only now, after bootout+bootstrap, give the daemons a bounded
+            // window to bind their ports before re-probing.
+            let serve_port = std::env::var("FLYWHEEL_SERVE_PORT")
+                .ok()
+                .and_then(|s| s.parse::<u16>().ok())
+                .unwrap_or(crate::daemon::SERVE_PORT_DEFAULT);
+            wait_for_port(&toron_addr(cfg), 10);
+            wait_for_port(&format!("127.0.0.1:{serve_port}"), 10);
             probes.clear();
             probes.push(binaries_probe());
             let (jobs, _) = jobs_probe();
@@ -442,4 +480,28 @@ pub(crate) fn cmd_stack_doctor(cfg: &Config, json: bool, fix: bool) -> Result<()
         anyhow::bail!("stack doctor found a failing probe");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_for_port_polls_until_a_listener_binds() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        drop(listener);
+        let held = addr.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _late = std::net::TcpListener::bind(&held).expect("late bind");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        assert!(wait_for_port(&addr, 3), "a late listener must be awaited");
+        thread.join().expect("late listener thread");
+        assert!(
+            !wait_for_port("127.0.0.1:1", 1),
+            "a refused port must time out false"
+        );
+    }
 }

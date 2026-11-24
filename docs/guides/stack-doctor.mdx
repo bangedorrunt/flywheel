@@ -29,6 +29,6 @@ An install finishes by running `flywheel stack doctor`. If any probe fails, the 
 - **`toron … refused`**: the daemon is down or the address is wrong. Check `FLYWHEEL_TORON_URL` and the daemon log.
 - **`daemon_port … held by <other>`**: another program owns the serve port, so `flywheel serve` dies in a loop while generic status still looks ok. Doctor names the process; stop it and reinstall.
 
-During install, a `launchctl bootstrap` failure now names the job, prints its exit code and stderr tail, and carries on with the remaining jobs. Install still fails at the end if doctor finds a job that did not come up.
+During install, a `launchctl bootstrap` failure now names the job, prints its exit code and stderr tail, and carries on with the remaining jobs. Install still fails at the end if doctor finds a job that did not come up. Both the installer and `doctor --fix` wait for the bootout to leave the launchd plane before bootstrapping — bootstrapping in the same instant is what produces `Bootstrap failed: 5: Input/output error`. After `--fix` re-registers a job, doctor waits (bounded, 10 s) for the daemons' ports before re-probing, so a slow bind never reads as a failed probe.
 
 `doctor --fix` only performs repairs that are safe without the operator's install door: re-registering jobs from their plists. Everything else gets a fix hint, not a silent mutation.
