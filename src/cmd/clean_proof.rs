@@ -1209,3 +1209,40 @@ fn ci_receipt_marks_skipped_jobs_failed_when_build_fails() {
         );
     }
 }
+
+/// bd-n6kyt: the CI base comes from the newest eligible green Proof receipt,
+/// not from the fallback pin, when such a receipt exists.
+#[test]
+fn ci_proof_base_prefers_the_newest_green_receipt() {
+    let parts = tempfile::tempdir().expect("tempdir");
+    let runs = parts.path().join("runs.json");
+    std::fs::write(
+        &runs,
+        r#"[
+          {"databaseId":1,"headSha":"aaa","createdAt":"2026-11-24T01:00:00Z","eligible":true},
+          {"databaseId":2,"headSha":"bbb","createdAt":"2026-11-24T02:00:00Z","eligible":true},
+          {"databaseId":3,"headSha":"ccc","createdAt":"2026-11-24T03:00:00Z","eligible":false}
+        ]"#,
+    )
+    .expect("write runs fixture");
+    let script = repo_root().join("scripts/ci-proof-base.py");
+    let out = Command::new("python3")
+        .arg(script)
+        .arg("select")
+        .arg("--runs-json")
+        .arg(runs)
+        .arg("--fallback")
+        .arg("83db630b")
+        .output()
+        .expect("run base selection");
+    assert!(
+        out.status.success(),
+        "selection failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "bbb",
+        "newest eligible green receipt wins over the fallback"
+    );
+}
