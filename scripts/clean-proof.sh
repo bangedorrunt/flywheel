@@ -379,7 +379,7 @@ run_parallel_step() { # name cmd...
   shift
   date +%s >"$TMP/$name.start"
   echo "clean-proof: $name (parallel)"
-  ( "$@" >"$TMP/$name.log" 2>&1; echo $? >"$TMP/$name.status" ) &
+  ( set +e; "$@" >"$TMP/$name.log" 2>&1; echo $? >"$TMP/$name.status" ) &
   PARALLEL_NAMES="$PARALLEL_NAMES$name
 "
 }

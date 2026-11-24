@@ -801,11 +801,26 @@ pub(crate) fn compose_dispatch_prompt(
 ) -> String {
     let stage = stage_prompt.map(str::trim).filter(|s| !s.is_empty());
     let task = task.map(str::trim).filter(|s| !s.is_empty());
-    match (stage, task) {
+    let (bead_header, task) = match task {
+        Some(t) if t.starts_with("BEAD:") => match t.split_once('\n') {
+            Some((first, rest)) => (
+                Some(first.trim()),
+                Some(rest.trim()).filter(|s| !s.is_empty()),
+            ),
+            None => (Some(t), None),
+        },
+        other => (None, other),
+    };
+    let body = match (stage, task) {
         (Some(stage), Some(task)) => format!("{stage}\n\nTASK: {task}"),
         (Some(stage), None) => stage.to_string(),
         (None, Some(task)) => task.to_string(),
         (None, None) => fallback.to_string(),
+    };
+    match bead_header {
+        Some(hdr) if body != fallback => format!("{hdr}\n\n{body}"),
+        Some(hdr) => hdr.to_string(),
+        None => body,
     }
 }
 
@@ -3830,6 +3845,14 @@ mod tests {
             compose_dispatch_prompt(Some("  "), Some(""), "fallback"),
             "fallback"
         );
+        let with_bead = compose_dispatch_prompt(
+            Some("STAGE RULES"),
+            Some("BEAD: bd-42\nfix bug"),
+            "fallback",
+        );
+        assert!(with_bead.starts_with("BEAD: bd-42"));
+        assert!(with_bead.contains("STAGE RULES"));
+        assert!(with_bead.contains("TASK: fix bug"));
     }
 
     /// The durable spawn launcher is a PLANE door (backends.md: spawn, crew

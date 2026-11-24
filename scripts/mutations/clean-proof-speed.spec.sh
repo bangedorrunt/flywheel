@@ -20,8 +20,8 @@ mutation "C1  a sibling suite cache never hits" \
 mutation "D1  the suites run one after the other again" \
     file=scripts/clean-proof.sh \
     expect=proof_suites_run_concurrently \
-    find='( "$@" >"$TMP/$name.log" 2>&1; echo $? >"$TMP/$name.status" ) &' \
-    replace='( "$@" >"$TMP/$name.log" 2>&1; echo $? >"$TMP/$name.status" )'
+    find='( set +e; "$@" >"$TMP/$name.log" 2>&1; echo $? >"$TMP/$name.status" ) &' \
+    replace='( set +e; "$@" >"$TMP/$name.log" 2>&1; echo $? >"$TMP/$name.status" )'
 
 mutation "E1  changed-file tests are skipped" \
     file=scripts/clean-proof.sh \

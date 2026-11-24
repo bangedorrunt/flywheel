@@ -9,14 +9,14 @@ TEST_FILTER=(
 mutation "P1  compose_dispatch_prompt drops stage_prompt when task is present" \
     file=src/pane.rs \
     expect=compose_dispatch_prompt_preserves_stage_when_task_is_present \
-    find='    match (stage, task) {
+    find='    let body = match (stage, task) {
         (Some(stage), Some(task)) => format!("{stage}\n\nTASK: {task}"),
         (Some(stage), None) => stage.to_string(),
         (None, Some(task)) => task.to_string(),
         (None, None) => fallback.to_string(),
-    }' \
+    };' \
     replace='    let _ = stage;
-    match task {
+    let body = match task {
         Some(task) => task.to_string(),
         None => fallback.to_string(),
-    }'
+    };'
