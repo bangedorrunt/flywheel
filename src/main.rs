@@ -27,6 +27,7 @@ mod backend;
 mod br;
 mod briefing;
 mod builtin_workflows;
+mod burst;
 mod captain_directory;
 mod captain_slot;
 mod catalog_tui;
@@ -1148,6 +1149,24 @@ enum Commands {
         #[arg(long)]
         propose_shape: Option<String>,
         /// machine JSON (primitive, reason, argv)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stripped one-shot burst reviewer/verifier in Rex (D5)
+    Burst {
+        project: String,
+        #[arg(long, default_value = "claude")]
+        kind: String,
+        #[arg(long, default_value = "ce-review")]
+        stage: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        resume: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -3301,6 +3320,7 @@ fn main() {
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
         "deadlock <project> [--wait-minutes N] (bd-v4dcv: wait-for graph over live leases + open collab asks; pages the captain once per pin cycle and once per wait older than N minutes, naming pins and resources)",
+        "burst <project> --kind <harness> --stage <stage> --prompt <text> [--resume <id>] [--dry-run] [--json]",
             "snapshot <project> (fleet snapshot flywheel-snapshot.v1 as robot JSON)",
             "status <project> + progress [<project>] [--json] (bd-swarm-cockpit-pczs cockpit reads: status rows carry pin/npub/pane/verdict/bead/reservations/last_active_ts_us and print JSON when not a TTY; progress groups beads by wave-N label — closed/in_progress/ready/blocked/unknown — and names dispatching_wave, the lowest ready/in-progress wave; project defaults to the workspace cwd)",
             "agent tail <pin> [--project <p>] [--json] [--n N] (bd-swarm-cockpit-pczs: the pin's recent actions — tool calls / commands — from the session the pane reports on agent_session; path sessions read the pi JSONL, id sessions read the opencode store; no newest-file guessing. hc 0.1.16 reports no agent_session, so on hc it bails loud — use `flywheel output` or `hc read`)",
@@ -3927,6 +3947,26 @@ fn main() {
         Some(Commands::Deadlock { project, wait_minutes }) => {
             crate::cmd::deadlock::cmd_deadlock_check(project, *wait_minutes)
         }
+        Some(Commands::Burst {
+            project,
+            kind,
+            stage,
+            prompt,
+            resume,
+            model,
+            dry_run,
+            json,
+        }) => crate::burst::cmd_burst(
+            &cfg,
+            project,
+            kind,
+            stage,
+            prompt,
+            resume.as_deref(),
+            model.as_deref(),
+            *dry_run,
+            *json,
+        ),
         Some(Commands::Mail { cmd }) => cmd_mail(&cfg, cmd),
         Some(Commands::HookTrampoline { event, agent }) => {
             let pin = std::env::var("AGENT_NAME").unwrap_or_default();
