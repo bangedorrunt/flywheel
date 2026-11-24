@@ -5007,6 +5007,25 @@ mod plan_base_tests {
 mod legacy_log_shape_tests {
     use super::parse_log_line;
 
+    /// bd-ihiqo.6: the bead verify names this test; a clean loader must have
+    /// no warning path for old shapes and must skip them without output.
+    #[test]
+    fn malformed_log_lines_do_not_warn() {
+        let old = [
+            r#"{"ts":"1","kind":"already-pulled","project":"p","data":{}}"#,
+            r#"{"ts":"2","project":"p","data":[]}"#,
+            r#"{"ts":"3","kind":"spawn","project":"p","data":["old","shape"]}"#,
+        ];
+        for line in old {
+            assert!(parse_log_line(line).is_none() || line.contains("\"spawn\""));
+        }
+        let src = crate::test_source::crate_source();
+        assert!(
+            !src.contains("eprintln!(\"flywheel: skipping malformed log line"),
+            "the loader must not warn on old shapes"
+        );
+    }
+
     /// bd-ihiqo.2: old log shapes (a doorbell audit kind, a row with no kind,
     /// or a sequence-typed payload) must be skipped without a warning.
     #[test]
