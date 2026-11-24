@@ -99,7 +99,10 @@ impl StatechartDefinition for BuildBreakProgramDef {
                     .guard(|_, e| {
                         matches!(e, BuildBreakEvent::Broken { holder, caller, .. } if holder == caller)
                     });
-                node.on(broken).on(own)
+                let finish = node
+                    .transition(BuildBreakState::Done)
+                    .on(|e| matches!(e, BuildBreakEvent::Finish));
+                node.on(broken).on(own).on(finish)
             })
             .state(BuildBreakState::Alerted, |node| {
                 let broken = node
@@ -122,9 +125,12 @@ impl StatechartDefinition for BuildBreakProgramDef {
                             ctx.alerted.remove(key);
                         }
                     });
-                node.on(broken).on(recovered)
+                let finish = node
+                    .transition(BuildBreakState::Done)
+                    .on(|e| matches!(e, BuildBreakEvent::Finish));
+                node.on(broken).on(recovered).on(finish)
             })
-            .state(BuildBreakState::Done, |node| node)
+            .final_state(BuildBreakState::Done, |node| node)
             .build()
     }
 
