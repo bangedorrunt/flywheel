@@ -23,4 +23,6 @@ rev = "3387c446ee5a0a2729274415272587d98d085fb8"
 # $XDG_STATE_HOME/flywheel/clean-proof/receipts). Set `base` only as a manual
 # override; a stale pin re-runs every spec on every landing. Unset means derive.
 [mutations]
-# base = "<sha>"
+# CI first-run base: the last local green (6009acb7 before the history
+# rewrite), mapped to its post-rewrite sha. Advance only on a green receipt.
+base = "83db630ba936552c64bee88f9e6254992c172c24"

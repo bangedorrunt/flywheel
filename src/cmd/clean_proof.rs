@@ -1186,12 +1186,26 @@ fn ci_receipt_marks_skipped_jobs_failed_when_build_fails() {
         serde_json::from_slice(&out.stdout).expect("merge prints a receipt");
     assert_eq!(doc["ok"], serde_json::json!(false), "build failure is red");
     assert_eq!(doc["failed_step"], serde_json::json!("build"));
-    for step in doc["steps"].as_array().expect("steps array") {
+    let steps = doc["steps"].as_array().expect("steps array");
+    assert!(
+        steps.iter().any(|s| s["name"] == "build"),
+        "the receipt must carry the build step"
+    );
+    for step in steps {
+        if step["name"] == "prepare" {
+            continue;
+        }
         assert_eq!(
             step["ok"],
             serde_json::json!(false),
             "{} must not read green: {step}",
             step["name"]
+        );
+        assert!(
+            step["conclusion"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("skipped:") || c == "failure"),
+            "a real conclusion is recorded: {step}"
         );
     }
 }

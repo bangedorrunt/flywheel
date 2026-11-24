@@ -15,6 +15,7 @@ use crate::{config, profile};
 /// auto-proposer here (P11.3b).
 #[allow(clippy::large_enum_variant)] // clap derives one variant per verb
 #[allow(clippy::large_stack_frames)] // frames come from clap's derive, not hand-written code
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)] // newer nightly names this derive lint differently
 #[derive(Subcommand)]
 pub(crate) enum CoalitionCmd {
     /// Register an agent identity in the coalition's toron project (members

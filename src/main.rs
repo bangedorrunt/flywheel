@@ -813,6 +813,7 @@ enum ProofCmd {
 
 #[allow(clippy::large_enum_variant)] // clap derives one variant per verb
 #[allow(clippy::large_stack_frames)] // frames come from clap's derive, not hand-written code
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)] // newer nightly names this derive lint differently
 #[derive(Subcommand)]
 enum Commands {
     /// Background proof train: status of the newest HEAD proof (bd-7qhz0)

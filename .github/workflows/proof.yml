@@ -30,7 +30,9 @@ jobs:
       toron_rev: ${{ steps.revs.outputs.toron }}
       elm_rev: ${{ steps.revs.outputs.elm }}
       all_specs: ${{ steps.specs.outputs.all }}
+      mut_base: ${{ steps.specs.outputs.base }}
       changed_specs: ${{ steps.specs.outputs.changed }}
+      changed_paths: ${{ steps.specs.outputs.paths }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,10 +53,16 @@ jobs:
         run: |
           all="$(find scripts/mutations -maxdepth 1 -name '*.spec.sh' -printf '%f\n' | sed 's#\.spec\.sh$##' | jq -Rsc 'split("\n") | map(select(length>0))')"
           echo "all=$all" >> "$GITHUB_OUTPUT"
+          base="$(awk '/^\[mutations\]/{inside=1; next} /^\[/{inside=0} inside && /^base = /{gsub(/"/,"",$3); print $3}' proof.toml)"
+          [ -n "$base" ] || { echo "proof.toml needs [mutations] base for CI" >&2; exit 1; }
+          git cat-file -e "$base^{commit}" || { echo "mutation base $base is not a commit" >&2; exit 1; }
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          paths="$(git diff --name-only "$base" HEAD | jq -Rsc 'split("\n") | map(select(length>0))')"
+          echo "paths=$paths" >> "$GITHUB_OUTPUT"
           if [ "${{ github.event_name }}" = schedule ]; then
             echo "changed=$all" >> "$GITHUB_OUTPUT"
           else
-            changed="$(git diff --name-only ${{ github.event.before || 'HEAD~1' }} HEAD -- scripts/mutations | sed -n 's#scripts/mutations/\(.*\)\.spec\.sh#\1#p' | sort -u | jq -Rsc 'split("\n") | map(select(length>0))')"
+            changed="$(git diff --name-only "$base" HEAD -- scripts/mutations | sed -n 's#scripts/mutations/\(.*\)\.spec\.sh#\1#p' | sort -u | jq -Rsc 'split("\n") | map(select(length>0))')"
             echo "changed=$changed" >> "$GITHUB_OUTPUT"
           fi
 
@@ -199,8 +207,10 @@ jobs:
         env:
           RESULTS: '${{ needs.prepare.result }},${{ needs.build.result }},${{ needs.tests.result }},${{ needs.lints.result }},${{ needs.mutations.result }}'
           MUT_EXPECTED: ${{ needs.prepare.outputs.changed_specs != '[]' }}
+          MUT_BASE: '${{ needs.prepare.outputs.mut_base }}'
+          CHANGED_PATHS: '${{ needs.prepare.outputs.changed_paths }}'
         run: |
-          python3 scripts/merge-proof-receipt.py /tmp/proof-parts "$RESULTS" "$GITHUB_SHA" "$MUT_EXPECTED" > proof-receipt.json
+          python3 scripts/merge-proof-receipt.py /tmp/proof-parts "$RESULTS" "$GITHUB_SHA" "$MUT_EXPECTED" "$MUT_BASE" "$CHANGED_PATHS" > proof-receipt.json
           cat proof-receipt.json
           python3 -c "import json,sys; d=json.load(open('proof-receipt.json')); sys.exit(0 if d['ok'] else 1)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
