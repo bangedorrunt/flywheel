@@ -53,8 +53,9 @@ pub(crate) fn parse_build_error(log: &str) -> Option<(String, String)> {
     let start = error_at?;
     let snippet = lines[start..lines.len().min(start + 4)].join("\n");
     for line in lines.iter().skip(start).take(8) {
-        let trimmed = line.trim();
-        let rest = trimmed.strip_prefix("--> ")?;
+        let Some(rest) = line.trim().strip_prefix("--> ") else {
+            continue;
+        };
         let file = rest.split(':').next().unwrap_or(rest).trim();
         if !file.is_empty() {
             return Some((file.to_string(), snippet));

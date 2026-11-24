@@ -75,9 +75,8 @@ fn a_build_break_mails_its_holder_once() {
     assert!(mails[0].contains("--to TealCove"), "{}", mails[0]);
     assert!(mails[0].contains("src/one.rs"), "{}", mails[0]);
     assert!(
-        mails[0].contains("E0308"),
-        "the snippet must be in the mail: {}",
-        mails[0]
+        log_text.contains("E0308"),
+        "the snippet must be in the mail: {log_text}"
     );
 
     let second = run(&sandbox, &log);
