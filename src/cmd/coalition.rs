@@ -14,6 +14,7 @@ use crate::{config, profile};
 /// Manual collab reuses P11.2 (soft-conflict freeze + request-release) — no
 /// auto-proposer here (P11.3b).
 #[allow(clippy::large_enum_variant)] // clap derives one variant per verb
+#[allow(clippy::large_stack_frames)] // frames come from clap's derive, not hand-written code
 #[derive(Subcommand)]
 pub(crate) enum CoalitionCmd {
     /// Register an agent identity in the coalition's toron project (members
