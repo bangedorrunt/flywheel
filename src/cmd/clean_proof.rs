@@ -134,14 +134,15 @@ fn clean_proof_runs_needles_then_build_then_clippy_then_suite() {
     let needles = at("run_step verify-needles bash scripts/verify-needles.sh");
     let build = at("run_step build ");
     let clippy = at("run_step verify-clippy bash scripts/verify-clippy.sh");
-    let suite = at("run_step suite ");
+    let changed = at("run_changed_file_tests || true");
+    let suite = at("run_parallel_step suite ");
     assert!(
         needles < build,
         "the needle lint must run before anything is compiled"
     );
     assert!(
-        build < clippy && clippy < suite,
-        "a clippy failure must land before the suite starts"
+        build < clippy && clippy < changed && changed < suite,
+        "clippy and changed-file tests must land before the suite starts"
     );
 }
 
