@@ -102,7 +102,8 @@ jobs:
           cargo build -p toron-cli --bin toron --manifest-path toron/Cargo.toml
           echo "$GITHUB_WORKSPACE/beads/target/debug" >> "$GITHUB_PATH"
           echo "$GITHUB_WORKSPACE/toron/target/debug" >> "$GITHUB_PATH"
-          which br toron
+      - name: Verify br + toron on PATH
+        run: which br toron
       - uses: taiki-e/install-action@0e09747a63ae497bf945b3dcaf38fef0050d0109 # v2.62.0
         with: { tool: cargo-nextest }
       - name: Test shard ${{ matrix.shard }}/4
@@ -134,7 +135,8 @@ jobs:
           cargo build -p toron-cli --bin toron --manifest-path toron/Cargo.toml
           echo "$GITHUB_WORKSPACE/beads/target/debug" >> "$GITHUB_PATH"
           echo "$GITHUB_WORKSPACE/toron/target/debug" >> "$GITHUB_PATH"
-          which br toron
+      - name: Verify br + toron on PATH
+        run: which br toron
       - name: Needles, sandbox, clippy, fmt, jargon, ledger gates
         working-directory: flywheel
         run: |
