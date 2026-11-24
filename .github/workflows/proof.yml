@@ -69,7 +69,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { repository: bangedorrunt/elm-effect-rs, path: elm-effect-rs, ref: '${{ needs.prepare.outputs.elm_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with: { toolchain: nightly, components: rustfmt,clippy }
+        with:
+          toolchain: nightly
+          components: "rustfmt, clippy"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: 'flywheel\ntoron\nelm-effect-rs' }
       - name: Build once
@@ -127,7 +129,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { repository: bangedorrunt/elm-effect-rs, path: elm-effect-rs, ref: '${{ needs.prepare.outputs.elm_rev }}', token: '${{ secrets.CI_TORON_TOKEN }}' }
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
-        with: { toolchain: nightly, components: rustfmt,clippy }
+        with:
+          toolchain: nightly
+          components: "rustfmt, clippy"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with: { workspaces: 'flywheel\ntoron\nelm-effect-rs' }
       - name: Checkout beads (br CLI, GS-025)
@@ -153,9 +157,7 @@ jobs:
           bash scripts/check-peer-aware-sot.sh
           bash scripts/check-beads-ledger.sh --history
           cargo check --workspace
-          # New nightly nursery lint flags clap's generated Parser/Subcommand
-          # functions; the derives are not code we can reshape here.
-          cargo clippy -p flywheel --bin flywheel -- -D warnings -A clippy::large_unopt_stack_frames
+          cargo clippy -p flywheel --bin flywheel -- -D warnings
           cargo fmt --check
           cargo test -p flywheel --bin flywheel no_jargon_in_any_agent_facing_string
 
@@ -196,8 +198,9 @@ jobs:
         working-directory: flywheel
         env:
           RESULTS: '${{ needs.prepare.result }},${{ needs.build.result }},${{ needs.tests.result }},${{ needs.lints.result }},${{ needs.mutations.result }}'
+          MUT_EXPECTED: ${{ needs.prepare.outputs.changed_specs != '[]' }}
         run: |
-          python3 scripts/merge-proof-receipt.py /tmp/proof-parts "$RESULTS" "$GITHUB_SHA" > proof-receipt.json
+          python3 scripts/merge-proof-receipt.py /tmp/proof-parts "$RESULTS" "$GITHUB_SHA" "$MUT_EXPECTED" > proof-receipt.json
           cat proof-receipt.json
           python3 -c "import json,sys; d=json.load(open('proof-receipt.json')); sys.exit(0 if d['ok'] else 1)"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

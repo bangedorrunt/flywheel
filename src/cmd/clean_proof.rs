@@ -1161,3 +1161,37 @@ echo "FAILED=$FAILED_STEP"
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+/// bd-7qhz0: a skipped job after a failed build must never read as a green
+/// receipt. The merge is tested against the real script with a build failure
+/// and skipped test/lint/mutation fragments.
+#[test]
+fn ci_receipt_marks_skipped_jobs_failed_when_build_fails() {
+    let parts = tempfile::tempdir().expect("tempdir");
+    let script = repo_root().join("scripts/merge-proof-receipt.py");
+    let out = Command::new("python3")
+        .arg(script)
+        .arg(parts.path())
+        .arg("success,failure,skipped,skipped,skipped")
+        .arg("abc123")
+        .arg("false")
+        .output()
+        .expect("run receipt merge");
+    assert!(
+        out.status.success(),
+        "merge failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("merge prints a receipt");
+    assert_eq!(doc["ok"], serde_json::json!(false), "build failure is red");
+    assert_eq!(doc["failed_step"], serde_json::json!("build"));
+    for step in doc["steps"].as_array().expect("steps array") {
+        assert_eq!(
+            step["ok"],
+            serde_json::json!(false),
+            "{} must not read green: {step}",
+            step["name"]
+        );
+    }
+}
