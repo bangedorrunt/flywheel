@@ -2079,7 +2079,7 @@ live-verified. Record one BEFORE closing."#;
     }
 
     fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = crate::git_identity::command()
             .current_dir(dir)
             .args(args)
             .output()

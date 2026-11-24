@@ -792,6 +792,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn invalid_logrotate_plist_is_detected() {
         let root = std::env::temp_dir().join(format!("fw-logrotate-{}", std::process::id()));

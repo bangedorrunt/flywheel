@@ -1042,10 +1042,8 @@ pub(crate) fn cmd_commit(
 mod tests {
     use super::*;
 
-    use std::process::Command as StdCommand;
-
     fn git(dir: &Path, args: &[&str]) -> String {
-        let output = StdCommand::new("git")
+        let output = crate::git_identity::command()
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -1740,7 +1738,7 @@ mod tests {
         install_real_hook(&dir);
         fs::write(dir.join("plain.txt"), "x\n").unwrap();
         git(&dir, &["add", "plain.txt"]);
-        let out = StdCommand::new("git")
+        let out = crate::git_identity::command()
             .arg("-C")
             .arg(&dir)
             .args(["commit", "-qm", "plain"])
@@ -1761,7 +1759,7 @@ mod tests {
         ] {
             fs::write(dir.join(format!("{tag}.txt")), "x\n").unwrap();
             git(&dir, &["add", format!("{tag}.txt").as_str()]);
-            let out = StdCommand::new("git")
+            let out = crate::git_identity::command()
                 .arg("-C")
                 .arg(&dir)
                 .args(["commit", "-qm", tag])

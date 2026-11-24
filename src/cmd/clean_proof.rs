@@ -793,7 +793,7 @@ fn mail_red_owners_source() -> String {
 }
 
 fn git_in(dir: &std::path::Path, args: &[&str]) {
-    let out = Command::new("git")
+    let out = crate::git_identity::command()
         .current_dir(dir)
         .args(args)
         .output()

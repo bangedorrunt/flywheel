@@ -70,6 +70,7 @@ mod events_source;
 mod events_tokens;
 mod failure;
 mod fs_util;
+mod git_identity;
 mod harness_api;
 mod harness_caps;
 mod harness_registry;

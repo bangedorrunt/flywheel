@@ -1601,6 +1601,7 @@ pub fn strip_host_args(args: &[String]) -> Vec<String> {
 /// search, and its fail-closed gate refuses loudly if the bin is still
 /// missing. That is the right place for the failure: the installer does not
 /// invent a path.
+#[cfg(target_os = "macos")]
 fn resolved_bin_value(name: &str) -> String {
     doorbell_rt::binpath::resolve_cli(name)
         .map(|p| p.display().to_string())

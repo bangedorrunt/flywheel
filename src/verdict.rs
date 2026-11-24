@@ -645,7 +645,7 @@ pub fn derive_head_sha_in(cwd: &Path, search: &Path, bead_id: &str) -> anyhow::R
 
 /// Git stdout for `args` in `cwd`, trimmed of the trailing newline.
 fn git_stdout(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let out = StdCommand::new("git")
+    let out = crate::git_identity::command()
         .args(args)
         .current_dir(cwd)
         .output()
@@ -1978,7 +1978,7 @@ mod tests {
         let _g = crate::config::lock_env();
         let (dir, bead_id) = scratch_workspace("sha-empty-skip");
         let work = derive_head_sha(&dir, &bead_id).unwrap();
-        let out = std::process::Command::new("git")
+        let out = crate::git_identity::command()
             .args(["commit", "--allow-empty", "-m", &bead_id])
             .current_dir(&dir)
             .output()
