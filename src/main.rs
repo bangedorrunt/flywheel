@@ -1144,6 +1144,9 @@ enum Commands {
         /// still override zeros.
         #[arg(long)]
         project: Option<String>,
+        /// optional proposed delivery shape (direct|reviewed|wave)
+        #[arg(long)]
+        propose_shape: Option<String>,
         /// machine JSON (primitive, reason, argv)
         #[arg(long)]
         json: bool,
@@ -3536,6 +3539,7 @@ fn main() {
             launch_pending,
             contention,
             project,
+            propose_shape,
             json,
         }) => cmd_decide(
             &cfg,
@@ -3545,6 +3549,7 @@ fn main() {
             *launch_pending,
             *contention,
             project.as_deref(),
+            propose_shape.as_deref(),
             *json,
         ),
         Some(Commands::Rebind { project }) => cmd_rebind(&cfg, project),
@@ -11109,6 +11114,7 @@ fn cmd_decide(
     launch_pending: u32,
     contention: bool,
     project: Option<&str>,
+    propose_shape: Option<&str>,
     json: bool,
 ) -> Result<()> {
     let mut snap = decide::Snapshot {
@@ -11159,12 +11165,16 @@ fn cmd_decide(
         bail!("{e}");
     }
     use toron_core::kernel::Program as _;
-    let classify = crate::elm::DecideProgram::update(
-        &snap,
-        &crate::elm::DecideMsg::Classify {
+    let msg = match propose_shape {
+        Some(raw) => crate::elm::DecideMsg::ProposeShape {
+            target: target.to_string(),
+            proposed: decide::DeliveryShape::parse(raw).map_err(|e| anyhow!("{e}"))?,
+        },
+        None => crate::elm::DecideMsg::Classify {
             target: target.to_string(),
         },
-    );
+    };
+    let classify = crate::elm::DecideProgram::update(&snap, &msg);
     let cmd = classify
         .commands
         .into_iter()
@@ -11175,13 +11185,17 @@ fn cmd_decide(
         .find(|(p, _)| *p == cmd.primitive)
         .and_then(|(_, r)| r.clone());
     if json {
-        print_json(&serde_json::json!({
+        let mut out = serde_json::json!({
             "primitive": cmd.primitive,
             "reason": cmd.reason,
             "argv": cmd.argv,
             "topology": cmd.topology,
             "role": role,
-        }));
+        });
+        if let Some(proposal) = &cmd.proposal {
+            out["proposal"] = serde_json::json!(proposal);
+        }
+        print_json(&out);
     } else {
         println!(
             "{}\n{}\n{}\ntopology {}\nrole {}",

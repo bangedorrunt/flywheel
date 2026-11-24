@@ -59,8 +59,16 @@ pub fn kernel_millis(d: std::time::Duration) -> toron_core::kernel::Duration {
 /// `decide` and the tests below pin the fold they must both agree on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DecideMsg {
-    Classify { target: String },
-    Classified { argv: Vec<String> },
+    Classify {
+        target: String,
+    },
+    ProposeShape {
+        target: String,
+        proposed: crate::decide::DeliveryShape,
+    },
+    Classified {
+        argv: Vec<String>,
+    },
 }
 
 /// One classification intent: the full decision surface `cmd_decide`
@@ -73,6 +81,8 @@ pub struct DecideCmd {
     pub reason: String,
     pub argv: Vec<String>,
     pub topology: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<crate::decide::DeliveryProposalRecord>,
 }
 
 impl CmdTrait for DecideCmd {
@@ -104,6 +114,21 @@ impl Program for DecideProgram {
                         reason: d.reason.clone(),
                         argv: d.argv.clone(),
                         topology: d.topology.to_string(),
+                        proposal: None,
+                    }],
+                }
+            }
+            DecideMsg::ProposeShape { target, proposed } => {
+                let (record, d) =
+                    crate::decide::evaluate_delivery_proposal(*proposed, target, model);
+                Update {
+                    model: model.clone(),
+                    commands: vec![DecideCmd {
+                        primitive: d.primitive.to_string(),
+                        reason: d.reason.clone(),
+                        argv: d.argv.clone(),
+                        topology: d.topology.to_string(),
+                        proposal: Some(record),
                     }],
                 }
             }
@@ -200,7 +225,47 @@ mod tests {
                 reason: d.reason.clone(),
                 argv: d.argv.clone(),
                 topology: d.topology.to_string(),
+                proposal: None,
             }]
+        );
+    }
+
+    #[test]
+    fn propose_shape_update_is_pure_and_journals_accept_or_refuse() {
+        let snap = Snapshot {
+            contention: true,
+            ..Snapshot::default()
+        };
+        let msg = DecideMsg::ProposeShape {
+            target: "fix bug".into(),
+            proposed: crate::decide::DeliveryShape::Direct,
+        };
+        let first = DecideProgram::update(&snap, &msg);
+        let second = DecideProgram::update(&snap, &msg);
+        assert_eq!(first.commands, second.commands);
+        assert_eq!(first.commands.len(), 1);
+        let cmd = &first.commands[0];
+        assert_eq!(cmd.primitive, "ce-lfg");
+        let proposal = cmd.proposal.as_ref().expect("proposal recorded");
+        assert!(!proposal.accepted);
+        assert_eq!(
+            proposal.effective_shape,
+            crate::decide::DeliveryShape::Reviewed
+        );
+
+        let accepted = DecideProgram::update(
+            &Snapshot::default(),
+            &DecideMsg::ProposeShape {
+                target: "fix typo".into(),
+                proposed: crate::decide::DeliveryShape::Direct,
+            },
+        );
+        assert!(
+            accepted.commands[0]
+                .proposal
+                .as_ref()
+                .expect("proposal")
+                .accepted
         );
     }
 
@@ -229,6 +294,7 @@ mod tests {
             reason: "test".into(),
             argv: vec!["loop".into(), "work".into()],
             topology: "swarm".into(),
+            proposal: None,
         };
         let exit = Runtime::run(DecideInterpret::interpret(&cmd));
         assert!(exit.is_success());
@@ -316,6 +382,7 @@ mod tests {
                 reason: d.reason.clone(),
                 argv: d.argv.clone(),
                 topology: d.topology.to_string(),
+                proposal: None,
             }]
         );
     }

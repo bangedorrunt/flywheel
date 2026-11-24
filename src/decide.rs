@@ -612,6 +612,147 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
     },
 ];
 
+/// Pure 3-row delivery-shape table (`D8/R1`): an LLM or caller may propose a
+/// delivery shape, and this pure table accepts or refuses it deterministically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeliveryShape {
+    Direct,
+    Reviewed,
+    Wave,
+}
+
+impl DeliveryShape {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "direct" => Ok(Self::Direct),
+            "reviewed" => Ok(Self::Reviewed),
+            "wave" => Ok(Self::Wave),
+            other => Err(format!(
+                "unknown delivery shape {other:?}; expected direct, reviewed, or wave"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryShapeRow {
+    pub shape: DeliveryShape,
+    pub primitive: &'static str,
+    pub topology: &'static str,
+    pub argv: RouteArgv,
+    pub reason: &'static str,
+}
+
+pub static DELIVERY_SHAPE_TABLE: &[DeliveryShapeRow; 3] = &[
+    DeliveryShapeRow {
+        shape: DeliveryShape::Direct,
+        primitive: "steer-direct",
+        topology: "swarm",
+        argv: RouteArgv::SteerDirect,
+        reason: "direct delivery — steer --direct (light loop, no tracker)",
+    },
+    DeliveryShapeRow {
+        shape: DeliveryShape::Reviewed,
+        primitive: "ce-lfg",
+        topology: "swarm",
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "reviewed delivery — ce-lfg (build -> review -> verify)",
+    },
+    DeliveryShapeRow {
+        shape: DeliveryShape::Wave,
+        primitive: "ce-wave",
+        topology: "swarm",
+        argv: RouteArgv::WorkflowRun { mode: "pane" },
+        reason: "wave delivery — ce-wave (plan -> beads -> build -> exit)",
+    },
+];
+
+#[cfg(test)]
+pub const DELIVERY_PRIMITIVES: &[&str] = &["steer-direct", "ce-lfg", "ce-review", "ce-wave"];
+
+#[cfg(test)]
+pub const KEPT_NON_DELIVERY_PRIMITIVES: &[&str] = &[
+    "ce-resume",
+    "ce-debug",
+    "ce-measure",
+    "ce-compound",
+    "ce-triage",
+    "ce-retro",
+    "ce-bakeoff",
+    "join",
+    "steer",
+    "spawn-send",
+    "cron-start",
+    "compose-parts",
+    "compose-agent",
+    "coalition-form",
+    "loop-work",
+    "figure-it-out",
+    "none",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeliveryProposalRecord {
+    pub proposed: DeliveryShape,
+    pub accepted: bool,
+    pub effective_shape: DeliveryShape,
+    pub refusal_reason: Option<String>,
+    pub decision_primitive: String,
+}
+
+pub fn evaluate_delivery_proposal(
+    proposed: DeliveryShape,
+    target: &str,
+    snap: &Snapshot,
+) -> (DeliveryProposalRecord, Decision) {
+    let t = target.to_ascii_lowercase();
+    let requires_tracker = has(&t, &["beads", "tracker", "gate"]) && !has(&t, &["no tracker"]);
+    let forbids_tracker = has(&t, &["no tracker"]);
+
+    let (accepted, effective_shape, refusal_reason) = match proposed {
+        DeliveryShape::Direct if snap.contention => (
+            false,
+            DeliveryShape::Reviewed,
+            Some("file contention active; escalating to reviewed delivery".to_string()),
+        ),
+        DeliveryShape::Direct if requires_tracker => (
+            false,
+            DeliveryShape::Wave,
+            Some("target requires tracker/beads; escalating to wave delivery".to_string()),
+        ),
+        DeliveryShape::Wave if forbids_tracker => (
+            false,
+            DeliveryShape::Direct,
+            Some("target forbids tracker; downgrading to direct delivery".to_string()),
+        ),
+        other => (true, other, None),
+    };
+
+    let row = DELIVERY_SHAPE_TABLE
+        .iter()
+        .find(|r| r.shape == effective_shape)
+        .expect("DELIVERY_SHAPE_TABLE covers all 3 DeliveryShape variants");
+    let synth = RouteEntry {
+        primitive: row.primitive,
+        matchers: &[],
+        topology: row.topology,
+        gate: RouteGate::Always,
+        argv: row.argv,
+        reason: row.reason,
+    };
+    let mut decision = build_decision(&synth, target, snap);
+    apply_crew_budget(&mut decision, target);
+    let record = DeliveryProposalRecord {
+        proposed,
+        accepted,
+        effective_shape,
+        refusal_reason,
+        decision_primitive: decision.primitive.to_string(),
+    };
+    (record, decision)
+}
+
 /// Earliest match position, longest needle on ties: among the needles of
 /// one row that hit, the smallest index wins and the longest needle breaks
 /// index ties. Returns (pos, len).
@@ -2256,5 +2397,56 @@ mod decide_router_tests {
         assert_eq!(one_shot.primitive, "ce-measure");
         let implement_slow = decide("fix the slow dispatch", &snap());
         assert_eq!(implement_slow.primitive, "none");
+    }
+
+    #[test]
+    fn every_routing_table_row_maps_to_delivery_shape_or_kept_primitive() {
+        assert_eq!(ROUTING_TABLE.len(), 44);
+        assert_eq!(DELIVERY_SHAPE_TABLE.len(), 3);
+        assert_eq!(KEPT_NON_DELIVERY_PRIMITIVES.len(), 17);
+        for row in ROUTING_TABLE {
+            assert!(
+                DELIVERY_PRIMITIVES.contains(&row.primitive)
+                    || KEPT_NON_DELIVERY_PRIMITIVES.contains(&row.primitive),
+                "unmapped ROUTING_TABLE primitive: {}",
+                row.primitive
+            );
+        }
+    }
+
+    #[test]
+    fn evaluate_delivery_proposal_accepts_refuses_and_roundtrips_json() {
+        let (acc_rec, acc_dec) =
+            evaluate_delivery_proposal(DeliveryShape::Direct, "fix typo", &snap());
+        assert!(acc_rec.accepted);
+        assert_eq!(acc_rec.effective_shape, DeliveryShape::Direct);
+        assert_eq!(acc_rec.refusal_reason, None);
+        assert_eq!(acc_dec.primitive, "steer-direct");
+
+        let contention_snap = Snapshot {
+            contention: true,
+            ..snap()
+        };
+        let (cont_rec, cont_dec) =
+            evaluate_delivery_proposal(DeliveryShape::Direct, "fix bug", &contention_snap);
+        assert!(!cont_rec.accepted);
+        assert_eq!(cont_rec.effective_shape, DeliveryShape::Reviewed);
+        assert_eq!(cont_dec.primitive, "ce-lfg");
+
+        let (beads_rec, beads_dec) =
+            evaluate_delivery_proposal(DeliveryShape::Direct, "ship beads goal", &snap());
+        assert!(!beads_rec.accepted);
+        assert_eq!(beads_rec.effective_shape, DeliveryShape::Wave);
+        assert_eq!(beads_dec.primitive, "ce-wave");
+
+        let (notrack_rec, notrack_dec) =
+            evaluate_delivery_proposal(DeliveryShape::Wave, "fix with no tracker", &snap());
+        assert!(!notrack_rec.accepted);
+        assert_eq!(notrack_rec.effective_shape, DeliveryShape::Direct);
+        assert_eq!(notrack_dec.primitive, "steer-direct");
+
+        let json = serde_json::to_string(&beads_rec).expect("serialize");
+        let back: DeliveryProposalRecord = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, beads_rec);
     }
 }
