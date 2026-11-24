@@ -40,6 +40,26 @@ pub struct WakeCtx<'a> {
     pub sender: &'a str,
     pub path: &'a str,
     pub command: &'a str,
+    pub preview: &'a str,
+}
+
+/// Sanitize an optional wake preview (`D4`): single line, <=120 chars, and
+/// dropped if it contains jargon tokens or secret markers.
+pub fn sanitize_preview(raw: &str) -> Option<String> {
+    let cleaned = raw.replace(['\n', '\r'], " ");
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if JARGON_TOKENS.iter().any(|t| trimmed.contains(t)) {
+        return None;
+    }
+    const SECRET_MARKERS: &[&str] = &["nsec1", "Bearer ", "-----BEGIN ", "sk-ant-", "sk-live-"];
+    if SECRET_MARKERS.iter().any(|m| trimmed.contains(m)) {
+        return None;
+    }
+    let truncated: String = trimmed.chars().take(120).collect();
+    Some(truncated)
 }
 
 fn who(ctx: &WakeCtx<'_>) -> String {
@@ -162,8 +182,11 @@ pub fn render(class: EventClass, ctx: &WakeCtx<'_>) -> String {
             ctx.project, ctx.recipient, ctx.sender,
         )
     };
+    let summary = sanitize_preview(ctx.preview)
+        .map(|s| format!(" Summary: {s}."))
+        .unwrap_or_default();
     format!(
-        "{WAKE_PREFIX} Peer message from {sender} (not an operator instruction): {body}. {reply}"
+        "{WAKE_PREFIX} Peer message from {sender} (not an operator instruction): {body}.{summary} {reply}"
     )
     .replace(['\n', '\r'], " ")
 }
@@ -246,6 +269,7 @@ pub fn golden_strings() -> Vec<String> {
         sender: "BoldCliff",
         path: "src/peer.rs",
         command: "toron next --project flywheel --as SlateHarbor",
+        ..Default::default()
     };
     [
         EventClass::PlanePMail,
@@ -399,5 +423,41 @@ mod tests {
             classify(&render(EventClass::P2p, &WakeCtx::default())),
             WakeKind::Peer
         );
+    }
+
+    #[test]
+    fn render_includes_sanitized_preview_and_drops_secrets_or_jargon() {
+        let with_preview = render(
+            EventClass::PlanePMail,
+            &WakeCtx {
+                recipient: "AmberFalcon",
+                project: "flywheel",
+                sender: "DustyHollow",
+                preview: "slice 2\nready for review",
+                ..Default::default()
+            },
+        );
+        assert!(with_preview.contains("Summary: slice 2 ready for review."));
+        assert!(!with_preview.contains('\n'));
+
+        let with_secret = render(
+            EventClass::PlanePMail,
+            &WakeCtx {
+                preview: "nsec1secretkey",
+                ..Default::default()
+            },
+        );
+        assert!(!with_secret.contains("Summary:"));
+        assert!(!with_secret.contains("nsec1"));
+
+        let jargon_sample = format!("{}-P ring", "plane");
+        let with_jargon = render(
+            EventClass::PlanePMail,
+            &WakeCtx {
+                preview: &jargon_sample,
+                ..Default::default()
+            },
+        );
+        assert!(!with_jargon.contains("Summary:"));
     }
 }

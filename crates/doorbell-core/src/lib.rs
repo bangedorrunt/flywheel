@@ -748,6 +748,7 @@ pub fn p2p_line_from_hint(hint: &str, project: &str, pin: &str) -> String {
                 command: verb,
                 project,
                 recipient: pin,
+                ..Default::default()
             },
         ),
         _ => agent_text::render(
