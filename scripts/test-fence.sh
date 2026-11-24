@@ -259,7 +259,7 @@ mkdir -p "$SW/fw-proof.Stale.DDDD" "$SW/fw-proof.Fresh.AAAA" "$SW/fw-proof.Live.
 : >"$SW/fw-proof.Fresh.AAAA/.fence-running.lock"
 : >"$SW/fw-proof.Live.EEEE/.proof-running.lock"
 touch -t 202001010000 "$SW/fence.Stale.DDDD" "$SW/fw-proof.Stale.DDDD"
-touch -t "$(date -v-5H +%Y%m%d%H%M)" "$SW/fw-proof.Live.EEEE"
+touch -t "$(date -d '5 hours ago' +%Y%m%d%H%M 2>/dev/null || date -v-5H +%Y%m%d%H%M)" "$SW/fw-proof.Live.EEEE"
 run_sweep() {
     ( export TMPDIR="$SW" FLYWHEEL_FENCE_PIN="$1"
       FENCE_SWEEP_TEST=0 bash "$ROOT/scripts/fence.sh" --repo "$REPO" --sha "$GOOD" --keep \

@@ -103,7 +103,7 @@ sweep_kept_exports() {
         case "$(basename "$dir")" in
             fence."$PIN".*) ;;
             *)
-                age=$((now - $(stat -f %m "$dir" 2>/dev/null || echo 0)))
+                age=$((now - $(stat -c %Y "$dir" 2>/dev/null || stat -f %m "$dir" 2>/dev/null || echo 0)))
                 [ "$age" -ge "$SWEEP_AGE_SECS" ] || continue
                 ;;
         esac
