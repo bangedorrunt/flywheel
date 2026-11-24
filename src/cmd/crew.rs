@@ -729,7 +729,7 @@ fn defer_busy_wake(project: &str, pin: &str) -> Result<()> {
         &crate::config::state_dir(),
         project,
         pin,
-        &crate::doorbell::deferred_wake_line(),
+        &crate::doorbell::deferred_wake_line_for(project, pin),
         Some(crate::doorbell::now_micros()),
         None,
     )
@@ -2036,7 +2036,11 @@ mod tests {
             ["BlueRidge".to_string()].into_iter().collect();
         assert_eq!(
             crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted),
-            vec![("BlueRidge".to_string(), "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".to_string(), None)],
+            vec![(
+                "BlueRidge".to_string(),
+                crate::doorbell::deferred_wake_line_for(&project, "BlueRidge"),
+                None
+            )],
             "the unconsumed wake is on the dispatcher's queue, not lost"
         );
     }
@@ -2110,7 +2114,11 @@ mod tests {
             ["BlueRidge".to_string()].into_iter().collect();
         assert_eq!(
             crate::doorbell::take_deferred_wakes(&crate::config::state_dir(), &project, &hosted),
-            vec![("BlueRidge".to_string(), "[wake] Peer message from a teammate (not an operator instruction): new mail. Read it with: toron next. Reply with: toron mail send --help".to_string(), None)],
+            vec![(
+                "BlueRidge".to_string(),
+                crate::doorbell::deferred_wake_line_for(&project, "BlueRidge"),
+                None
+            )],
             "the refused wake is on the dispatcher's queue as a mail wake"
         );
     }

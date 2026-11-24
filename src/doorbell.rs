@@ -1020,8 +1020,18 @@ fn deferred_wakes_path(state_dir: &Path, project: &str) -> PathBuf {
 /// wake, never routine chatter: the fold drops a non-urgent, non-mail prompt
 /// line (bd-346jl), so any other text would be silently swallowed at the
 /// drain.
+pub fn deferred_wake_line_for(project: &str, pin: &str) -> String {
+    doorbell_core::doorbell_line_for(
+        doorbell_core::EventClass::PlanePMail,
+        "toron next",
+        project,
+        pin,
+    )
+}
+
+#[cfg(test)]
 pub fn deferred_wake_line() -> String {
-    doorbell_core::doorbell_line(doorbell_core::EventClass::PlanePMail, "toron next")
+    deferred_wake_line_for("", "")
 }
 
 /// Hand one refused wake to the live dispatcher. The host folds it as
@@ -2842,6 +2852,15 @@ mod tests {
     /// handoff row with no later drained/Prompt row for that pin is still
     /// owed a ring; one that drained is never re-rung. Foreign workspaces are
     /// not this host's business.
+    #[test]
+    fn deferred_wake_line_for_includes_project_and_pin() {
+        let line = deferred_wake_line_for("flywheel", "AmberFalcon");
+        assert!(
+            line.contains("--project flywheel --as AmberFalcon"),
+            "expected flags in deferred wake line: {line}"
+        );
+    }
+
     #[test]
     fn unrung_deferrals_reads_the_journal_not_the_memory() {
         let dir = std::env::temp_dir().join(format!("fw-unrung-{}", std::process::id()));
