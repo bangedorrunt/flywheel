@@ -731,6 +731,7 @@ mod send_dispatch_header_tests {
 /// `flywheel config seed` writes the compiled-in workflows, stages, and
 /// judgment packs that are missing. It never overwrites an existing file.
 /// `workflow drift` and `judgment pack drift` only report. They do not rewrite.
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)] // newer nightly names this derive lint differently
 #[derive(Parser)]
 #[command(
     name = "flywheel",
@@ -772,6 +773,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)] // newer nightly names this derive lint differently
 #[derive(Subcommand)]
 enum EventsTokenCmd {
     /// Rotate a pin's events token before its TTL and revoke the old hash.
@@ -789,6 +791,7 @@ enum EventsTokenCmd {
     },
 }
 
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)] // newer nightly names this derive lint differently
 #[derive(Subcommand)]
 enum SeatCmd {
     /// Re-bind a seat to a live pane (bd-01q9d)
@@ -802,6 +805,7 @@ enum SeatCmd {
 }
 
 /// Proof train verbs (bd-7qhz0). The loop is captain-owned; crews only read status.
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)] // newer nightly names this derive lint differently
 #[derive(Subcommand)]
 enum ProofCmd {
     /// Show running sha, step, elapsed, last green/red sha and covered beads

@@ -1939,6 +1939,7 @@ mod tests {
     }
 }
 
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)] // newer nightly names this derive lint differently
 #[derive(Subcommand)]
 pub(crate) enum MailLockCmd {
     /// reserve files (advisory locks)
@@ -1977,6 +1978,7 @@ pub(crate) enum MailLockCmd {
     },
 }
 
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)] // newer nightly names this derive lint differently
 #[derive(Subcommand)]
 pub(crate) enum MailContactCmd {
     /// request contact with an agent (optionally in another project)
@@ -2024,6 +2026,7 @@ pub(crate) enum MailContactCmd {
     },
 }
 
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)] // newer nightly names this derive lint differently
 #[derive(Subcommand)]
 pub(crate) enum MailSlotCmd {
     /// acquire the advisory build slot (exclusive recommended)
@@ -2067,6 +2070,7 @@ pub(crate) enum MailSlotCmd {
     },
 }
 
+#[allow(unknown_lints, clippy::large_unopt_stack_frames)] // newer nightly names this derive lint differently
 #[derive(Subcommand)]
 pub(crate) enum MailProductCmd {
     /// ensure a product exists (e.g. trading-research, knowledge)
