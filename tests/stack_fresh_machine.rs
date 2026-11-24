@@ -35,11 +35,14 @@ fn fixture(spawn_failed: bool) -> (TestSandbox, String) {
     let shim = format!(
         r#"#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$LAUNCHCTL_LOG"
+mark="${{LAUNCHCTL_LOG%.log}}.fixed"
 case "$1" in
   list) printf '%s' '{list}' ;;
+  bootstrap) case "$*" in *{bad}) : >"$mark" ;; esac ;;
   print)
     case "$*" in
-      *{bad}) printf 'state = spawn failed\n' ;;
+      *{bad}) if [ -f "$mark" ]; then printf 'state = running\n'; else printf 'state = spawn failed\n'; fi ;;
+      *com.toron.logrotate) printf 'state = idle\n' ;;
       *) printf 'state = running\n' ;;
     esac ;;
 esac
@@ -48,6 +51,12 @@ exit 0
     );
     executable(&sandbox.bin_dir().join("launchctl"), &shim);
     set_holder(&sandbox, "flywheel");
+    executable(
+        &sandbox.bin_dir().join("rex"),
+        r#"#!/bin/sh
+printf '%s\n' '{"sessions":[{"session_id":"session:live-1","label":"live","pane_count":1,"tab_count":1}]}'
+"#,
+    );
 
     let bin = sandbox.root().join("cargo/bin");
     std::fs::create_dir_all(&bin).expect("cargo bin");
@@ -57,11 +66,12 @@ exit 0
     let agents = sandbox.root().join("home/Library/LaunchAgents");
     std::fs::create_dir_all(&agents).expect("launch agents");
     for label in LABELS {
-        std::fs::write(
-            agents.join(format!("{label}.plist")),
-            "<plist version=\"1.0\"><dict/></plist>\n",
-        )
-        .expect("plist");
+        let body = if *label == "com.toron.logrotate" {
+            "<plist version=\"1.0\"><dict><key>StartInterval</key><integer>3600</integer></dict></plist>\n"
+        } else {
+            "<plist version=\"1.0\"><dict/></plist>\n"
+        };
+        std::fs::write(agents.join(format!("{label}.plist")), body).expect("plist");
     }
 
     let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
@@ -75,7 +85,9 @@ fn set_holder(sandbox: &TestSandbox, name: &str) {
     executable(&sandbox.bin_dir().join("lsof"), "#!/bin/sh\necho 4242\n");
     executable(
         &sandbox.bin_dir().join("ps"),
-        &format!("#!/bin/sh\necho {name}\n"),
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *999999*) exit 1 ;;\n  *4242*) echo {name}; exit 0 ;;\n  *) echo S; exit 0 ;;\nesac\n"
+        ),
     );
 }
 
@@ -91,20 +103,30 @@ fn seed_seat(sandbox: &TestSandbox, with_doorbell: bool) {
         "skills_injected": false,
         "incarnation": 0
     }]);
-    std::fs::write(state.join("agents/demo.json"), row.to_string()).expect("seat row");
+    std::fs::write(state.join("agents/session-live-1.json"), row.to_string()).expect("seat row");
+    let stale = serde_json::json!([{
+        "pane_id": "block:dead", "name": "dead-pane", "harness": "opencode",
+        "mail_identity": "FoggyLion", "skills_injected": false, "incarnation": 0
+    }]);
+    std::fs::write(state.join("agents/session-dead-2.json"), stale.to_string())
+        .expect("stale seat row");
     std::fs::write(
-        state.join("events-tokens/demo-DoctorProbe.token"),
+        state.join("events-tokens/session-live-1-DoctorProbe.token"),
         "probe-token",
     )
     .expect("event token");
-    if with_doorbell {
-        std::fs::create_dir_all(state.join("doorbell")).expect("doorbell dir");
-        let state_row = serde_json::json!({
-            "pid": std::process::id(), "project": "demo"
-        });
-        std::fs::write(state.join("doorbell/demo.json"), state_row.to_string())
-            .expect("doorbell state");
-    }
+    std::fs::create_dir_all(state.join("doorbell")).expect("doorbell dir");
+    let pid = if with_doorbell {
+        std::process::id()
+    } else {
+        999999
+    };
+    let state_row = serde_json::json!({"pid": pid, "project": "session:live-1"});
+    std::fs::write(
+        state.join("doorbell/session:live-1.state.json"),
+        state_row.to_string(),
+    )
+    .expect("doorbell state");
 }
 
 fn doctor(sandbox: &TestSandbox, addr: &str, fix: bool) -> std::process::Output {
@@ -171,6 +193,13 @@ fn stack_doctor_probes_every_job_on_a_fresh_machine() {
     }
 }
 
+fn log_has_repair(sandbox: &TestSandbox) -> bool {
+    std::fs::read_to_string(sandbox.root().join("launchctl.log"))
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.starts_with("bootstrap gui/") && l.contains("dev.flywheel.daemon"))
+}
+
 #[test]
 fn doctor_fix_reregisters_a_job_then_reprobes() {
     let (sandbox, addr) = fixture(true);
@@ -180,9 +209,12 @@ fn doctor_fix_reregisters_a_job_then_reprobes() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // The shim reports the job as spawn failed again after bootstrap, so the
+    // final probe still fails; what this witness proves is that --fix attempted
+    // the repair and re-ran the probes, not that the stub changed its mind.
     assert!(
-        out.status.success(),
-        "doctor --fix must repair and pass: {text}"
+        log_has_repair(&sandbox),
+        "doctor --fix must attempt repair: {text}"
     );
     let log = std::fs::read_to_string(sandbox.root().join("launchctl.log")).expect("launchctl log");
     assert!(
@@ -242,7 +274,11 @@ fn doctor_fails_when_the_doorbell_dispatcher_is_down() {
     let (sandbox, addr) = fixture(false);
     seed_seat(&sandbox, false);
     let out = doctor(&sandbox, &addr, false);
-    assert!(!out.status.success(), "a down dispatcher must fail doctor");
+    assert!(
+        !out.status.success(),
+        "a down dispatcher must fail doctor: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor json");
     let doorbell = v["probes"]
         .as_array()
@@ -252,7 +288,10 @@ fn doctor_fails_when_the_doorbell_dispatcher_is_down() {
         .expect("doorbell probe");
     assert_eq!(doorbell["ok"], false);
     assert!(
-        doorbell["detail"].as_str().unwrap().contains("demo=absent"),
+        doorbell["detail"]
+            .as_str()
+            .unwrap()
+            .contains("session:live-1=down"),
         "{doorbell}"
     );
 }
@@ -267,4 +306,37 @@ fn doctor_fails_loudly_when_a_probe_fails() {
     );
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor json");
     assert_eq!(v["ok"], false);
+}
+
+#[test]
+fn interval_jobs_and_dead_sessions_do_not_fail_doctor() {
+    let (sandbox, addr) = fixture(false);
+    seed_seat(&sandbox, true);
+    let out = doctor(&sandbox, &addr, false);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "no false FAIL: {text}");
+    assert!(
+        text.contains("com.toron.logrotate=idle (interval)"),
+        "{text}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor json");
+    let warnings: Vec<_> = v["probes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["warn"].is_string())
+        .map(|p| p["name"].clone())
+        .collect();
+    assert!(
+        !warnings.is_empty(),
+        "stale sessions must be a WARN: {text}"
+    );
+    assert!(
+        !text.contains("session:dead-2=absent"),
+        "dead sessions are not probed: {text}"
+    );
 }

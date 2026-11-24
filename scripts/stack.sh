@@ -144,15 +144,17 @@ restart_label() {
     # bd-rgs02: a bootstrap failure (e.g. launchd I/O error 5) must name the
     # job and show why, then let the OTHER jobs restart. The final doctor
     # fails the install, so one bad job cannot hide the rest of the report.
-    if ! out="$(launchctl bootstrap "gui/$uid" "$plist" 2>&1)"; then
-      rc=$?
+    rc=0
+    out="$(launchctl bootstrap "gui/$uid" "$plist" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
       echo "restart $label: launchctl bootstrap failed (exit $rc): $(printf '%s' "$out" | tail -3)" >&2
       RESTART_FAILURES+="$label "
       return 0
     fi
   elif launchctl print "$domain" >/dev/null 2>&1; then
-    if ! out="$(launchctl kickstart -k "$domain" 2>&1)"; then
-      rc=$?
+    rc=0
+    out="$(launchctl kickstart -k "$domain" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
       echo "restart $label: launchctl kickstart failed (exit $rc): $(printf '%s' "$out" | tail -3)" >&2
       RESTART_FAILURES+="$label "
       return 0

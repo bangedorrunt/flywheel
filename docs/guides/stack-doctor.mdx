@@ -14,10 +14,10 @@ An install finishes by running `flywheel stack doctor`. If any probe fails, the 
 | Probe | What it checks | Typical fix |
 |-------|----------------|-------------|
 | `binaries` | `flywheel` and `toron` are installed and answer `--version` | `flywheel stack install --operator` |
-| `jobs` | each `dev.flywheel.*` / `com.toron.*` job is loaded and `state = running` | `flywheel stack doctor --fix` |
+| `jobs` | each job is loaded; interval jobs may be idle, others must be `running`; a spawn failure or nonzero last exit fails | `flywheel stack doctor --fix` |
 | `toron` | the effective toron address accepts a TCP connection | install, then check the toron daemon log |
-| `doorbell` | each seated project's dispatcher has a live pid | `flywheel doorbell start <project>` |
-| `events` | every events-door seat has an events token | install (mints missing tokens) |
+| `doorbell` | each **live** session's dispatcher has a live pid; dead sessions get a WARN, not a FAIL | `flywheel doorbell start <project>` |
+| `events` | every **live** events-door seat has an events token; dead sessions get a WARN | install (mints missing tokens) |
 | `wake` | a probe wake is actually queued for the doctor pin | install, then check the doorbell dispatcher |
 | `daemon_port` | the serve port (default 8787, override `FLYWHEEL_SERVE_PORT`) is held by our flywheel process | stop the named conflicting process, then install |
 

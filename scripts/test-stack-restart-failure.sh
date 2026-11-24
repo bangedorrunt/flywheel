@@ -34,12 +34,14 @@ for label in good dev.flywheel.bad last; do
 done
 
 out="$(
-  # shellcheck disable=SC1091
-  . "$ROOT/scripts/stack.sh"
-  restart_label good
-  restart_label dev.flywheel.bad
-  restart_label last
-)" 2>&1 || fail "one bad job must not abort the restart loop: $out"
+  {
+    # shellcheck disable=SC1091
+    . "$ROOT/scripts/stack.sh"
+    restart_label good
+    restart_label dev.flywheel.bad
+    restart_label last
+  } 2>&1
+)" || fail "one bad job must not abort the restart loop: $out"
 
 uid="$(id -u)"
 for label in good dev.flywheel.bad last; do

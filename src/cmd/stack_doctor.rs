@@ -19,6 +19,9 @@ pub(crate) struct Probe {
     pub ok: bool,
     pub detail: String,
     pub fix: String,
+    /// Non-fatal observations (e.g. stale state dirs from dead sessions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn: Option<String>,
 }
 
 const CORE_JOBS: &[&str] = &[
@@ -48,19 +51,50 @@ fn job_labels() -> Vec<String> {
     labels
 }
 
-fn job_state(label: &str) -> Option<String> {
+/// (loaded, state, last exit code, interval job). An interval job is healthy
+/// when loaded: launchd leaves it idle between runs, so "not running" is not
+/// a failure. Only a spawn failure or a nonzero last exit is bad.
+fn job_health(label: &str) -> (bool, String, i32, bool) {
     let uid = unsafe { libc_getuid() };
-    let out = Command::new("launchctl")
+    let Ok(out) = Command::new("launchctl")
         .args(["print", &format!("gui/{uid}/{label}")])
         .output()
-        .ok()?;
+    else {
+        return (false, "not loaded".into(), 0, false);
+    };
     if !out.status.success() {
-        return None;
+        return (false, "not loaded".into(), 0, false);
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    text.lines()
+    let state = text
+        .lines()
         .find_map(|line| line.trim().strip_prefix("state = "))
-        .map(str::to_string)
+        .unwrap_or("unknown")
+        .trim()
+        .to_string();
+    let last_exit = text
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("last exit code = ")
+                .and_then(|v| v.trim().parse::<i32>().ok())
+        })
+        .unwrap_or(0);
+    let plist = launch_agent_dir().join(format!("{label}.plist"));
+    let interval = std::fs::read_to_string(&plist)
+        .map(|body| body.contains("StartInterval") || body.contains("StartCalendarInterval"))
+        .unwrap_or(false);
+    (true, state, last_exit, interval)
+}
+
+/// Workspace ids rex reports as live now. Dead sessions leave doorbell state
+/// dirs and seat registry rows behind; they must not fail doctor.
+fn live_workspaces(cfg: &Config) -> std::collections::BTreeSet<String> {
+    crate::backend::multiplexer_backend(cfg)
+        .ok()
+        .and_then(|b| b.workspace_list().ok())
+        .map(|rows| rows.into_iter().map(|w| w.workspace_id).collect())
+        .unwrap_or_default()
 }
 
 #[cfg(unix)]
@@ -133,6 +167,7 @@ fn binaries_probe() -> Probe {
             format!("missing or unversioned: {}", missing.join(", "))
         },
         fix: "flywheel stack install --operator".into(),
+        warn: None,
     }
 }
 
@@ -140,16 +175,20 @@ fn jobs_probe() -> (Probe, Vec<String>) {
     let mut failed = Vec::new();
     let mut detail = Vec::new();
     for label in job_labels() {
-        match job_state(&label) {
-            Some(state) if state == "running" => detail.push(format!("{label}=running")),
-            Some(state) => {
-                failed.push(label.clone());
-                detail.push(format!("{label}={state}"))
-            }
-            None => {
-                failed.push(label.clone());
-                detail.push(format!("{label}=not loaded"))
-            }
+        let (loaded, state, last_exit, interval) = job_health(&label);
+        let healthy =
+            loaded && state != "spawn failed" && last_exit == 0 && (interval || state == "running");
+        detail.push(format!(
+            "{label}={state}{}{}",
+            if last_exit == 0 {
+                String::new()
+            } else {
+                format!(" exit={last_exit}")
+            },
+            if interval { " (interval)" } else { "" }
+        ));
+        if !healthy {
+            failed.push(label.clone());
         }
     }
     let ok = failed.is_empty();
@@ -158,34 +197,54 @@ fn jobs_probe() -> (Probe, Vec<String>) {
         ok,
         detail: detail.join("; "),
         fix: "flywheel stack doctor --fix (re-register from plist)".into(),
+        warn: None,
     };
     (probe, failed)
 }
 
-fn doorbell_probe() -> Probe {
+fn doorbell_probe(cfg: &Config) -> Probe {
     let state_dir = crate::config::state_dir();
-    let projects = super::stack::events_seats_and_tokens()
-        .0
-        .iter()
-        .map(|(project, _, _)| project.clone())
-        .collect::<std::collections::BTreeSet<_>>();
+    let live = live_workspaces(cfg);
     let mut detail = Vec::new();
+    let mut stale = Vec::new();
     let mut down = Vec::new();
-    for project in projects {
-        let state = crate::doorbell::dispatcher_token_for_project(&state_dir, &project);
-        detail.push(format!("{project}={state}"));
-        if state != "up" {
-            down.push(project);
+    if let Ok(entries) = std::fs::read_dir(state_dir.join("doorbell")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|x| x.to_str()).unwrap_or("");
+            let Some(workspace) = name.strip_suffix(".state.json").map(str::to_string) else {
+                continue;
+            };
+            if !live.contains(&workspace) {
+                stale.push(workspace);
+                continue;
+            }
+            let state = crate::doorbell::dispatcher_token(&state_dir, &workspace);
+            detail.push(format!("{workspace}={state}"));
+            if state != "up" {
+                down.push(workspace);
+            }
         }
     }
     if detail.is_empty() {
-        detail.push("no seated projects".into());
+        detail.push(format!(
+            "{} live session(s) without a dispatcher",
+            live.len()
+        ));
     }
+    let warn = (!stale.is_empty()).then(|| {
+        format!(
+            "{} stale doorbell state dirs ({}); clean with: remove <state>/doorbell/<session>",
+            stale.len(),
+            stale.join(", ")
+        )
+    });
     Probe {
         name: "doorbell",
         ok: down.is_empty(),
         detail: detail.join("; "),
         fix: "flywheel doorbell start <project> (or stack doctor --fix)".into(),
+        warn,
     }
 }
 
@@ -237,6 +296,7 @@ fn daemon_port_probe() -> Probe {
                 command.as_deref().unwrap_or("unknown")
             )
         },
+        warn: None,
     }
 }
 
@@ -264,21 +324,35 @@ fn wake_probe() -> Probe {
             if ok { "wake queued" } else { "no wake row" }
         ),
         fix: "flywheel stack install --operator; check the doorbell dispatcher".into(),
+        warn: None,
     }
 }
 
-fn events_probe() -> Probe {
-    let (seats, tokens) = super::stack::events_seats_and_tokens();
+fn events_probe(cfg: &Config) -> Probe {
+    let live = live_workspaces(cfg);
+    let (all_seats, tokens) = super::stack::events_seats_and_tokens();
+    // Dead sessions leave seat rows behind; only live workspaces can carry a
+    // working events door.
+    let seats: Vec<_> = all_seats
+        .iter()
+        .filter(|(project, _, _)| live.contains(project))
+        .cloned()
+        .collect();
+    let stale: Vec<String> = all_seats
+        .iter()
+        .filter(|(project, _, _)| !live.contains(project))
+        .map(|(project, pin, _)| format!("{project}/{pin}"))
+        .collect();
     let tokenless = super::stack::tokenless_events_seats(&seats, &tokens);
     let ok = tokenless.is_empty();
     Probe {
         name: "events",
         ok,
         detail: if ok {
-            format!("{} events-door seats armed", seats.len())
+            format!("{} live events-door seats armed", seats.len())
         } else {
             format!(
-                "tokenless seats: {}",
+                "tokenless live seats: {}",
                 tokenless
                     .iter()
                     .map(|(p, pin, _)| format!("{p}/{pin}"))
@@ -287,6 +361,13 @@ fn events_probe() -> Probe {
             )
         },
         fix: "flywheel stack install --operator (mints seat event tokens)".into(),
+        warn: (!stale.is_empty()).then(|| {
+            format!(
+                "{} seat rows from dead sessions ignored ({}); clean with: remove <state>/doorbell/<session>",
+                stale.len(),
+                stale.join(", ")
+            )
+        }),
     }
 }
 
@@ -298,6 +379,7 @@ fn toron_probe(cfg: &Config) -> Probe {
         ok,
         detail: format!("{addr}: {}", if ok { "reachable" } else { "refused" }),
         fix: "flywheel stack install --operator; then check toron daemon logs".into(),
+        warn: None,
     }
 }
 
@@ -307,8 +389,8 @@ pub(crate) fn cmd_stack_doctor(cfg: &Config, json: bool, fix: bool) -> Result<()
     let (jobs, failed_jobs) = jobs_probe();
     probes.push(jobs);
     probes.push(toron_probe(cfg));
-    probes.push(doorbell_probe());
-    probes.push(events_probe());
+    probes.push(doorbell_probe(cfg));
+    probes.push(events_probe(cfg));
     probes.push(wake_probe());
     probes.push(daemon_port_probe());
 
@@ -325,8 +407,8 @@ pub(crate) fn cmd_stack_doctor(cfg: &Config, json: bool, fix: bool) -> Result<()
             let (jobs, _) = jobs_probe();
             probes.push(jobs);
             probes.push(toron_probe(cfg));
-            probes.push(doorbell_probe());
-            probes.push(events_probe());
+            probes.push(doorbell_probe(cfg));
+            probes.push(events_probe(cfg));
             probes.push(wake_probe());
             probes.push(daemon_port_probe());
         }
@@ -351,6 +433,9 @@ pub(crate) fn cmd_stack_doctor(cfg: &Config, json: bool, fix: bool) -> Result<()
                     format!(" (fix: {})", probe.fix)
                 }
             );
+            if let Some(warn) = &probe.warn {
+                println!("WARN {} — {}", probe.name, warn);
+            }
         }
     }
     if probes.iter().any(|p| !p.ok) {
