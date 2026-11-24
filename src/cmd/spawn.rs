@@ -4132,6 +4132,25 @@ mod spawn_profile_plan_tests {
         );
     }
 
+    /// bd-omp-pin-wrong-cwd-ivool: the verify names this test. The pinned build
+    /// travels in the launch command, independent of the seat's cwd.
+    #[test]
+    fn omp_version_pin_survives_a_foreign_cwd() {
+        let binary = crate::harness_launch_binary("omp");
+        assert!(
+            binary.contains(&format!(
+                "github:can1357/oh-my-pi@{}",
+                crate::harness_registry::OMP_DEFAULT_VERSION
+            )),
+            "the omp launch must name the verified build: {binary}"
+        );
+        let cmd = crate::pane::rex_env_command(&Default::default(), "omp", &[]);
+        assert!(
+            cmd.contains(crate::harness_registry::OMP_DEFAULT_VERSION),
+            "the rex launch path must carry the pin too: {cmd}"
+        );
+    }
+
     /// bd-omp-pin: a seat launched from ANY project dir names the pinned omp
     /// build explicitly, so mise never falls back to a cwd-less PATH omp.
     #[test]
