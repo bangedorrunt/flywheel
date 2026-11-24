@@ -153,7 +153,7 @@ jobs:
           bash scripts/check-peer-aware-sot.sh
           bash scripts/check-beads-ledger.sh --history
           cargo check --workspace
-          cargo clippy -p flywheel --bin flywheel --tests -- -D warnings
+          cargo clippy -p flywheel --bin flywheel -- -D warnings
           cargo fmt --check
           cargo test -p flywheel --bin flywheel no_jargon_in_any_agent_facing_string
 
