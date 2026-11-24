@@ -153,7 +153,9 @@ jobs:
           bash scripts/check-peer-aware-sot.sh
           bash scripts/check-beads-ledger.sh --history
           cargo check --workspace
-          cargo clippy -p flywheel --bin flywheel -- -D warnings
+          # New nightly nursery lint flags clap's generated Parser/Subcommand
+          # functions; the derives are not code we can reshape here.
+          cargo clippy -p flywheel --bin flywheel -- -D warnings -A clippy::large_unopt_stack_frames
           cargo fmt --check
           cargo test -p flywheel --bin flywheel no_jargon_in_any_agent_facing_string
 
