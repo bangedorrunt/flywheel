@@ -116,6 +116,9 @@ pub enum MemoryCmd {
         /// Actor pin/name (accepted for parity; forwarded where supported).
         #[arg(long = "as", name = "as")]
         r#as: Option<String>,
+        /// Quarantine as a candidate conclusion instead of active immediately.
+        #[arg(long)]
+        candidate: bool,
         /// Machine-readable output.
         #[arg(long)]
         json: bool,
@@ -135,6 +138,7 @@ pub fn cmd_memory(cfg: &Config, cmd: &MemoryCmd) -> Result<()> {
             kind,
             project,
             r#as,
+            candidate,
             json,
         } => cmd_record_lesson(
             cfg,
@@ -142,6 +146,7 @@ pub fn cmd_memory(cfg: &Config, cmd: &MemoryCmd) -> Result<()> {
             kind.as_deref(),
             project.as_deref(),
             r#as.as_deref(),
+            *candidate,
             *json,
         ),
     }
@@ -194,10 +199,12 @@ fn cmd_record_lesson(
     kind: Option<&str>,
     project: Option<&str>,
     as_agent: Option<&str>,
+    candidate: bool,
     json: bool,
 ) -> Result<()> {
     let project_dir = project.map(|p| crate::project_dir(cfg, p));
-    let recorded = record_lesson_with_pin(content, kind, project_dir.as_deref(), as_agent);
+    let recorded =
+        record_lesson_with_options(content, kind, project_dir.as_deref(), as_agent, candidate);
     if json {
         print_json(&serde_json::json!({
             "ok": recorded,
@@ -702,6 +709,37 @@ fn trap_matcher(content: &str) -> String {
     y.chars().take(120).collect::<String>().trim().to_string()
 }
 
+/// Build the `chie memory record` argv for a lesson.
+fn build_record_lesson_argv(
+    content: &str,
+    kind: Option<&str>,
+    project_dir: Option<&Path>,
+    pin: Option<&str>,
+    candidate: bool,
+) -> Vec<String> {
+    let mut args = vec!["memory".to_string(), "record".to_string()];
+    if let Some(dir) = chie_project(project_dir) {
+        args.push("--project".to_string());
+        args.push(dir);
+    }
+    // A default kind that chie can derive into a retrievable rule lesson.
+    let kind = kind
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("error");
+    args.push("--kind".to_string());
+    args.push(kind.to_string());
+    if let Some(p) = pin.map(str::trim).filter(|s| !s.is_empty()) {
+        args.push("--pin".to_string());
+        args.push(p.to_string());
+    }
+    if candidate {
+        args.push("--candidate".to_string());
+    }
+    args.push(rule_lesson_event(content));
+    args
+}
+
 /// Record a lesson in chie memory attributed to an optional agent pin.
 pub fn record_lesson_with_pin(
     content: &str,
@@ -709,25 +747,24 @@ pub fn record_lesson_with_pin(
     project_dir: Option<&Path>,
     pin: Option<&str>,
 ) -> bool {
+    record_lesson_with_options(content, kind, project_dir, pin, false)
+}
+
+/// Record a lesson in chie memory with optional agent pin and candidate flag.
+pub fn record_lesson_with_options(
+    content: &str,
+    kind: Option<&str>,
+    project_dir: Option<&Path>,
+    pin: Option<&str>,
+    candidate: bool,
+) -> bool {
     let content = content.trim();
     if content.is_empty() {
         return false;
     }
+    let argv = build_record_lesson_argv(content, kind, project_dir, pin, candidate);
     let mut cmd = Command::new(chie_bin());
-    cmd.args(["memory", "record"]);
-    if let Some(dir) = chie_project(project_dir) {
-        cmd.args(["--project", &dir]);
-    }
-    // A default kind that chie can derive into a retrievable rule lesson.
-    let kind = kind
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("error");
-    cmd.args(["--kind", kind]);
-    if let Some(p) = pin.map(str::trim).filter(|s| !s.is_empty()) {
-        cmd.args(["--pin", p]);
-    }
-    cmd.arg(rule_lesson_event(content));
+    cmd.args(&argv);
     match run_chie_bounded(&mut cmd, CHIE_SUBPROCESS_TIMEOUT) {
         Ok(out) => out.status.success(),
         Err(_) => false,
@@ -1201,5 +1238,15 @@ printf '[{"rule_id":"e-1","warning":"drain parks are bounded"}]'
         let dir = tmpdir("http-timeout");
         let check = briefing_traps_with_http_url(Some(&url), "fix bug", None, Some(&dir));
         assert_eq!(check.status, TrapStatus::Timeout);
+    }
+
+    #[test]
+    fn build_record_lesson_argv_includes_candidate_only_when_requested() {
+        let active = build_record_lesson_argv("Avoid X", Some("decision"), None, None, false);
+        assert!(!active.iter().any(|a| a == "--candidate"));
+        let cand =
+            build_record_lesson_argv("Avoid X", Some("decision"), None, Some("AmberFalcon"), true);
+        assert!(cand.iter().any(|a| a == "--candidate"));
+        assert!(cand.windows(2).any(|w| w == ["--pin", "AmberFalcon"]));
     }
 }

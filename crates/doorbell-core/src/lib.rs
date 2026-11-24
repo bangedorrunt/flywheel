@@ -574,6 +574,17 @@ pub fn parse_rfc3339_micros(ts: &str) -> Result<i64, chrono::ParseError> {
 /// mailbox without --project and --as, so the read door is rendered here,
 /// once, for both immediate and queued wakes.
 pub fn doorbell_line_for(class: EventClass, hint: &str, project: &str, pin: &str) -> String {
+    doorbell_line_with_preview(class, hint, project, pin, "")
+}
+
+/// Render one agent-facing wake with an optional sanitized preview line.
+pub fn doorbell_line_with_preview(
+    class: EventClass,
+    hint: &str,
+    project: &str,
+    pin: &str,
+    preview: &str,
+) -> String {
     if class == EventClass::P2p {
         return p2p_line_from_hint(hint, project, pin);
     }
@@ -583,6 +594,7 @@ pub fn doorbell_line_for(class: EventClass, hint: &str, project: &str, pin: &str
             command: hint,
             project,
             recipient: pin,
+            preview,
             ..Default::default()
         },
     )
@@ -2774,6 +2786,26 @@ mod tests {
         );
         let ring = super::composed_ring(&model.queues["BlueRidge"]);
         assert!(ring.contains("--project flywheel") && ring.contains("--as BlueRidge"));
+    }
+
+    #[test]
+    fn doorbell_line_with_preview_appends_summary_when_non_empty() {
+        let plain = super::doorbell_line_with_preview(
+            EventClass::PlanePMail,
+            "toron next",
+            "flywheel",
+            "BlueRidge",
+            "",
+        );
+        assert!(!plain.contains("Summary:"));
+        let with_summary = super::doorbell_line_with_preview(
+            EventClass::PlanePMail,
+            "toron next",
+            "flywheel",
+            "BlueRidge",
+            "check the gate",
+        );
+        assert!(with_summary.contains("Summary: check the gate."));
     }
 
     #[test]

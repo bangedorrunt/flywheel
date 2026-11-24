@@ -97,6 +97,19 @@ pub fn wake_line_for(
     recipient: &str,
     sender: &str,
 ) -> String {
+    wake_line_with_preview(_wm, urgency, project, recipient, sender, "")
+}
+
+/// Render a wake line with project, recipient, sender, and sanitized preview.
+#[must_use]
+pub fn wake_line_with_preview(
+    _wm: Wm,
+    urgency: Urgency,
+    project: &str,
+    recipient: &str,
+    sender: &str,
+    preview: &str,
+) -> String {
     // bd-ofa1s: plain English, no machine ids in prose. The watermark stays
     // available to the typed `Wm` carrier for dedupe (bd-tdpix).
     let class = match urgency {
@@ -109,6 +122,7 @@ pub fn wake_line_for(
             recipient,
             project,
             sender,
+            preview,
             ..Default::default()
         },
     )
@@ -500,6 +514,20 @@ mod tests {
         assert!(
             line.contains("toron mail send --project flywheel --as DustyHollow --to AmberFalcon")
         );
+    }
+
+    #[test]
+    fn wake_line_with_preview_appends_sanitized_summary() {
+        let line = wake_line_with_preview(
+            Wm(7),
+            Urgency::Normal,
+            "flywheel",
+            "DustyHollow",
+            "AmberFalcon",
+            "review\nstatus",
+        );
+        assert!(line.contains("toron next --project flywheel --as DustyHollow"));
+        assert!(line.contains("Summary: review status."));
     }
 
     fn walk(root: &std::path::Path, rel: &str, out: &mut Vec<(String, String)>) {

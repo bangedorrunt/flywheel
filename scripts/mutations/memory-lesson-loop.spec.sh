@@ -34,8 +34,8 @@ mutation "M3  repeated lessons are not deduplicated" \
 mutation "M4  record-lesson sends the pin as the authoring peer" \
     file=$MEM \
     expect=recording_with_as_is_retrievable \
-    find='        cmd.args(["--pin", p]);' \
-    replace='        cmd.args(["--peer", &format!("agent:{p}")]);'
+    find='        args.push("--pin".to_string());' \
+    replace='        args.push("--peer".to_string());'
 
 mutation "N1  an inline memory test drops the fake chie" \
     file=tests/memory_loop.rs \

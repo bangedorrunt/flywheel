@@ -478,12 +478,18 @@ impl PromptDispatch {
         } else {
             crate::pane_write::Urgency::Normal
         };
-        crate::pane_write::wake_line_for(
+        let preview = self
+            .prompt
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
+        crate::pane_write::wake_line_with_preview(
             crate::pane_write::Wm(wm),
             urgency,
             &self.project,
             &self.pin,
             &self.sender,
+            preview,
         )
     }
 
@@ -1792,6 +1798,10 @@ mod tests {
         assert!(
             wake.contains("toron next --project flywheel --as BlackGorge"),
             "wake must include --project and --as: {wake}"
+        );
+        assert!(
+            wake.contains("Summary: do the thing."),
+            "wake must include sanitized preview: {wake}"
         );
         let confirmation = dispatch.confirmation(42);
         assert_eq!(confirmation["pin"], "BlackGorge");
