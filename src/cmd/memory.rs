@@ -214,8 +214,11 @@ fn cmd_record_lesson(
 }
 
 const MAX_TRAPS: usize = 20;
+const MAX_BRIEF_TRAPS: usize = 5;
 const MAX_QUERY_CHARS: usize = 600;
 const MAX_PATH_CHECKS: usize = 12;
+const CHIE_HTTP_TIMEOUT: Duration = Duration::from_millis(250);
+const DEFAULT_CHIE_HTTP_URL: &str = "http://127.0.0.1:18081";
 
 /// How complete a trap check is. Ordered by severity: a fold keeps the worst
 /// call's status, so one timed-out call marks the whole result partial.
@@ -274,10 +277,81 @@ fn path_like(q: &str) -> bool {
     q.contains('/') || q.ends_with(".rs") || q.ends_with(".toml") || q.ends_with(".md")
 }
 
-/// Briefing preflight: the objective, bead and modified paths go to chie as
-/// ONE free-text query; each modified path also gets its own glob check, all
-/// calls in parallel.
-pub fn briefing_traps(
+fn chie_http_base_url() -> Option<String> {
+    if let Ok(raw) = std::env::var("FLYWHEEL_CHIE_HTTP_URL") {
+        let trimmed = raw.trim().trim_end_matches('/');
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("off") {
+            return None;
+        }
+        return Some(trimmed.to_string());
+    }
+    if cfg!(test) {
+        return None;
+    }
+    Some(DEFAULT_CHIE_HTTP_URL.to_string())
+}
+
+#[derive(Debug)]
+enum HttpTrapResult {
+    Hit(TrapCheck),
+    Fallback,
+}
+
+fn try_briefing_traps_http(
+    base_url: &str,
+    query: Option<&str>,
+    paths: &[String],
+    project_dir: Option<&Path>,
+) -> HttpTrapResult {
+    let url = format!("{base_url}/v1/check-trap");
+    let project = chie_project(project_dir);
+    let body = serde_json::json!({
+        "query": query,
+        "paths": paths,
+        "project": project,
+    });
+    let agent = ureq::AgentBuilder::new().timeout(CHIE_HTTP_TIMEOUT).build();
+    let resp = match agent.post(&url).send_json(body) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(404 | 405 | 501 | 503, _)) => return HttpTrapResult::Fallback,
+        Err(ureq::Error::Status(code, r)) => {
+            let text = r.into_string().unwrap_or_default();
+            return HttpTrapResult::Hit(TrapCheck {
+                traps: Vec::new(),
+                status: TrapStatus::Failed,
+                detail: Some(format!("HTTP {code}: {text}")),
+            });
+        }
+        Err(ureq::Error::Transport(t)) => {
+            let msg = t.to_string();
+            let low = msg.to_ascii_lowercase();
+            if low.contains("timed out") || low.contains("timeout") {
+                return HttpTrapResult::Hit(TrapCheck {
+                    traps: Vec::new(),
+                    status: TrapStatus::Timeout,
+                    detail: Some(msg),
+                });
+            }
+            return HttpTrapResult::Fallback;
+        }
+    };
+    let doc: serde_json::Value = match resp.into_json() {
+        Ok(d) => d,
+        Err(e) => {
+            return HttpTrapResult::Hit(TrapCheck {
+                traps: Vec::new(),
+                status: TrapStatus::Failed,
+                detail: Some(format!("invalid JSON from chie HTTP: {e}")),
+            });
+        }
+    };
+    let mut check = fold_outcomes(vec![CallOutcome::Found(extract_trap_lines_json(&doc))]);
+    check.traps.truncate(MAX_BRIEF_TRAPS);
+    HttpTrapResult::Hit(check)
+}
+
+pub(crate) fn briefing_traps_with_http_url(
+    http_base_url: Option<&str>,
     objective: &str,
     bead: Option<&str>,
     project_dir: Option<&Path>,
@@ -299,6 +373,14 @@ pub fn briefing_traps(
         .chars()
         .take(MAX_QUERY_CHARS)
         .collect();
+    if let Some(base_url) = http_base_url {
+        let q = (!query.is_empty()).then_some(query.as_str());
+        if let HttpTrapResult::Hit(check) =
+            try_briefing_traps_http(base_url, q, &paths, project_dir)
+        {
+            return check;
+        }
+    }
     let mut calls = Vec::new();
     if !query.is_empty() {
         calls.push(TrapCall {
@@ -310,7 +392,20 @@ pub fn briefing_traps(
         path: Some(p),
         ..TrapCall::default()
     }));
-    run_trap_calls(&calls, project_dir)
+    let mut check = run_trap_calls(&calls, project_dir);
+    check.traps.truncate(MAX_BRIEF_TRAPS);
+    check
+}
+
+/// Briefing preflight: the objective, bead and modified paths go to chie as
+/// ONE HTTP call when `:18081` answers, falling back to bounded subprocesses.
+pub fn briefing_traps(
+    objective: &str,
+    bead: Option<&str>,
+    project_dir: Option<&Path>,
+) -> TrapCheck {
+    let base = chie_http_base_url();
+    briefing_traps_with_http_url(base.as_deref(), objective, bead, project_dir)
 }
 
 /// `flywheel memory check-trap`: one chie call that reads the query as text,
@@ -1025,5 +1120,86 @@ printf '[{"rule_id":"e-1","warning":"drain parks are bounded"}]'
         let recorded = fs::read_to_string(log).unwrap();
         assert!(recorded.contains("--pin QuietLantern"), "args: {recorded}");
         assert!(!recorded.contains("--peer"), "args: {recorded}");
+    }
+
+    fn serve_once(status_line: &str, body: &str, delay: Duration) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_string();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn briefing_traps_uses_http_fast_path_and_caps_to_five() {
+        let traps: Vec<_> = (1..=8)
+            .map(|i| serde_json::json!({ "rule_id": format!("r-{i}"), "warning": format!("Rule {i}") }))
+            .collect();
+        let url = serve_once(
+            "200 OK",
+            &serde_json::json!({ "ok": true, "traps": traps, "count": 8 }).to_string(),
+            Duration::ZERO,
+        );
+        let dir = tmpdir("http-200-traps");
+        let missing = dir.join("chie-missing");
+        let check = with_chie_bin(&missing, || {
+            briefing_traps_with_http_url(Some(&url), "fix bug", None, Some(&dir))
+        });
+        assert_eq!(check.status, TrapStatus::Ok);
+        assert_eq!(check.traps.len(), MAX_BRIEF_TRAPS);
+    }
+
+    #[test]
+    fn briefing_traps_http_200_empty_skips_subprocess_fallback() {
+        let url = serve_once(
+            "200 OK",
+            r#"{"ok":true,"traps":[],"count":0}"#,
+            Duration::ZERO,
+        );
+        let dir = tmpdir("http-200-empty");
+        let missing = dir.join("chie-missing");
+        let check = with_chie_bin(&missing, || {
+            briefing_traps_with_http_url(Some(&url), "fix bug", None, Some(&dir))
+        });
+        assert_eq!(check.status, TrapStatus::Ok);
+        assert!(check.traps.is_empty());
+    }
+
+    #[test]
+    fn briefing_traps_http_404_falls_back_to_subprocess() {
+        let url = serve_once("404 Not Found", r#"{"error":"not found"}"#, Duration::ZERO);
+        let dir = tmpdir("http-404-fallback");
+        let missing = dir.join("chie-missing");
+        let check = with_chie_bin(&missing, || {
+            briefing_traps_with_http_url(Some(&url), "fix bug", None, Some(&dir))
+        });
+        assert_eq!(check.status, TrapStatus::Offline);
+    }
+
+    #[test]
+    fn briefing_traps_http_timeout_returns_timeout_status() {
+        let url = serve_once(
+            "200 OK",
+            r#"{"ok":true,"traps":[],"count":0}"#,
+            Duration::from_millis(450),
+        );
+        let dir = tmpdir("http-timeout");
+        let check = briefing_traps_with_http_url(Some(&url), "fix bug", None, Some(&dir));
+        assert_eq!(check.status, TrapStatus::Timeout);
     }
 }

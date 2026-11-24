@@ -95,28 +95,15 @@ impl Gate {
     }
 }
 
-/// The gate's grounding read: the SAME bounded projection `__gate-learnings`
-/// prints, projected to the paths the artifact carries. A missing corpus is not
-/// a gate failure — it is an empty read, said out loud.
-pub fn learnings(root: &str, budget: usize) -> Vec<String> {
-    match crate::cmd::internal::project_gate_learnings(root, budget, None, None) {
-        Ok((_, projected)) => projected.iter().map(|e| e.path.clone()).collect(),
-        Err(e) => {
-            eprintln!("flywheel: wave gate could not read {root} for the grounding read: {e:#}");
-            Vec::new()
-        }
-    }
-}
-
 /// `flywheel __wave-gate --label wave-N --project <p> [--json]`.
 pub(crate) fn cmd(cfg: &crate::config::Config, project: &str, label: &str) -> anyhow::Result<()> {
     let ready = crate::load_ready_beads(cfg, project)?;
     let inprogress = crate::load_inprogress_beads(cfg, project)?;
     let decided = gate(&ready, &inprogress, label).map_err(anyhow::Error::msg)?;
-    let projected = learnings("chiebukuro", crate::cmd::internal::default_gate_budget());
+    let project_dir = crate::project_dir(cfg, project);
+    let projected = crate::cmd::memory::briefing_traps(label, None, Some(&project_dir)).traps;
     let artifact = decided.artifact(label, &projected);
-    let path = crate::project_state::wave_dir(&crate::project_dir(cfg, project))
-        .join(format!("{label}-ready.json"));
+    let path = crate::project_state::wave_dir(&project_dir).join(format!("{label}-ready.json"));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
