@@ -839,9 +839,6 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn tmpdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -867,9 +864,7 @@ mod tests {
     }
 
     fn with_chie_bin<T>(bin: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::config::lock_env();
         let old = std::env::var_os("FLYWHEEL_CHIE_BIN");
         unsafe { std::env::set_var("FLYWHEEL_CHIE_BIN", bin) };
         let out = f();

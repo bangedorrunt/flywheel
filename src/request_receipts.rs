@@ -787,6 +787,7 @@ mod tests {
     /// the location check and a pane-local cron looks hosted-shaped.
     #[test]
     fn is_hosted_caller_requires_hosted_location() {
+        let _env = crate::config::lock_env();
         use crate::agent_ref::BindingLocation;
         let prev = std::env::var("REX_SESSION").ok();
         unsafe { std::env::remove_var("REX_SESSION") };

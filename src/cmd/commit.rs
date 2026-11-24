@@ -1479,6 +1479,7 @@ mod tests {
     /// it named.
     #[test]
     fn sibling_commit_checks_and_releases_prefixed_paths() {
+        let _env = crate::config::lock_env();
         let sandbox = flywheel_test_sandbox::TestSandbox::new();
         let (ctx, log) = fake_toron(&sandbox, "soft");
         let home = sandbox.root().join("home");

@@ -2290,6 +2290,7 @@ mod session_schema_tests {
     /// message assertions red.
     #[test]
     fn output_reports_a_missing_session_table() {
+        let _env = crate::config::lock_env();
         let drifted = vec!["session_part".to_string(), "session_v2".to_string()];
         assert_eq!(
             session_schema_from_tables(&drifted),

@@ -1530,6 +1530,7 @@ esac
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn pane_plane_passes_over_fake_rex_with_plane_absent() {
+        let _env = crate::config::lock_env();
         let _guard = crate::backend::rex_test_guard::RexBinGuard::install(PANE_HC_FAKE_REX);
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         let cfg = crate::config::Config::default();

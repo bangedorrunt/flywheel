@@ -1232,6 +1232,7 @@ esac
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn rex_send_resolves_pin_and_prompts_once_on_the_rex_target() {
+        let _env = crate::config::lock_env();
         let guard = crate::backend::rex_test_guard::RexBinGuard::install(REX_SEND_FAKE_REX);
         unsafe { std::env::set_var("FLYWHEEL_BACKEND", "superlogical") };
         let cfg = crate::config::Config::default();
@@ -1322,6 +1323,7 @@ esac
     #[cfg(feature = "backend-superlogical")]
     #[test]
     fn rex_send_ambiguity_is_typed_and_prompts_nothing() {
+        let _env = crate::config::lock_env();
         let script = REX_SEND_FAKE_REX.replace(
             r#"{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"NeatHeron","creator_name":"com.superlogical.terminal"}]}"#,
             r#"{"blocks":[{"block_id":"block:fake-1","window_id":"window:fake-1","label":"NeatHeron"},{"block_id":"block:fake-2","window_id":"window:fake-1","label":"NeatHeron"}]}"#,

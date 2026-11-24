@@ -700,6 +700,7 @@ mod tests {
     /// One test owns the env mutation so parallel cargo workers cannot race.
     #[test]
     fn capture_harness_session_reads_grok_env() {
+        let _env = crate::config::lock_env();
         let prev = std::env::var("GROK_SESSION_ID").ok();
         unsafe { std::env::set_var("GROK_SESSION_ID", "sess-abc") };
         assert_eq!(capture_harness_session("grok").as_deref(), Some("sess-abc"));

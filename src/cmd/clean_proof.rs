@@ -218,6 +218,7 @@ fn mutation_specs_run_newest_change_first() {
 /// step dies on the working copy's version of it.
 #[test]
 fn a_sha_proof_runs_the_revisions_own_driver() {
+    let _env = crate::config::lock_env();
     let dir = tempfile::tempdir().expect("tempdir");
     let scripts = dir.path().join("scripts");
     std::fs::create_dir_all(&scripts).unwrap();

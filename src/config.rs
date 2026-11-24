@@ -1969,11 +1969,10 @@ daily = [
     /// XDG beats legacy when both exist (precedence XDG > legacy > default).
     #[test]
     fn load_prefers_xdg_over_legacy() {
-        let _g = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let home = std::env::temp_dir().join(format!("flywheel-pref-home-{}", std::process::id()));
-        let xdg = std::env::temp_dir().join(format!("flywheel-pref-xdg-{}", std::process::id()));
+        let _g = lock_env();
+        let id = uuid::Uuid::new_v4();
+        let home = std::env::temp_dir().join(format!("flywheel-pref-home-{id}"));
+        let xdg = std::env::temp_dir().join(format!("flywheel-pref-xdg-{id}"));
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&xdg);
         let prev_home = std::env::var_os("HOME");
@@ -1994,10 +1993,14 @@ daily = [
         .unwrap();
 
         let cfg = Config::load().expect("load reads XDG");
+        let xdg_path = config_file();
         assert_eq!(
             cfg.agent_mail.as_ref().and_then(|m| m.name.as_deref()),
             Some("Xdg"),
-            "XDG wins over legacy"
+            "XDG wins over legacy (xdg_path={:?}, exists={}, env_xdg={:?})",
+            xdg_path,
+            xdg_path.exists(),
+            std::env::var_os("XDG_CONFIG_HOME"),
         );
         match prev_home {
             Some(v) => unsafe { std::env::set_var("HOME", v) },
@@ -2007,6 +2010,8 @@ daily = [
             Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
         }
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&xdg);
     }
 
     #[test]
