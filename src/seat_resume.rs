@@ -61,8 +61,12 @@ pub fn cmd_resume(cfg: &crate::Config, pin: &str, dry_run: bool) -> Result<()> {
                 "resume: run this inside the Rex pane that should hold {pin} (REX_BLOCK is unset)"
             )
         })?;
-    let (project, seat) = crate::state::find_seat_by_pin(pin)
-        .ok_or_else(|| anyhow!("resume: no seat for {pin} in any project registry"))?;
+    let (project, seat, archived) = match crate::state::find_seat_by_pin(pin) {
+        Some((project, seat)) => (project, seat, false),
+        None => crate::state::find_resumable_by_pin(pin)
+            .map(|(project, seat)| (project, seat, true))
+            .ok_or_else(|| anyhow!("resume: no live or resumable seat for {pin}"))?,
+    };
     let harness = seat
         .harness
         .clone()
@@ -88,8 +92,93 @@ pub fn cmd_resume(cfg: &crate::Config, pin: &str, dry_run: bool) -> Result<()> {
         println!("project: {project}\npane: {pane}\ncommand: {command}");
         return Ok(());
     }
+    if archived {
+        crate::state::restore_resumable(&project, pin)?;
+    }
     crate::cmd::swarm::seat_adopt(&project, Some(pin), &pane, None)?;
     exec_shell(&command)
+}
+
+/// Which resumable seats `--all` can bring back, and why it skips the rest.
+pub fn resume_all_plan(rows: &[crate::state::SpawnEntry]) -> (Vec<String>, Vec<(String, String)>) {
+    let mut ready = Vec::new();
+    let mut skipped = Vec::new();
+    for row in rows {
+        let Some(pin) = row.mail_identity.clone() else {
+            continue;
+        };
+        if pin.is_empty()
+            || !pin
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            skipped.push((pin, "pin is not a plain name".to_string()));
+            continue;
+        }
+        let Some(harness) = row.harness.as_deref() else {
+            skipped.push((pin, "no harness recorded".to_string()));
+            continue;
+        };
+        match resume_args(harness, row.harness_session.as_deref()) {
+            Ok(_) => ready.push(pin),
+            Err(e) => skipped.push((pin, format!("{e:#}"))),
+        }
+    }
+    (ready, skipped)
+}
+
+/// `flywheel seat resume --all`: one new pane per lost seat in the fleet
+/// workspace, each running `flywheel seat resume <pin>`.
+pub fn cmd_resume_all(cfg: &crate::Config, project: &str, dry_run: bool) -> Result<()> {
+    let backend = crate::backend::factory::multiplexer_backend(cfg)?;
+    crate::pane::reap_dead_registry_rows_on(project, &*backend);
+    let (ready, skipped) = resume_all_plan(&crate::state::load_resumable(project));
+    for (pin, why) in &skipped {
+        eprintln!("seat resume --all: skip {pin}: {why}");
+    }
+    if ready.is_empty() {
+        println!("seat resume --all: no resumable seats for {project}");
+        return Ok(());
+    }
+    let label = crate::swarm_label(project);
+    let meta = crate::state::load_spawn_meta(project);
+    let ws = backend
+        .workspace_list()?
+        .into_iter()
+        .find(|ws| ws.label == label || meta.as_deref() == Some(ws.label.as_str()))
+        .ok_or_else(|| {
+            anyhow!("seat resume --all: no live fleet workspace for {project} (label {label})")
+        })?;
+    let mut prev = backend
+        .pane_list(Some(&ws.workspace_id))?
+        .first()
+        .map(|p| p.pane_id.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "seat resume --all: workspace {} has no pane",
+                ws.workspace_id
+            )
+        })?;
+    let dir = crate::utf8_path(&crate::project_dir(cfg, project), "project dir")?;
+    for pin in ready {
+        let command = format!("flywheel seat resume {pin}");
+        if dry_run {
+            println!("{pin}: new pane in {} runs: {command}", ws.workspace_id);
+            continue;
+        }
+        let pane = backend.pane_split(&prev, "down", Some(&dir))?.pane_id;
+        crate::pane::wait_rex_shell_ready(
+            &*backend,
+            &pane,
+            &pin,
+            &pane,
+            std::time::Duration::from_secs(15),
+        )?;
+        backend.pane_run(&pane, &command)?;
+        println!("{pin}: resuming in {pane}");
+        prev = pane;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -144,6 +233,39 @@ mod tests {
         assert_eq!(&args[..2], ["--resume", "sid"]);
         assert!(args.iter().any(|a| a == "--plugin-dir"), "{args:?}");
         assert_eq!(resume_launch_args("pi", None).unwrap(), ["--continue"]);
+    }
+
+    fn row(pin: &str, harness: Option<&str>, session: Option<&str>) -> crate::state::SpawnEntry {
+        crate::state::SpawnEntry {
+            pane_id: "block:gone".to_string(),
+            name: format!("crew-{pin}"),
+            profile: None,
+            harness: harness.map(str::to_string),
+            model: None,
+            model_pin: None,
+            effort: None,
+            mode: None,
+            skills_digest: None,
+            mail_identity: Some(pin.to_string()),
+            skills_injected: false,
+            incarnation: 1,
+            harness_session: session.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn resume_all_brings_back_only_seats_that_can_reopen() {
+        let rows = [
+            row("AmberOwl", Some("claude"), Some("sid")),
+            row("BlueFox", Some("pi"), None),
+            row("CoralJay", Some("claude"), None),
+            row("DuskElk", None, Some("sid")),
+            row("bad pin;rm", Some("pi"), None),
+        ];
+        let (ready, skipped) = resume_all_plan(&rows);
+        assert_eq!(ready, ["AmberOwl", "BlueFox"]);
+        let names: Vec<&str> = skipped.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(names, ["CoralJay", "DuskElk", "bad pin;rm"]);
     }
 
     #[test]

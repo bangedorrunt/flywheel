@@ -59,6 +59,7 @@ flywheel burst <project> --kind <harness> --stage <stage> --prompt <text> [--res
 flywheel seat adopt [<pin>] --pane <block> [--session <id>]   # re-bind a seat to a live pane (bd-01q9d); --session alone finds a resumed seat (bd-gcoq1)
 flywheel seat resume [<pin>] [--dry-run]   # in a new pane: re-bind the seat here and reopen its claude/opencode/pi/agy session
 # a harness resumed in a new pane runs `flywheel arrive <p> --as <pin>`: arrive moves the seat row to $REX_BLOCK
+flywheel seat resume --all [--project <p>] [--dry-run]   # captain: one new pane per seat whose pane died; pruned rows wait in agents/resumable/ until resumed or retired
 flywheel retire <pin>... [--project p] [--force-working]
 ```
 

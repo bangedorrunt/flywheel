@@ -390,6 +390,169 @@ pub fn record_harness_session(project: &str, pin: &str, session: &str) -> bool {
     save_spawn_registry(project, &rows).is_ok()
 }
 
+/// Seats whose pane died, kept so `seat resume` can bring them back. A
+/// subdirectory, so the registry scans over `agents_dir` never read it.
+pub fn resumable_file(project: &str) -> PathBuf {
+    agents_dir()
+        .join("resumable")
+        .join(format!("{}.json", spawn_registry_key(project)))
+}
+
+pub fn load_resumable(project: &str) -> Vec<SpawnEntry> {
+    std::fs::read_to_string(resumable_file(project))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn save_resumable(project: &str, rows: &[SpawnEntry]) -> Result<()> {
+    let path = resumable_file(project);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::project_state::write_atomic(&path, serde_json::to_string_pretty(rows)?.as_bytes())?;
+    Ok(())
+}
+
+/// Add the pinned rows a prune dropped (in `before`, not in `after`); a pin
+/// keeps only its newest row.
+pub fn merge_resumable(
+    mut archive: Vec<SpawnEntry>,
+    before: &[SpawnEntry],
+    after: &[SpawnEntry],
+) -> Vec<SpawnEntry> {
+    for row in before.iter().filter(|r| !after.contains(r)) {
+        let Some(pin) = row.mail_identity.as_deref() else {
+            continue;
+        };
+        archive.retain(|r| r.mail_identity.as_deref() != Some(pin));
+        archive.push(row.clone());
+    }
+    archive
+}
+
+pub fn archive_dropped_rows(project: &str, before: &[SpawnEntry], after: &[SpawnEntry]) {
+    let merged = merge_resumable(load_resumable(project), before, after);
+    if let Err(e) = save_resumable(project, &merged) {
+        eprintln!("flywheel: could not keep dropped seats for resume: {e:#}");
+    }
+}
+
+#[cfg(test)]
+mod resumable_tests {
+    use super::*;
+
+    fn seat(pin: Option<&str>, pane: &str) -> SpawnEntry {
+        SpawnEntry {
+            pane_id: pane.to_string(),
+            name: format!("crew-{pane}"),
+            profile: None,
+            harness: Some("claude".to_string()),
+            model: None,
+            model_pin: None,
+            effort: None,
+            mode: None,
+            skills_digest: None,
+            mail_identity: pin.map(str::to_string),
+            skills_injected: false,
+            incarnation: 1,
+            harness_session: Some("sid".to_string()),
+        }
+    }
+
+    #[test]
+    fn prune_keeps_dropped_pinned_rows_newest_per_pin() {
+        let old = seat(Some("AmberOwl"), "block:1");
+        let live = seat(Some("BlueFox"), "block:2");
+        let unpinned = seat(None, "block:3");
+        let newer = seat(Some("AmberOwl"), "block:4");
+        let archive = merge_resumable(
+            vec![old],
+            &[live.clone(), unpinned, newer.clone()],
+            std::slice::from_ref(&live),
+        );
+        assert_eq!(
+            archive,
+            [newer],
+            "the live seat stays out; an unpinned row is not kept"
+        );
+    }
+
+    #[test]
+    fn a_pruned_seat_restores_into_the_live_registry_and_retire_forgets_it() {
+        let _env = crate::config::lock_env();
+        let project = "resumable-demo";
+        let gone = seat(Some("AmberOwl"), "block:dead");
+        let other = seat(Some("BlueFox"), "block:dead2");
+        archive_dropped_rows(project, &[gone.clone(), other.clone()], &[]);
+        assert!(
+            find_seat_by_pin("AmberOwl").is_none(),
+            "the registry scan never reads the resumable list"
+        );
+        let (key, found) = find_resumable_by_pin("AmberOwl").expect("kept for resume");
+        assert_eq!(found, gone);
+        assert_eq!(restore_resumable(&key, "AmberOwl").unwrap(), gone);
+        assert_eq!(load_spawn_registry(&key), [gone]);
+        assert_eq!(load_resumable(&key), [other]);
+        forget_resumable(&key, &["BlueFox".to_string()]).unwrap();
+        assert!(load_resumable(&key).is_empty());
+    }
+}
+
+/// Retire ends a seat for good, so it leaves the resumable list too.
+pub fn forget_resumable(project: &str, pins: &[String]) -> Result<()> {
+    let mut rows = load_resumable(project);
+    let before = rows.len();
+    rows.retain(|r| {
+        !pins
+            .iter()
+            .any(|p| r.mail_identity.as_deref() == Some(p.as_str()))
+    });
+    if rows.len() == before {
+        return Ok(());
+    }
+    save_resumable(project, &rows)
+}
+
+pub fn find_resumable_by_pin(pin: &str) -> Option<(String, SpawnEntry)> {
+    for entry in std::fs::read_dir(agents_dir().join("resumable"))
+        .ok()?
+        .flatten()
+    {
+        let path = entry.path();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(rows) = serde_json::from_str::<Vec<SpawnEntry>>(&raw) else {
+            continue;
+        };
+        if let Some(seat) = rows
+            .into_iter()
+            .find(|s| s.mail_identity.as_deref() == Some(pin))
+        {
+            return Some((path.file_stem()?.to_string_lossy().to_string(), seat));
+        }
+    }
+    None
+}
+
+/// Move a resumable seat back into the live registry (its old pane id stays
+/// until `seat adopt` moves it).
+pub fn restore_resumable(project: &str, pin: &str) -> Result<SpawnEntry> {
+    let mut archive = load_resumable(project);
+    let at = archive
+        .iter()
+        .position(|r| r.mail_identity.as_deref() == Some(pin))
+        .ok_or_else(|| anyhow::anyhow!("no resumable seat for {pin} in {project}"))?;
+    let row = archive.remove(at);
+    let mut live = load_spawn_registry(project);
+    live.retain(|r| r.mail_identity.as_deref() != Some(pin));
+    live.push(row.clone());
+    save_spawn_registry(project, &live)?;
+    save_resumable(project, &archive)?;
+    Ok(row)
+}
+
 pub fn spawn_registry_file(project: &str) -> PathBuf {
     agents_dir().join(format!("{}.json", spawn_registry_key(project)))
 }

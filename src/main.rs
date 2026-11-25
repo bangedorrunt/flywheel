@@ -813,6 +813,12 @@ enum SeatCmd {
         /// Print the command instead of running it
         #[arg(long)]
         dry_run: bool,
+        /// Captain: one new pane per seat whose pane died, in the fleet workspace
+        #[arg(long, conflicts_with = "pin")]
+        all: bool,
+        /// Project for --all (default: FLYWHEEL_PROJECT, else this directory's)
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 
@@ -3316,7 +3322,7 @@ fn main() {
                 "spawn <project> [--kind K=N ...] [--assign PIN=BEAD[,BEAD] ...] [--dry-run --json] [--patch <seat>.<field>=<value> (repeatable; re-resolves the seat with from: user)] [--model harness-default leaves the harness's own model untouched] [--yes] (ADR-0022 plan spawn; see --help for the full flag list)",
                 "assign <project> --to <pin> --beads <bd> [--msg <m>] [--reassign] (bd-vk0do: refuses with '<pin> holds <path> for <bead>' when a lease, intent or live brief on the bead belongs to another pin; --reassign mails that holder a withdrawal and proceeds)",
                 "retire <pin>... [--project <p>] [--force-working] [--as <pin>] [--json] (bd-rilvn: the thin per-pin stop verb over the seat path — ONE journaled SeatEffect::Retire through Ports::seat closes that pane, the pin's leases are released operator-signed by HOLDER (a sibling on the same bead keeps its lease), then the roster row is deregistered; refuses the captain/operator seat by role and a working pin without --force-working)",
-            "swarm plan <project> [spawn flags] | swarm apply <project> [--patch <seat>.<field>=<value>] [--count <role>=<n>] [--yes] [--dry-run] [--json] | seat adopt <pin> --pane <block> [--session <id>] | seat resume [<pin>] [--dry-run] | swarm status [<project>] [--json] (ADR-0022 rollout 6 + D7 remainder: plan prints the SAME flywheel-plan.v1 object as `spawn --dry-run --json`; apply is the one mechanism — patch/count -> pure reconciler -> the one `Ports::seat` interpreter, journal-first; fields harness|model|effort|mode|role (role only on apply; spawn rejects it); `--count role=+1` grows the fleet within crew.max; Spawn/InjectRole run live (InjectRole never for review/verify seats); `binding-rebind --model` routes here; status lists live seats with the plane's status; ADR-0022 D1: every apply is a plan EVENT first - the plan of record is the source of the desired seats, pending events fold in memory and land as ONE write only after every gate, and a planned SPAWN needs --yes)",
+            "swarm plan <project> [spawn flags] | swarm apply <project> [--patch <seat>.<field>=<value>] [--count <role>=<n>] [--yes] [--dry-run] [--json] | seat adopt <pin> --pane <block> [--session <id>] | seat resume [<pin>] [--dry-run] | seat resume --all [--project <p>] [--dry-run] | swarm status [<project>] [--json] (ADR-0022 rollout 6 + D7 remainder: plan prints the SAME flywheel-plan.v1 object as `spawn --dry-run --json`; apply is the one mechanism — patch/count -> pure reconciler -> the one `Ports::seat` interpreter, journal-first; fields harness|model|effort|mode|role (role only on apply; spawn rejects it); `--count role=+1` grows the fleet within crew.max; Spawn/InjectRole run live (InjectRole never for review/verify seats); `binding-rebind --model` routes here; status lists live seats with the plane's status; ADR-0022 D1: every apply is a plan EVENT first - the plan of record is the source of the desired seats, pending events fold in memory and land as ONE write only after every gate, and a planned SPAWN needs --yes)",
             "send interrupt view output watch attach kill",
             "prefer <role.field>=<value> [--project <p>] | prefer --list [--json] | prefer --forget <role.field> [--project <p>] (ADR-0022 D6: standing preferences — project beats always, exact role beats *; set also records a chie lesson)",
             "crew preview|control|prompt|inbox --open [--pin <pin>]|done <brief-id> --receipt \"<sha + proof + test tail>\" (ADR-0010 D7: crew control <project> <pin> interrupt|exit|relaunch — no arbitrary-text entry; interrupt=Escape capability-gated, exit preserves reservations+dirty, relaunch=journaled rollback-on-launch-fail; control-plane prompts carry U+2063+FLYWHEEL_OP: marker; a dispatched crew prompt IS a brief and `crew done <brief> --receipt` closes it and wakes the captain, falling back to plane-P mail when the captain has no pane row (both paths dead is a typed error saying the captain heard NOTHING); a wake the pane already holds is not a failure — the mail is stored and the prompt exits 0 as queued)",
@@ -3412,7 +3418,20 @@ fn main() {
                 pane,
                 session.as_deref(),
             ),
-            SeatCmd::Resume { pin, dry_run } => pin
+            SeatCmd::Resume {
+                all: true,
+                project,
+                dry_run,
+                ..
+            } => crate::seat_resume::cmd_resume_all(
+                &cfg,
+                &project
+                    .clone()
+                    .or_else(|| std::env::var("FLYWHEEL_PROJECT").ok())
+                    .unwrap_or_else(|| crate::cron::detect_project(&cfg, None).unwrap_or_default()),
+                *dry_run,
+            ),
+            SeatCmd::Resume { pin, dry_run, .. } => pin
                 .clone()
                 .or_else(|| std::env::var("AGENT_NAME").ok())
                 .filter(|p| !p.trim().is_empty())

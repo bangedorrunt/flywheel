@@ -625,6 +625,7 @@ pub(crate) fn retire_with(
             .any(|p| e.mail_identity.as_deref() == Some(p.as_str()))
     });
     crate::state::save_spawn_registry(project, &entries)?;
+    crate::state::forget_resumable(project, pins)?;
     // bd-89q4r: load_spawn_registry falls back to the project-local mirror
     // when the state registry is empty. Leaving the row there resurrects the
     // retired seat as idle and makes the next spawn need --retire-orphans.

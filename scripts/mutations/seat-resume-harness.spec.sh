@@ -8,6 +8,9 @@ TEST_FILTER=(
     gemini_is_deprecated_for_antigravity
     claude_session_is_a_uuid_passed_with_session_id
     arrive_moves_a_seat_only_when_its_row_names_another_pane
+    prune_keeps_dropped_pinned_rows_newest_per_pin
+    a_pruned_seat_restores_into_the_live_registry_and_retire_forgets_it
+    resume_all_brings_back_only_seats_that_can_reopen
 )
 
 mutation "R1  agy resume keeps the hook's harness prefix" \
@@ -45,3 +48,21 @@ mutation "R6  arrive leaves a moved seat on its old pane" \
     expect=arrive_moves_a_seat_only_when_its_row_names_another_pane \
     find='    seat.filter(|(_, row)| row.pane_id != pane)' \
     replace='    seat.filter(|(_, row)| row.pane_id == pane)'
+
+mutation "R7  the resumable list keeps every old row of a pin" \
+    file=src/state.rs \
+    expect=prune_keeps_dropped_pinned_rows_newest_per_pin \
+    find='        archive.retain(|r| r.mail_identity.as_deref() != Some(pin));' \
+    replace='        let _ = pin;'
+
+mutation "R8  restore leaves the seat on the resumable list" \
+    file=src/state.rs \
+    expect=a_pruned_seat_restores_into_the_live_registry_and_retire_forgets_it \
+    find='    let row = archive.remove(at);' \
+    replace='    let row = archive[at].clone();'
+
+mutation "R9  resume --all launches seats that cannot reopen" \
+    file=src/seat_resume.rs \
+    expect=resume_all_brings_back_only_seats_that_can_reopen \
+    find='            Err(e) => skipped.push((pin, format!("{e:#}"))),' \
+    replace='            Err(_) => ready.push(pin),'

@@ -418,16 +418,14 @@ pub fn reap_dead_registry_rows(project: &str, c: &mut Client) -> usize {
     let resolved = crate::config::Config::load()
         .map(|cfg| crate::backend::resolve_plane(&cfg))
         .unwrap_or_else(|_| crate::backend::resolve_plane(&crate::config::Config::default()));
-    let (kept, pruned) = reap_closed_rows(
-        state::load_spawn_registry(project),
-        &live,
-        resolved.plane.name(),
-    );
+    let before = state::load_spawn_registry(project);
+    let (kept, pruned) = reap_closed_rows(before.clone(), &live, resolved.plane.name());
     if pruned == 0 {
         return 0;
     }
     match state::save_spawn_registry(project, &kept) {
         Ok(()) => {
+            state::archive_dropped_rows(project, &before, &kept);
             eprintln!("flywheel: reaped {pruned} dead-pane registry row(s) for {project}");
             pruned
         }
@@ -449,13 +447,14 @@ pub fn reap_dead_registry_rows_on(project: &str, backend: &dyn MultiplexerBacken
             return 0;
         }
     };
-    let (kept, pruned) =
-        reap_closed_rows(state::load_spawn_registry(project), &live, backend.name());
+    let before = state::load_spawn_registry(project);
+    let (kept, pruned) = reap_closed_rows(before.clone(), &live, backend.name());
     if pruned == 0 {
         return 0;
     }
     match state::save_spawn_registry(project, &kept) {
         Ok(()) => {
+            state::archive_dropped_rows(project, &before, &kept);
             eprintln!("flywheel: reaped {pruned} dead-pane registry row(s) for {project}");
             pruned
         }
@@ -989,10 +988,11 @@ fn spawn_crew_into_rex(
         .ok()
         .map(|panes| panes.into_iter().map(|p| p.pane_id).collect());
     if let Some(live) = &live_known {
-        let before = registry.len();
+        let before = registry.clone();
         registry = prune_dead_pane_rows(registry, live);
-        let pruned = before - registry.len();
+        let pruned = before.len() - registry.len();
         if pruned > 0 {
+            state::archive_dropped_rows(project, &before, &registry);
             eprintln!("flywheel: pruned {pruned} dead-pane registry row(s) for {project}");
         }
     }
@@ -1261,10 +1261,11 @@ fn spawn_crew_into(
         .ok()
         .map(|panes| panes.into_iter().map(|p| p.pane_id).collect());
     if let Some(live) = &live_known {
-        let before = registry.len();
+        let before = registry.clone();
         registry = prune_dead_pane_rows(registry, live);
-        let pruned = before - registry.len();
+        let pruned = before.len() - registry.len();
         if pruned > 0 {
+            state::archive_dropped_rows(project, &before, &registry);
             eprintln!("flywheel: pruned {pruned} dead-pane registry row(s) for {project}");
         }
     }
