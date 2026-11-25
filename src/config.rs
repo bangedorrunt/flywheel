@@ -126,7 +126,7 @@ pub fn lock_env() -> TestStateHome {
 /// re-triggers the sidecar migration mid-suite).
 #[cfg(test)]
 pub struct TestStateHome {
-    _env: std::sync::MutexGuard<'static, ()>,
+    _env: Option<std::sync::MutexGuard<'static, ()>>,
     dir: PathBuf,
     prev: Option<std::ffi::OsString>,
     prev_home: Option<std::ffi::OsString>,
@@ -209,7 +209,7 @@ pub fn test_state_home() -> TestStateHome {
         std::env::set_var("XDG_STATE_HOME", &dir);
     }
     TestStateHome {
-        _env,
+        _env: Some(_env),
         dir,
         prev,
         prev_home,
@@ -1583,53 +1583,40 @@ daily = [
     fn drop_restores_a_foreign_prior_value_rather_than_clearing_it() {
         let sentinel = std::env::temp_dir().join("flywheel-bd-uu58-prior");
         let ours = std::env::temp_dir().join("flywheel-bd-uu58-ours");
-        let ambient = {
-            let _g = ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::fs::create_dir_all(&ours).expect("create our dir");
-            let ambient = std::env::var_os("XDG_STATE_HOME");
-            unsafe { std::env::set_var("XDG_STATE_HOME", &sentinel) };
-            ambient
-        };
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::fs::create_dir_all(&ours).expect("create our dir");
+        let ambient = std::env::var_os("XDG_STATE_HOME");
+        unsafe { std::env::set_var("XDG_STATE_HOME", &sentinel) };
         {
-            let _g = ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            {
-                let _home = TestStateHome {
-                    _env: _g,
-                    dir: ours.clone(),
-                    prev: Some(sentinel.clone().into_os_string()),
-                    prev_home: std::env::var_os("HOME"),
-                    prev_toron_data: std::env::var_os("TORON_DATA_DIR"),
-                    prev_toron_mcp_data: std::env::var_os("TORON_MCP_DATA_DIR"),
-                    prev_br_bin: std::env::var_os("FLYWHEEL_BR_BIN"),
-                    prev_path: std::env::var_os("PATH"),
-                    prev_agent: std::env::var_os("AGENT_NAME"),
-                    prev_pane: std::env::var_os("FLYWHEEL_PANE"),
-                };
-                assert_eq!(
-                    std::env::var_os("XDG_STATE_HOME").as_deref(),
-                    Some(sentinel.as_os_str()),
-                    "construction carries the foreign value; it does not rewrite it"
-                );
-            }
-        }
-        {
-            let _g = ENV_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _home = TestStateHome {
+                _env: None,
+                dir: ours.clone(),
+                prev: Some(sentinel.clone().into_os_string()),
+                prev_home: std::env::var_os("HOME"),
+                prev_toron_data: std::env::var_os("TORON_DATA_DIR"),
+                prev_toron_mcp_data: std::env::var_os("TORON_MCP_DATA_DIR"),
+                prev_br_bin: std::env::var_os("FLYWHEEL_BR_BIN"),
+                prev_path: std::env::var_os("PATH"),
+                prev_agent: std::env::var_os("AGENT_NAME"),
+                prev_pane: std::env::var_os("FLYWHEEL_PANE"),
+            };
             assert_eq!(
                 std::env::var_os("XDG_STATE_HOME").as_deref(),
                 Some(sentinel.as_os_str()),
-                "drop puts the foreign value back. remove_var here would hand the next \
-                 test the real state dir — the bd-uu58 leak through the drop path"
+                "construction carries the foreign value; it does not rewrite it"
             );
-            unsafe { std::env::remove_var("XDG_STATE_HOME") };
-            if let Some(a) = ambient {
-                unsafe { std::env::set_var("XDG_STATE_HOME", a) };
-            }
+        }
+        assert_eq!(
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            Some(sentinel.as_os_str()),
+            "drop puts the foreign value back. remove_var here would hand the next \
+             test the real state dir — the bd-uu58 leak through the drop path"
+        );
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        if let Some(a) = ambient {
+            unsafe { std::env::set_var("XDG_STATE_HOME", a) };
         }
         let _ = std::fs::remove_dir_all(&ours);
     }
