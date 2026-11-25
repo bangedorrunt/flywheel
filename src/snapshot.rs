@@ -142,6 +142,106 @@ pub struct Snapshot {
     /// last persisted by the durable loop. `loop` on the wire.
     #[serde(default, rename = "loop")]
     pub loop_state: crate::durable::LoopSnapshot,
+    /// Pure fleet health diagnostics (bd-k7b7h).
+    #[serde(default)]
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Severity of a fleet diagnostic (`P0`/`P1` fail `--check`).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum DiagnosticSeverity {
+    P0,
+    P1,
+    P2,
+    P3,
+}
+
+/// One pure fleet diagnostic entry in `flywheel-snapshot.v1`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Diagnostic {
+    pub id: String,
+    pub severity: DiagnosticSeverity,
+    pub summary: String,
+    pub evidence: String,
+    pub remedy_cmd: String,
+}
+
+/// Edge-collected health signals fed into [`diagnose_fleet`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FleetHealthSignals {
+    pub rex_missing_method: Option<String>,
+    pub doorbell_running_binary_mtime: Option<u64>,
+    pub doorbell_disk_binary_mtime: Option<u64>,
+    pub host_log_max_bytes: u64,
+    pub host_log_path: Option<String>,
+    pub host_log_cap_bytes: u64,
+    pub chie_ok: bool,
+    pub chie_latency_ms: Option<u64>,
+    pub chie_error: Option<String>,
+}
+
+const SNAPSHOT_HOST_LOG_CAP_BYTES: u64 = 8 * 1024 * 1024;
+const CHIE_SLOW_THRESHOLD_MS: u64 = 250;
+
+/// Pure fleet diagnostic rules over [`FleetHealthSignals`].
+pub fn diagnose_fleet(signals: &FleetHealthSignals) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    if let Some(method) = &signals.rex_missing_method {
+        out.push(Diagnostic {
+            id: "REX_VERSION_SKEW".to_string(),
+            severity: DiagnosticSeverity::P0,
+            summary: format!("Rex server is missing required method `{method}`"),
+            evidence: format!("missing_api_method={method}"),
+            remedy_cmd: "rex version && flywheel stack status --check".to_string(),
+        });
+    }
+    if let (Some(running), Some(disk)) = (
+        signals.doorbell_running_binary_mtime,
+        signals.doorbell_disk_binary_mtime,
+    ) && disk > running
+    {
+        out.push(Diagnostic {
+            id: "STALE_DOORBELL_GENERATION".to_string(),
+            severity: DiagnosticSeverity::P1,
+            summary: "Running doorbell watcher predates the installed binary".to_string(),
+            evidence: format!("running_mtime={running} disk_mtime={disk}"),
+            remedy_cmd: "flywheel stack status --check".to_string(),
+        });
+    }
+    if signals.host_log_cap_bytes > 0 && signals.host_log_max_bytes > signals.host_log_cap_bytes {
+        let path = signals.host_log_path.as_deref().unwrap_or("<unknown>");
+        out.push(Diagnostic {
+            id: "HOST_LOG_OVER_CAP".to_string(),
+            severity: DiagnosticSeverity::P2,
+            summary: "Doorbell host log exceeds the 8 MiB cap".to_string(),
+            evidence: format!(
+                "bytes={} cap={} path={path}",
+                signals.host_log_max_bytes, signals.host_log_cap_bytes
+            ),
+            remedy_cmd: "flywheel doorbell restart".to_string(),
+        });
+    }
+    if !signals.chie_ok
+        || signals
+            .chie_latency_ms
+            .is_some_and(|ms| ms > CHIE_SLOW_THRESHOLD_MS)
+    {
+        let evidence = match (&signals.chie_error, signals.chie_latency_ms) {
+            (Some(err), _) => err.clone(),
+            (None, Some(ms)) => format!("latency_ms={ms} threshold_ms={CHIE_SLOW_THRESHOLD_MS}"),
+            (None, None) => "chie check-trap probe failed".to_string(),
+        };
+        out.push(Diagnostic {
+            id: "CHIE_SLOW".to_string(),
+            severity: DiagnosticSeverity::P1,
+            summary: "Chiebukuro (:18081) is unreachable or slower than 250ms".to_string(),
+            evidence,
+            remedy_cmd: "chie preflight --json && chie status".to_string(),
+        });
+    }
+    out
 }
 
 /// Journal value → tick Msg (workspace first, legacy doorbell second).
@@ -547,6 +647,8 @@ pub fn assemble_with_label(
         degraded.push("progress".to_string());
     }
     let runs = snapshot_runs();
+    let signals = collect_fleet_health_signals(cfg, &state_dir, ws_label);
+    let diagnostics = diagnose_fleet(&signals);
 
     Snapshot {
         schema: SNAPSHOT_SCHEMA.to_string(),
@@ -575,7 +677,95 @@ pub fn assemble_with_label(
         runs,
         fleet_workspaces,
         fleet_agents,
+        diagnostics,
     }
+}
+
+fn collect_fleet_health_signals(
+    cfg: &crate::config::Config,
+    state_dir: &std::path::Path,
+    ws_label: &str,
+) -> FleetHealthSignals {
+    let mut signals = FleetHealthSignals {
+        host_log_cap_bytes: SNAPSHOT_HOST_LOG_CAP_BYTES,
+        chie_ok: true,
+        ..FleetHealthSignals::default()
+    };
+
+    let doorbell_dir = state_dir.join("doorbell");
+    for suffix in [".out.log", ".err.log", ".log"] {
+        let candidate = doorbell_dir.join(format!("{ws_label}{suffix}"));
+        if let Ok(meta) = std::fs::metadata(&candidate) {
+            let len = meta.len();
+            if len > signals.host_log_max_bytes {
+                signals.host_log_max_bytes = len;
+                signals.host_log_path = Some(candidate.display().to_string());
+            }
+        }
+    }
+
+    if let Some(watcher_gen) = crate::doorbell::dispatcher_generation(state_dir, ws_label) {
+        signals.doorbell_running_binary_mtime = Some(watcher_gen.binary_mtime_unix);
+        if let Ok(exe) = std::env::current_exe()
+            && let Ok(meta) = std::fs::metadata(exe)
+            && let Ok(modified) = meta.modified()
+            && let Ok(secs) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            signals.doorbell_disk_binary_mtime = Some(secs.as_secs());
+        }
+    }
+
+    let skip_probes = std::env::var("FLYWHEEL_SNAPSHOT_SKIP_PROBES")
+        .ok()
+        .as_deref()
+        == Some("1")
+        || cfg!(test);
+    if !skip_probes
+        && crate::pane::rex_door_selected(cfg)
+        && let Ok(out) = std::process::Command::new("rex")
+            .args(["api", "list"])
+            .output()
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        signals.rex_missing_method =
+            toron_plane::backend::rex_cli::missing_api_method(&text).map(str::to_string);
+    }
+
+    let chie_url = std::env::var("FLYWHEEL_CHIE_HTTP_URL").ok();
+    let should_probe_chie = match (&chie_url, skip_probes) {
+        (Some(u), _) if u.trim().is_empty() => false,
+        (Some(_), _) => true,
+        (None, true) => false,
+        (None, false) => true,
+    };
+    if should_probe_chie {
+        let base = chie_url
+            .unwrap_or_else(|| "http://127.0.0.1:18081".to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let url = format!("{base}/v1/check-trap");
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_millis(CHIE_SLOW_THRESHOLD_MS))
+            .build();
+        let started = std::time::Instant::now();
+        match agent.post(&url).send_json(serde_json::json!({
+            "query": "snapshot-probe",
+            "paths": [],
+        })) {
+            Ok(_) => {
+                signals.chie_ok = true;
+                signals.chie_latency_ms = Some(started.elapsed().as_millis() as u64);
+            }
+            Err(err) => {
+                signals.chie_ok = false;
+                signals.chie_latency_ms = Some(started.elapsed().as_millis() as u64);
+                signals.chie_error = Some(err.to_string());
+            }
+        }
+    }
+
+    signals
 }
 
 /// Wave11: beads-progress section reader (br list + ready). Pure core is
@@ -1064,6 +1254,7 @@ pub fn schema_keys() -> Vec<&'static str> {
         "runs",
         "fleet_workspaces",
         "fleet_agents",
+        "diagnostics",
     ]
 }
 
@@ -1276,6 +1467,7 @@ mod adr0010_d10_tests {
             runs: Vec::new(),
             fleet_workspaces: Vec::new(),
             fleet_agents: Vec::new(),
+            diagnostics: Vec::new(),
         }
     }
 
@@ -1613,6 +1805,7 @@ mod adr0010_d10_tests {
             runs: vec![],
             fleet_workspaces: vec![],
             fleet_agents: vec![],
+            diagnostics: vec![],
         };
         let core = status_core_counts(&snap);
         assert_eq!(core["agents"], serde_json::json!(2));
@@ -1634,5 +1827,99 @@ mod adr0010_d10_tests {
             crate::snapshot_reporting::status_core(&snap)["agents"],
             serde_json::json!(2)
         );
+    }
+
+    #[test]
+    fn diagnose_fleet_healthy_signals_return_empty() {
+        let signals = FleetHealthSignals {
+            host_log_cap_bytes: SNAPSHOT_HOST_LOG_CAP_BYTES,
+            host_log_max_bytes: SNAPSHOT_HOST_LOG_CAP_BYTES,
+            doorbell_running_binary_mtime: Some(100),
+            doorbell_disk_binary_mtime: Some(100),
+            chie_ok: true,
+            chie_latency_ms: Some(CHIE_SLOW_THRESHOLD_MS),
+            ..FleetHealthSignals::default()
+        };
+        assert!(diagnose_fleet(&signals).is_empty());
+    }
+
+    #[test]
+    fn diagnose_fleet_rex_version_skew_is_p0() {
+        let signals = FleetHealthSignals {
+            rex_missing_method: Some("session.destroy".to_string()),
+            chie_ok: true,
+            ..FleetHealthSignals::default()
+        };
+        let diags = diagnose_fleet(&signals);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].id, "REX_VERSION_SKEW");
+        assert_eq!(diags[0].severity, DiagnosticSeverity::P0);
+        assert!(diags[0].evidence.contains("session.destroy"));
+    }
+
+    #[test]
+    fn diagnose_fleet_stale_doorbell_generation_is_p1_and_equal_mtime_is_ok() {
+        let stale = FleetHealthSignals {
+            doorbell_running_binary_mtime: Some(100),
+            doorbell_disk_binary_mtime: Some(101),
+            chie_ok: true,
+            ..FleetHealthSignals::default()
+        };
+        let diags = diagnose_fleet(&stale);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].id, "STALE_DOORBELL_GENERATION");
+        assert_eq!(diags[0].severity, DiagnosticSeverity::P1);
+    }
+
+    #[test]
+    fn diagnose_fleet_host_log_over_cap_is_p2_and_at_cap_is_ok() {
+        let over = FleetHealthSignals {
+            host_log_cap_bytes: SNAPSHOT_HOST_LOG_CAP_BYTES,
+            host_log_max_bytes: SNAPSHOT_HOST_LOG_CAP_BYTES + 1,
+            host_log_path: Some("/tmp/fw.err.log".to_string()),
+            chie_ok: true,
+            ..FleetHealthSignals::default()
+        };
+        let diags = diagnose_fleet(&over);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].id, "HOST_LOG_OVER_CAP");
+        assert_eq!(diags[0].severity, DiagnosticSeverity::P2);
+        assert!(diags[0].evidence.contains("/tmp/fw.err.log"));
+
+        let at_cap = FleetHealthSignals {
+            host_log_max_bytes: SNAPSHOT_HOST_LOG_CAP_BYTES,
+            ..over
+        };
+        assert!(diagnose_fleet(&at_cap).is_empty());
+    }
+
+    #[test]
+    fn diagnose_fleet_chie_slow_and_unreachable_are_p1_and_250ms_is_ok() {
+        let slow = FleetHealthSignals {
+            chie_ok: true,
+            chie_latency_ms: Some(CHIE_SLOW_THRESHOLD_MS + 1),
+            ..FleetHealthSignals::default()
+        };
+        let slow_diags = diagnose_fleet(&slow);
+        assert_eq!(slow_diags.len(), 1);
+        assert_eq!(slow_diags[0].id, "CHIE_SLOW");
+        assert_eq!(slow_diags[0].severity, DiagnosticSeverity::P1);
+
+        let at_threshold = FleetHealthSignals {
+            chie_ok: true,
+            chie_latency_ms: Some(CHIE_SLOW_THRESHOLD_MS),
+            ..FleetHealthSignals::default()
+        };
+        assert!(diagnose_fleet(&at_threshold).is_empty());
+
+        let down = FleetHealthSignals {
+            chie_ok: false,
+            chie_error: Some("connection refused".to_string()),
+            ..FleetHealthSignals::default()
+        };
+        let down_diags = diagnose_fleet(&down);
+        assert_eq!(down_diags.len(), 1);
+        assert_eq!(down_diags[0].id, "CHIE_SLOW");
+        assert!(down_diags[0].evidence.contains("connection refused"));
     }
 }

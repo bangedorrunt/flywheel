@@ -156,6 +156,7 @@ mod tests {
             runs: Vec::new(),
             fleet_workspaces: Vec::new(),
             fleet_agents: Vec::new(),
+            diagnostics: Vec::new(),
         };
         assert_eq!(
             bearings_line(&snapshot),
