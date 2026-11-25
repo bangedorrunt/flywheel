@@ -198,6 +198,12 @@ mod watch_batch_tests {
     }
 }
 
+pub const LIVE_PINS_EVERY_SECS: u64 = 30;
+
+fn live_pins_due(has_rings: bool, last_read: Option<u64>, now: u64) -> bool {
+    has_rings && last_read.is_none_or(|last| now.saturating_sub(last) >= LIVE_PINS_EVERY_SECS)
+}
+
 pub struct Brain<H: Host> {
     cfg: BrainConfig,
     host: H,
@@ -220,6 +226,7 @@ pub struct Brain<H: Host> {
     digest_since: Option<tokio::time::Instant>,
     stats: Stats,
     sweep_last: Option<u64>,
+    live_pins_read_at: Option<u64>,
     /// Next journal seq (D4.4): resumed from the tail so rows stay
     /// monotonic per workspace across restarts.
     next_seq: u64,
@@ -346,6 +353,7 @@ impl<H: Host> Brain<H> {
             digest_since: None,
             stats: Stats::default(),
             sweep_last: None,
+            live_pins_read_at: None,
             next_seq,
             inert_died: 0,
             journal_write_failed: 0,
@@ -1028,9 +1036,14 @@ impl<H: Host> Brain<H> {
         // A pin with no pane cannot hear: resolve its ring instead of letting
         // it age into a permanent conflict (bd-3vkpe). Only an authoritative
         // live set may drop a ring; a host that cannot tell keeps them all.
-        let resolved = match self.host.live_pins() {
-            Some(live) => self.hear.retain_live(&live),
-            None => Vec::new(),
+        let resolved = if live_pins_due(self.hear.has_rings(), self.live_pins_read_at, now) {
+            self.live_pins_read_at = Some(now);
+            match self.host.live_pins() {
+                Some(live) => self.hear.retain_live(&live),
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
         };
         for pin in resolved {
             self.deaf_attempts.remove(&pin);
@@ -1809,6 +1822,81 @@ mod tests {
         if let Some(watch_at) = got.iter().position(|s| s == "watch") {
             assert!(restart_at < watch_at, "{got:?}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-mjjgd: the live roster is a rex process fan-out, so the sweep must not
+    /// read it every second. It reads it only when a ring waits on an answer,
+    /// and at most once per LIVE_PINS_EVERY_SECS.
+    #[tokio::test]
+    async fn sweep_reads_live_pins_only_for_waiting_rings_and_throttled() {
+        struct CountHost {
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Host for CountHost {
+            fn tick(&mut self, _msg: &BrainMsg) -> Vec<crate::host::Effect> {
+                Vec::new()
+            }
+            fn now_unix(&self) -> u64 {
+                1_000
+            }
+            fn live_pins(&self) -> Option<Vec<String>> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(vec!["CyanCove".to_string()])
+            }
+            fn fetch_inbox(&self, _pin: &str, _since: &str) -> Vec<serde_json::Value> {
+                Vec::new()
+            }
+            fn scan_ack_sla(&mut self) -> Vec<String> {
+                Vec::new()
+            }
+            fn restart_wake(&mut self) -> bool {
+                false
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("live-pins-brain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, _rx) = tokio::sync::mpsc::channel(crate::BRAIN_CAP);
+        let mut brain = Brain::new(
+            BrainConfig::new("live-pins"),
+            CountHost {
+                calls: calls.clone(),
+            },
+            FileStore::new(dir.clone()),
+            SinkManager::new(tx),
+        );
+        let count = || calls.load(std::sync::atomic::Ordering::SeqCst);
+
+        for now in 1_000..1_010 {
+            brain.dispatch(BrainMsg::Sweep { now }).await;
+        }
+        assert_eq!(count(), 0, "no ring waits, so the roster is never read");
+
+        brain.hear.note_inject("CyanCove", None, 1_010);
+        for now in 1_010..1_020 {
+            brain.dispatch(BrainMsg::Sweep { now }).await;
+        }
+        assert_eq!(
+            count(),
+            1,
+            "a waiting ring reads the roster once, then waits"
+        );
+
+        brain
+            .dispatch(BrainMsg::Sweep {
+                now: 1_010 + LIVE_PINS_EVERY_SECS,
+            })
+            .await;
+        assert_eq!(count(), 2, "the next read comes after the throttle window");
+
+        brain.hear.note_heard_pin("CyanCove");
+        brain
+            .dispatch(BrainMsg::Sweep {
+                now: 1_010 + 3 * LIVE_PINS_EVERY_SECS,
+            })
+            .await;
+        assert_eq!(count(), 2, "an answered ring stops the reads");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4541,6 +4629,10 @@ impl HearTracker {
 
     pub fn unanswered_pins(&self) -> Vec<String> {
         self.unanswered.iter().cloned().collect()
+    }
+
+    pub fn has_rings(&self) -> bool {
+        !self.pending.is_empty() || !self.unanswered.is_empty()
     }
 
     /// Resolve every ring for a pin that has no live pane: "no pane, nothing
