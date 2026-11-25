@@ -66,7 +66,7 @@ jobs:
           if [ "${{ github.event_name }}" = schedule ]; then
             echo "changed=$all" >> "$GITHUB_OUTPUT"
           else
-            changed="$(git diff --name-only "$base" HEAD -- scripts/mutations | sed -n 's#scripts/mutations/\(.*\)\.spec\.sh#\1#p' | sort -u | jq -Rsc 'split("\n") | map(select(length>0))')"
+            changed="$(git diff --name-only --diff-filter=d "$base" HEAD -- scripts/mutations | sed -n 's#scripts/mutations/\(.*\)\.spec\.sh#\1#p' | sort -u | jq -Rsc 'split("\n") | map(select(length>0))')"
             echo "changed=$changed" >> "$GITHUB_OUTPUT"
           fi
 
