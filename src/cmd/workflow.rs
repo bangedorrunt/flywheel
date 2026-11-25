@@ -2171,29 +2171,13 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     use crate::cmd::build_break_statechart::build_build_break_machine;
     use crate::elm::brief_statechart::build_brief_machine;
     use crate::elm::captain_watch_statechart::build_captain_watch_machine;
-    use crate::elm::deadlock_watch_statechart::build_deadlock_watch_machine;
     use crate::elm::lease_dirty_statechart::build_dirty_lease_machine;
     use crate::elm::lease_waitlist_statechart::build_lease_waitlist_machine;
     use crate::elm::mail_queue_statechart::build_mail_queue_machine;
-    use crate::elm::p2p_negotiation::{P2PNegotiationState, build_p2p_negotiation_machine};
     use crate::elm::plan_statechart::build_plan_machine;
-    use crate::elm::pre_edit_lease_statechart::build_pre_edit_machine;
     use crate::elm::result_mail_statechart::build_result_mail_machine;
     use crate::elm::seat_statechart::build_seat_machine;
     use crate::elm::work_unit_statechart::build_work_unit_machine;
-
-    fn verify_p2p(export_tla: bool) -> WorkflowVerifyChartReport {
-        let machine = build_p2p_negotiation_machine();
-        chart_report(
-            "P2PNegotiation",
-            &machine.topology(),
-            "Idle",
-            |state| *state == P2PNegotiationState::Idle,
-            export_tla.then(|| machine.to_tla_named("P2PNegotiation")),
-            None,
-            &ChartFindings::default(),
-        )
-    }
 
     fn verify_seat(export_tla: bool) -> WorkflowVerifyChartReport {
         use toron_core::kernel::StateNodeType;
@@ -2253,27 +2237,6 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
             "a final state",
             is_final,
             export_tla.then(|| machine.to_tla_named("Brief")),
-            None,
-            &ChartFindings::default(),
-        )
-    }
-
-    fn verify_deadlock_watch(export_tla: bool) -> WorkflowVerifyChartReport {
-        use toron_core::kernel::StateNodeType;
-        let machine = build_deadlock_watch_machine();
-        let topology = machine.topology();
-        let is_final = |state: &_| {
-            topology
-                .nodes
-                .get(state)
-                .is_some_and(|node| node.node_type == StateNodeType::Final)
-        };
-        chart_report(
-            "DeadlockWatch",
-            &topology,
-            "a final state",
-            is_final,
-            export_tla.then(|| machine.to_tla_named("DeadlockWatch")),
             None,
             &ChartFindings::default(),
         )
@@ -2405,27 +2368,6 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         )
     }
 
-    fn verify_pre_edit(export_tla: bool) -> WorkflowVerifyChartReport {
-        use toron_core::kernel::StateNodeType;
-        let machine = build_pre_edit_machine();
-        let topology = machine.topology();
-        let is_final = |state: &_| {
-            topology
-                .nodes
-                .get(state)
-                .is_some_and(|node| node.node_type == StateNodeType::Final)
-        };
-        chart_report(
-            "PreEdit",
-            &topology,
-            "a final state",
-            is_final,
-            export_tla.then(|| machine.to_tla_named("PreEdit")),
-            None,
-            &ChartFindings::default(),
-        )
-    }
-
     fn verify_plan(export_tla: bool) -> WorkflowVerifyChartReport {
         use toron_core::kernel::StateNodeType;
         let machine = build_plan_machine();
@@ -2450,9 +2392,6 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
     let want_all = name.is_none();
     let want = name.unwrap_or("").to_ascii_lowercase();
     let mut reports = Vec::new();
-    if want_all || matches!(want.as_str(), "p2p" | "p2p-negotiation" | "p2pnegotiation") {
-        reports.push(verify_p2p(export_tla));
-    }
     if want_all || matches!(want.as_str(), "seat" | "seat-statechart" | "seatstatechart") {
         reports.push(verify_seat(export_tla));
     }
@@ -2474,14 +2413,6 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         )
     {
         reports.push(verify_lease_waitlist(export_tla));
-    }
-    if want_all
-        || matches!(
-            want.as_str(),
-            "preedit" | "pre-edit" | "pre-edit-statechart"
-        )
-    {
-        reports.push(verify_pre_edit(export_tla));
     }
     if want_all
         || matches!(
@@ -2530,14 +2461,6 @@ fn cmd_workflow_verify(name: Option<&str>, export_tla: bool, json_out: bool) -> 
         )
     {
         reports.push(verify_work_unit(export_tla));
-    }
-    if want_all
-        || matches!(
-            want.as_str(),
-            "deadlockwatch" | "deadlock-watch" | "deadlock-watch-statechart"
-        )
-    {
-        reports.push(verify_deadlock_watch(export_tla));
     }
     // Catalog workflows (ADR-0021 D5.2 slice A, bd-36zlq): one chart report
     // per lowered workflow from the layered catalog — builtins, then the

@@ -118,8 +118,8 @@ fn test_cli_workflow_verify_plain_text() {
         "the hand-written SwarmLifecycle chart is retired; wave-swarm verifies as a workflow: {text}"
     );
     assert!(
-        text.contains("workflow verify P2PNegotiation: ok"),
-        "expected P2PNegotiation ok in output: {text}"
+        text.contains("workflow verify Seat: ok"),
+        "expected Seat ok in output: {text}"
     );
 }
 
@@ -158,7 +158,7 @@ fn test_cli_workflow_verify_json_contract() {
         !chart_names.contains(&"SwarmLifecycle"),
         "the hand-written SwarmLifecycle chart is retired: {chart_names:?}"
     );
-    assert!(chart_names.contains(&"P2PNegotiation"));
+    assert!(chart_names.contains(&"Seat"));
     assert!(
         chart_names.contains(&"ce-lfg"),
         "wave-swarm verifies as the lowered workflow: {chart_names:?}"
@@ -202,14 +202,14 @@ fn test_cli_workflow_verify_single_named_chart() {
     assert_eq!(charts.len(), 1);
     assert_eq!(charts[0]["name"], "ce-lfg");
 
-    // Verify P2PNegotiation alone
-    let out = env.run(&["workflow", "verify", "P2PNegotiation", "--json"]);
+    // Verify Seat alone
+    let out = env.run(&["workflow", "verify", "Seat", "--json"]);
     assert!(out.status.success());
     let json = stdout_json(&out);
     assert_eq!(json["ok"], true);
     let charts = json["charts"].as_array().unwrap();
     assert_eq!(charts.len(), 1);
-    assert_eq!(charts[0]["name"], "P2PNegotiation");
+    assert_eq!(charts[0]["name"], "Seat");
 }
 
 #[test]
@@ -243,8 +243,8 @@ fn test_cli_workflow_verify_export_tla() {
         "the retired chart exports no module"
     );
     assert!(
-        text.contains("---- MODULE P2PNegotiation ----"),
-        "must contain P2PNegotiation TLA+ header"
+        text.contains("---- MODULE Seat ----"),
+        "must contain Seat TLA+ header"
     );
     assert!(
         text.contains("EXTENDS Naturals"),
@@ -273,7 +273,7 @@ fn test_cli_peer_intent_directive() {
         "--project",
         "test-proj",
         "--path",
-        "src/elm/p2p_negotiation.rs",
+        "src/elm/work_unit_statechart.rs",
         "--scope",
         "unit-test",
         "--bead",
@@ -301,7 +301,7 @@ fn test_cli_peer_intent_directive() {
     );
     assert_eq!(json["broadcast"], true);
     assert_eq!(json["project"], "test-proj");
-    assert_eq!(json["path"], "src/elm/p2p_negotiation.rs");
+    assert_eq!(json["path"], "src/elm/work_unit_statechart.rs");
 }
 
 #[test]

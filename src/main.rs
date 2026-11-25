@@ -43,7 +43,6 @@ mod crew_menu;
 mod crew_receipt;
 mod cron;
 mod daemon;
-mod deadlock;
 mod decide;
 mod dispatch_bindings;
 mod doorbell;
@@ -1545,15 +1544,6 @@ enum Commands {
         /// to the old holder instead of an error (bd-vk0do)
         #[arg(long)]
         reassign: bool,
-    },
-    /// Deadlock watch: page the captain once per wait-for cycle and once
-    /// per wait older than the threshold (bd-v4dcv)
-    Deadlock {
-        /// Project to scan.
-        project: String,
-        /// Age in minutes that makes a single wait worth paging about.
-        #[arg(long, default_value_t = 15)]
-        wait_minutes: u64,
     },
     /// toron mail coordination surfaces
     Mail {
@@ -3334,7 +3324,6 @@ fn main() {
                 "artifacts <run_id> [--json] + artifacts stitch <run_id> (state-dir per-run records, stitch_artifacts at artifact.rs:233)",
                 "upstream parity (embedded in --robot-capabilities; offline manifest: docs/upstream-parity.toml)",
             "doorbell status/start/stop/re-inject/afk/why/roster/introduce (supervised pane-wake layer: lazy-heal + persisted wake state; afk batches captain-relevant wakes; roster is nearby panes+pins+reservations; introduce is contact+channel+subscribe)",
-        "deadlock <project> [--wait-minutes N] (bd-v4dcv: wait-for graph over live leases + open collab asks; pages the captain once per pin cycle and once per wait older than N minutes, naming pins and resources)",
         "burst <project> --kind <harness> --stage <stage> --prompt <text> [--resume <id>] [--dry-run] [--json]",
             "snapshot <project> (fleet snapshot flywheel-snapshot.v1 as robot JSON)",
             "status <project> + progress [<project>] [--json] (bd-swarm-cockpit-pczs cockpit reads: status rows carry pin/npub/pane/verdict/bead/reservations/last_active_ts_us and print JSON when not a TTY; progress groups beads by wave-N label — closed/in_progress/ready/blocked/unknown — and names dispatching_wave, the lowest ready/in-progress wave; project defaults to the workspace cwd)",
@@ -3978,9 +3967,6 @@ fn main() {
             msg,
             reassign,
         }) => cmd_assign(&cfg, project, to, beads, msg.as_deref(), *reassign),
-        Some(Commands::Deadlock { project, wait_minutes }) => {
-            crate::cmd::deadlock::cmd_deadlock_check(project, *wait_minutes)
-        }
         Some(Commands::Burst {
             project,
             kind,
@@ -17150,17 +17136,6 @@ pub(crate) fn live_file_rows(cfg: &Config, project: &str) -> Vec<(String, String
         .unwrap_or_default()
 }
 
-/// bd-reserve-yield-taqf: live `(bead, holder)` yield pairs — toron's
-/// structured stand-down (`reserve yield`), read through the same join as the
-/// lease board. Same soft-fail contract as the reservation board: a hiccup
-/// yields no pairs, and an unread board cannot invent a hold.
-fn live_yielded_pairs(cfg: &Config, project: &str) -> Vec<(String, String)> {
-    let Ok(mail) = mail_or_die(cfg) else {
-        return Vec::new();
-    };
-    mail.yielded_pairs(project).unwrap_or_default()
-}
-
 /// Unregisters this process's loop-pid entry on exit (any path). Only ever
 /// removes the entry when it still belongs to THIS pid — a newer loop that
 /// took over (--force) is never unregistered by the older process exiting
@@ -17837,8 +17812,7 @@ fn cmd_loop(
             let mut inprog_now: Vec<durable::ReadyBead> = Vec::new();
             let window = state::load_resume_window(project);
             let attempts = state::load_work_attempts(project);
-            let mut peers = live_reservation_holders(cfg, project);
-            peers.extend(live_yielded_pairs(cfg, project));
+            let peers = live_reservation_holders(cfg, project);
             let file_rows = live_file_rows(cfg, project);
             let now_us = chrono::Utc::now().timestamp_micros();
             let mut inprog_items: Vec<String> = Vec::new();
