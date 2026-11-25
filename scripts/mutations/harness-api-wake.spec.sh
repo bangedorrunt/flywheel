@@ -43,9 +43,8 @@ mutation "H4  msg id is not stable (hash dropped)" \
 mutation "H5  spawn mints no opencode session" \
     file=src/cmd/spawn.rs \
     expect=opencode_session_minted_into_argv_and_recorded \
-    find='    let crate::harness_registry::SessionResume::ChosenId { start, .. } =
-        crate::harness_registry::session_resume(kind)
-    else {
-        return None;
-    };' \
-    replace='    return None;'
+    find='    args.push(start.to_string());
+    args.push(id.clone());
+    Some(id)' \
+    replace='    let _ = (args, start, id);
+    None'
