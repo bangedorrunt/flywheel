@@ -700,6 +700,10 @@ RECEIPT_CHANGED_PATHS="${RECEIPT_CHANGED_PATHS:-}"
 # the captain) with the log path, cause and exact rerun command. A green
 # receipt mails nobody about failures.
 mail_red_owners() {
+  if [ -z "$4" ]; then
+    echo "clean-proof: no AGENT_NAME or FLYWHEEL_MAIL_AS; red rows not mailed (see $1)" >&2
+    return 0
+  fi
   PROOF_RECEIPT="$1" PROOF_REPO="$2" PROOF_PROJECT="$3" PROOF_MAIL_AS="$4" python3 - <<'PY'
 import json, os, subprocess
 
@@ -717,7 +721,7 @@ if receipt.get("ok"):
 
 repo = os.environ.get("PROOF_REPO", ".")
 project = os.environ.get("PROOF_PROJECT", "flywheel")
-sender = os.environ.get("PROOF_MAIL_AS", "Flywheel")
+sender = os.environ["PROOF_MAIL_AS"]
 captain = os.environ.get("AGENT_NAME") or sender
 logs = receipt.get("logs", "")
 
@@ -825,7 +829,7 @@ proof_write_receipt "$RECEIPT" "$OK" "$PROVEN_SHA" "$SHORT" "$STAMP" "$MODE" "$T
 # bd-n21ml: route red rows to their owners once the receipt exists. Never fail
 # a proof because a mail could not be delivered.
 mail_red_owners "$RECEIPT" "$ROOT" "${CLEAN_PROOF_PROJECT:-flywheel}" \
-  "${AGENT_NAME:-${FLYWHEEL_MAIL_AS:-Flywheel}}" || true
+  "${AGENT_NAME:-${FLYWHEEL_MAIL_AS:-}}" || true
 
 # bd-jp9z1.2: the witness for a freshly proved spec is THIS receipt, so the
 # entries are written only after it exists.
