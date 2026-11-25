@@ -58,8 +58,8 @@ fn compose_parts_value(target: &str) -> String {
 /// table below is the only map. Unknown primitives are explicit `"none"` —
 /// the silent `_ => "swarm"` bucket is deleted.
 pub fn topology_for_primitive(primitive: &str) -> &'static str {
-    ROUTING_TABLE
-        .iter()
+    all_route_entries()
+        .into_iter()
         .find(|e| e.primitive == primitive)
         .map(|e| e.topology)
         .unwrap_or("none")
@@ -188,17 +188,11 @@ pub struct RouteEntry {
     pub reason: &'static str,
 }
 
-/// The one routing table. Order is cosmetic: resolution is earliest-match
-/// position, then longest needle — never first-match-wins.
+/// Kept non-delivery routing rows (ADR-0023(b)). Delivery-shape triggers
+/// (`direct`, `reviewed`, `wave`) live in [`DELIVERY_TRIGGERS`] and resolve
+/// through [`DELIVERY_SHAPE_TABLE`]. Order is cosmetic: resolution is
+/// earliest-match position, then longest needle — never first-match-wins.
 pub static ROUTING_TABLE: &[RouteEntry] = &[
-    RouteEntry {
-        primitive: "ce-review",
-        matchers: &["audit", "read-only", "analyze"],
-        topology: "open",
-        gate: RouteGate::NoImplement,
-        argv: RouteArgv::WorkflowRun { mode: "headless" },
-        reason: "read-only analysis — captain-audit headless",
-    },
     RouteEntry {
         primitive: "ce-debug",
         matchers: &["repro", "regression", "bug-fix"],
@@ -304,14 +298,6 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "pause / going offline — checkpoint + standing handoff",
     },
     RouteEntry {
-        primitive: "ce-review",
-        matchers: &["interrogate", "tear this apart", "adversarial review"],
-        topology: "swarm",
-        gate: RouteGate::Always,
-        argv: RouteArgv::WorkflowRun { mode: "headless" },
-        reason: "interrogate — N-model adversarial review (read-only)",
-    },
-    RouteEntry {
         primitive: "figure-it-out",
         matchers: &["figure it out", "no playbook"],
         topology: "swarm",
@@ -326,22 +312,6 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         gate: RouteGate::Always,
         argv: RouteArgv::WorkflowRun { mode: "pane" },
         reason: "ship beads — ledger-green then housekeeper commit",
-    },
-    RouteEntry {
-        primitive: "ce-lfg",
-        matchers: &["feature"],
-        topology: "swarm",
-        gate: RouteGate::Always,
-        argv: RouteArgv::WorkflowRun { mode: "pane" },
-        reason: "feature — feature workflow (shape -> build -> prove)",
-    },
-    RouteEntry {
-        primitive: "ce-wave",
-        matchers: &["goal"],
-        topology: "swarm",
-        gate: RouteGate::Always,
-        argv: RouteArgv::WorkflowRun { mode: "pane" },
-        reason: "goal — meta-workflow (ce-brainstorm -> plan -> beads -> build)",
     },
     RouteEntry {
         primitive: "ce-triage",
@@ -413,14 +383,6 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "awareness-digest — captain digest (presence + reservations + guard)",
     },
     RouteEntry {
-        primitive: "ce-lfg",
-        matchers: &["onboard"],
-        topology: "swarm",
-        gate: RouteGate::Always,
-        argv: RouteArgv::WorkflowRun { mode: "pane" },
-        reason: "onboard — cold-start newcomer (map repo -> seed first task)",
-    },
-    RouteEntry {
         primitive: "join",
         matchers: &["join the fleet", "join fleet", "joining"],
         topology: "join",
@@ -444,14 +406,6 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "one pane — spawn --profile <role> --count 1, then send --to <full-name> --wait (never --oc)",
     },
     RouteEntry {
-        primitive: "ce-wave",
-        matchers: &["wave-swarm", "wave swarm"],
-        topology: "swarm",
-        gate: RouteGate::Always,
-        argv: RouteArgv::ComposeToken { token: "ce-wave" },
-        reason: "ce-wave — planned wave (plan -> polish -> audit -> gate -> track -> dispatch -> exit on landed)",
-    },
-    RouteEntry {
         primitive: "ce-debug",
         matchers: &[
             "repair-until-verified",
@@ -471,82 +425,6 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         reason: "repair-until-verified — compose --parts repair-until-verified --run",
     },
     RouteEntry {
-        primitive: "ce-wave",
-        matchers: &["beads-lifecycle", "beads lifecycle"],
-        topology: "swarm",
-        gate: RouteGate::Always,
-        argv: RouteArgv::ComposeToken { token: "ce-wave" },
-        reason: "beads-lifecycle — compose --parts ce-wave --run",
-    },
-    RouteEntry {
-        primitive: "ce-review",
-        matchers: &[
-            "argue both sides",
-            "devil's advocate",
-            "debate the",
-            "steelman",
-        ],
-        topology: "swarm",
-        gate: RouteGate::Always,
-        argv: RouteArgv::WorkflowRun { mode: "pane" },
-        reason: "debate — adversarial briefs, oracle decides",
-    },
-    RouteEntry {
-        primitive: "ce-lfg",
-        matchers: &[
-            "brainstorm",
-            "sharpen the requirements",
-            "requirements-only",
-            "ideate",
-        ],
-        topology: "swarm",
-        gate: RouteGate::Always,
-        argv: RouteArgv::WorkflowRunWith {
-            mode: "pane",
-            inputs: r#"{"explore":true}"#,
-        },
-        reason: "ce-brainstorm — requirements-first ideation (oracles diverge, planner reduces)",
-    },
-    RouteEntry {
-        primitive: "ce-wave",
-        matchers: &[
-            "break this down",
-            "bead-ready plan",
-            "decompose this goal",
-            "make a bead-ready plan",
-        ],
-        topology: "swarm",
-        gate: RouteGate::Always,
-        argv: RouteArgv::WorkflowRun { mode: "pane" },
-        reason: "ce-plan — goal to bead-ready plan, approval gate",
-    },
-    RouteEntry {
-        primitive: "ce-wave",
-        matchers: &[
-            "ship the chain",
-            "run the ship",
-            "ship chain",
-            "resolve to verify",
-        ],
-        topology: "swarm",
-        gate: RouteGate::Always,
-        argv: RouteArgv::WorkflowRun { mode: "pane" },
-        reason: "ship — resolve to verify gated chain",
-    },
-    RouteEntry {
-        primitive: "ce-wave",
-        matchers: &[
-            "convert to beads",
-            "file these as beads",
-            "track this plan",
-            "beads from this plan",
-        ],
-        topology: "swarm",
-        gate: RouteGate::Always,
-        argv: RouteArgv::WorkflowRun { mode: "pane" },
-        reason: "beads — plan to tracker (planner files the beads)",
-    },
-    RouteEntry {
         primitive: "loop-work",
         matchers: &["work the ready beads", "ready beads", "loop-mode", "loop"],
         topology: "open",
@@ -561,14 +439,6 @@ pub static ROUTING_TABLE: &[RouteEntry] = &[
         gate: RouteGate::ImplementTracker,
         argv: RouteArgv::Steer,
         reason: "implement + tracker/gate — steer",
-    },
-    RouteEntry {
-        primitive: "steer-direct",
-        matchers: &["no tracker", "direct"],
-        topology: "swarm",
-        gate: RouteGate::ImplementDirect,
-        argv: RouteArgv::SteerDirect,
-        reason: "implement, no tracker — steer --direct",
     },
     RouteEntry {
         primitive: "steer",
@@ -667,6 +537,185 @@ pub static DELIVERY_SHAPE_TABLE: &[DeliveryShapeRow; 3] = &[
         reason: "wave delivery — ce-wave (plan -> beads -> build -> exit)",
     },
 ];
+
+#[derive(Debug, Clone, Copy)]
+pub struct DeliveryTrigger {
+    pub shape: DeliveryShape,
+    pub matchers: &'static [&'static str],
+    pub gate: RouteGate,
+    pub topology_override: Option<&'static str>,
+    pub primitive_override: Option<&'static str>,
+    pub argv_override: Option<RouteArgv>,
+    pub reason: &'static str,
+}
+
+/// ADR-0023(a): delivery-shape triggers routed through [`DELIVERY_SHAPE_TABLE`].
+pub static DELIVERY_TRIGGERS: &[DeliveryTrigger] = &[
+    DeliveryTrigger {
+        shape: DeliveryShape::Reviewed,
+        matchers: &["audit", "read-only", "analyze"],
+        gate: RouteGate::NoImplement,
+        topology_override: Some("open"),
+        primitive_override: Some("ce-review"),
+        argv_override: Some(RouteArgv::WorkflowRun { mode: "headless" }),
+        reason: "read-only analysis — captain-audit headless",
+    },
+    DeliveryTrigger {
+        shape: DeliveryShape::Reviewed,
+        matchers: &["interrogate", "tear this apart", "adversarial review"],
+        gate: RouteGate::Always,
+        topology_override: None,
+        primitive_override: Some("ce-review"),
+        argv_override: Some(RouteArgv::WorkflowRun { mode: "headless" }),
+        reason: "interrogate — N-model adversarial review (read-only)",
+    },
+    DeliveryTrigger {
+        shape: DeliveryShape::Reviewed,
+        matchers: &["feature"],
+        gate: RouteGate::Always,
+        topology_override: None,
+        primitive_override: None,
+        argv_override: None,
+        reason: "feature — feature workflow (shape -> build -> prove)",
+    },
+    DeliveryTrigger {
+        shape: DeliveryShape::Wave,
+        matchers: &["goal"],
+        gate: RouteGate::Always,
+        topology_override: None,
+        primitive_override: None,
+        argv_override: None,
+        reason: "goal — meta-workflow (ce-brainstorm -> plan -> beads -> build)",
+    },
+    DeliveryTrigger {
+        shape: DeliveryShape::Reviewed,
+        matchers: &["onboard"],
+        gate: RouteGate::Always,
+        topology_override: None,
+        primitive_override: None,
+        argv_override: None,
+        reason: "onboard — cold-start newcomer (map repo -> seed first task)",
+    },
+    DeliveryTrigger {
+        shape: DeliveryShape::Wave,
+        matchers: &["wave-swarm", "wave swarm"],
+        gate: RouteGate::Always,
+        topology_override: None,
+        primitive_override: None,
+        argv_override: Some(RouteArgv::ComposeToken { token: "ce-wave" }),
+        reason: "ce-wave — planned wave (plan -> polish -> audit -> gate -> track -> dispatch -> exit on landed)",
+    },
+    DeliveryTrigger {
+        shape: DeliveryShape::Wave,
+        matchers: &["beads-lifecycle", "beads lifecycle"],
+        gate: RouteGate::Always,
+        topology_override: None,
+        primitive_override: None,
+        argv_override: Some(RouteArgv::ComposeToken { token: "ce-wave" }),
+        reason: "beads-lifecycle — compose --parts ce-wave --run",
+    },
+    DeliveryTrigger {
+        shape: DeliveryShape::Reviewed,
+        matchers: &[
+            "argue both sides",
+            "devil's advocate",
+            "debate the",
+            "steelman",
+        ],
+        gate: RouteGate::Always,
+        topology_override: None,
+        primitive_override: Some("ce-review"),
+        argv_override: None,
+        reason: "debate — adversarial briefs, oracle decides",
+    },
+    DeliveryTrigger {
+        shape: DeliveryShape::Reviewed,
+        matchers: &[
+            "brainstorm",
+            "sharpen the requirements",
+            "requirements-only",
+            "ideate",
+        ],
+        gate: RouteGate::Always,
+        topology_override: None,
+        primitive_override: None,
+        argv_override: Some(RouteArgv::WorkflowRunWith {
+            mode: "pane",
+            inputs: r#"{"explore":true}"#,
+        }),
+        reason: "ce-brainstorm — requirements-first ideation (oracles diverge, planner reduces)",
+    },
+    DeliveryTrigger {
+        shape: DeliveryShape::Wave,
+        matchers: &[
+            "break this down",
+            "bead-ready plan",
+            "decompose this goal",
+            "make a bead-ready plan",
+        ],
+        gate: RouteGate::Always,
+        topology_override: None,
+        primitive_override: None,
+        argv_override: None,
+        reason: "ce-plan — goal to bead-ready plan, approval gate",
+    },
+    DeliveryTrigger {
+        shape: DeliveryShape::Wave,
+        matchers: &[
+            "ship the chain",
+            "run the ship",
+            "ship chain",
+            "resolve to verify",
+        ],
+        gate: RouteGate::Always,
+        topology_override: None,
+        primitive_override: None,
+        argv_override: None,
+        reason: "ship — resolve to verify gated chain",
+    },
+    DeliveryTrigger {
+        shape: DeliveryShape::Wave,
+        matchers: &[
+            "convert to beads",
+            "file these as beads",
+            "track this plan",
+            "beads from this plan",
+        ],
+        gate: RouteGate::Always,
+        topology_override: None,
+        primitive_override: None,
+        argv_override: None,
+        reason: "beads — plan to tracker (planner files the beads)",
+    },
+    DeliveryTrigger {
+        shape: DeliveryShape::Direct,
+        matchers: &["no tracker", "direct"],
+        gate: RouteGate::ImplementDirect,
+        topology_override: None,
+        primitive_override: None,
+        argv_override: None,
+        reason: "implement, no tracker — steer --direct",
+    },
+];
+
+fn all_route_entries() -> Vec<RouteEntry> {
+    let mut entries = ROUTING_TABLE.to_vec();
+    for trigger in DELIVERY_TRIGGERS {
+        let base = DELIVERY_SHAPE_TABLE
+            .iter()
+            .find(|r| r.shape == trigger.shape)
+            .expect("DELIVERY_SHAPE_TABLE covers all DeliveryShape variants");
+        entries.push(RouteEntry {
+            primitive: trigger.primitive_override.unwrap_or(base.primitive),
+            matchers: trigger.matchers,
+            topology: trigger.topology_override.unwrap_or(base.topology),
+            gate: trigger.gate,
+            argv: trigger.argv_override.unwrap_or(base.argv),
+            reason: trigger.reason,
+        });
+    }
+    entries
+}
 
 #[cfg(test)]
 pub const DELIVERY_PRIMITIVES: &[&str] = &["steer-direct", "ce-lfg", "ce-review", "ce-wave"];
@@ -940,8 +989,9 @@ pub fn check_profile_routes(
 /// Compile the one routing table. Loud on overlap, on an ambiguous trigger, and
 /// on a dangling claim — callers fail closed.
 pub fn compile_routing_table() -> Result<(), String> {
-    check_routing_table(ROUTING_TABLE)?;
-    check_catalog(ROUTING_TABLE)
+    let all = all_route_entries();
+    check_routing_table(&all)?;
+    check_catalog(&all)
 }
 
 fn none_decision(target: &str, why: String) -> Decision {
@@ -1094,7 +1144,8 @@ fn classify(target: &str, snap: &Snapshot) -> Decision {
     }
     let t = target.to_ascii_lowercase();
     let implement = has(&t, &["implement", "fix"]);
-    let hits: Vec<((usize, usize), &RouteEntry)> = ROUTING_TABLE
+    let all = all_route_entries();
+    let hits: Vec<((usize, usize), &RouteEntry)> = all
         .iter()
         .filter_map(|e| e.match_key(&t, implement, snap).map(|key| (key, e)))
         .collect();
@@ -1162,10 +1213,19 @@ pub fn decide_trigger_for(workflow: &str) -> Option<&'static str> {
     if UNROUTED_PRIMITIVES.contains(&workflow) {
         return None;
     }
-    ROUTING_TABLE
+    if let Some(e) = ROUTING_TABLE.iter().find(|e| e.primitive == workflow) {
+        return e.matchers.first().copied();
+    }
+    DELIVERY_TRIGGERS
         .iter()
-        .find(|e| e.primitive == workflow)
-        .and_then(|e| e.matchers.first().copied())
+        .find(|t| {
+            let base = DELIVERY_SHAPE_TABLE
+                .iter()
+                .find(|r| r.shape == t.shape)
+                .expect("shape");
+            t.primitive_override.unwrap_or(base.primitive) == workflow
+        })
+        .and_then(|t| t.matchers.first().copied())
 }
 
 /// The compose-request archetype (§3.7 T4): the shape of work a mailed
@@ -2180,24 +2240,27 @@ mod decide_router_tests {
         );
     }
 
+    const fn test_entry(
+        primitive: &'static str,
+        matchers: &'static [&'static str],
+        topology: &'static str,
+        argv: RouteArgv,
+        reason: &'static str,
+    ) -> RouteEntry {
+        RouteEntry {
+            primitive,
+            matchers,
+            topology,
+            gate: RouteGate::Always,
+            argv,
+            reason,
+        }
+    }
+
     #[test]
     fn decide_router_same_position_tie_is_explicit_none() {
-        static TIE_A: RouteEntry = RouteEntry {
-            primitive: "aaa",
-            matchers: &["x"],
-            topology: "swarm",
-            gate: RouteGate::Always,
-            argv: RouteArgv::CronStart,
-            reason: "a",
-        };
-        static TIE_B: RouteEntry = RouteEntry {
-            primitive: "bbb",
-            matchers: &["x"],
-            topology: "open",
-            gate: RouteGate::Always,
-            argv: RouteArgv::CronStart,
-            reason: "b",
-        };
+        static TIE_A: RouteEntry = test_entry("aaa", &["x"], "swarm", RouteArgv::CronStart, "a");
+        static TIE_B: RouteEntry = test_entry("bbb", &["x"], "open", RouteArgv::CronStart, "b");
         let d = pick(vec![((0, 5), &TIE_A), ((0, 5), &TIE_B)], "t", &snap());
         assert_eq!(d.primitive, "none", "tie must not silently pick: {d:?}");
         assert!(
@@ -2225,22 +2288,8 @@ mod decide_router_tests {
     #[test]
     fn decide_router_overlap_fails_load() {
         let dup = [
-            RouteEntry {
-                primitive: "aaa",
-                matchers: &["same-needle"],
-                topology: "swarm",
-                gate: RouteGate::Always,
-                argv: RouteArgv::CronStart,
-                reason: "a",
-            },
-            RouteEntry {
-                primitive: "bbb",
-                matchers: &["same-needle"],
-                topology: "open",
-                gate: RouteGate::Always,
-                argv: RouteArgv::CronStart,
-                reason: "b",
-            },
+            test_entry("aaa", &["same-needle"], "swarm", RouteArgv::CronStart, "a"),
+            test_entry("bbb", &["same-needle"], "open", RouteArgv::CronStart, "b"),
         ];
         let err = check_routing_table(&dup).expect_err("duplicate needle must fail load");
         assert!(err.contains("same-needle"), "names the needle: {err}");
@@ -2253,22 +2302,14 @@ mod decide_router_tests {
     #[test]
     fn decide_router_shared_trigger_fails_load() {
         let dup = [
-            RouteEntry {
-                primitive: "aaa",
-                matchers: &["same-trigger"],
-                topology: "swarm",
-                gate: RouteGate::Always,
-                argv: RouteArgv::CronStart,
-                reason: "a",
-            },
-            RouteEntry {
-                primitive: "bbb",
-                matchers: &["same-trigger", "other"],
-                topology: "open",
-                gate: RouteGate::Always,
-                argv: RouteArgv::CronStart,
-                reason: "b",
-            },
+            test_entry("aaa", &["same-trigger"], "swarm", RouteArgv::CronStart, "a"),
+            test_entry(
+                "bbb",
+                &["same-trigger", "other"],
+                "open",
+                RouteArgv::CronStart,
+                "b",
+            ),
         ];
         let err = check_catalog(&dup).expect_err("shared trigger must fail load");
         assert!(err.contains("same-trigger"), "names the phrase: {err}");
@@ -2280,27 +2321,25 @@ mod decide_router_tests {
 
     #[test]
     fn decide_router_orphan_workflow_route_fails_load() {
-        let table = [RouteEntry {
-            primitive: "ghost-wf",
-            matchers: &["ghost"],
-            topology: "swarm",
-            gate: RouteGate::Always,
-            argv: RouteArgv::WorkflowRun { mode: "pane" },
-            reason: "g",
-        }];
+        let table = [test_entry(
+            "ghost-wf",
+            &["ghost"],
+            "swarm",
+            RouteArgv::WorkflowRun { mode: "pane" },
+            "g",
+        )];
         let err = check_workflow_routes(&table, &["real-wf".to_string()])
             .expect_err("orphan route must fail load");
         assert!(err.contains("ghost-wf"), "names the orphan: {err}");
         check_workflow_routes(&table, &["ghost-wf".to_string()])
             .expect("a resolvable workflow admits the route");
-        let non_wf = [RouteEntry {
-            primitive: "join",
-            matchers: &["join it"],
-            topology: "swarm",
-            gate: RouteGate::Always,
-            argv: RouteArgv::Join,
-            reason: "j",
-        }];
+        let non_wf = [test_entry(
+            "join",
+            &["join it"],
+            "swarm",
+            RouteArgv::Join,
+            "j",
+        )];
         check_workflow_routes(&non_wf, &[]).expect("Join is not a `workflow run` route");
     }
 
@@ -2313,15 +2352,17 @@ mod decide_router_tests {
             known.len() >= 10,
             "the builtin catalog is non-trivial: {known:?}"
         );
-        check_workflow_routes(ROUTING_TABLE, &known)
+        let all = all_route_entries();
+        check_workflow_routes(&all, &known)
             .expect("every routed `workflow run` primitive must exist in the catalog");
     }
 
     #[test]
     fn decide_router_unrouted_list_is_real_and_not_keyword_routed() {
+        let all = all_route_entries();
         for name in UNROUTED_PRIMITIVES {
             assert!(
-                ROUTING_TABLE.iter().any(|e| e.primitive == *name),
+                all.iter().any(|e| e.primitive == *name),
                 "{name} is declared unrouted but has no routing row"
             );
             assert_eq!(
@@ -2331,7 +2372,7 @@ mod decide_router_tests {
             );
         }
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        for e in ROUTING_TABLE {
+        for e in &all {
             if UNROUTED_PRIMITIVES.contains(&e.primitive) || !seen.insert(e.primitive) {
                 continue;
             }
@@ -2351,6 +2392,7 @@ mod decide_router_tests {
 
     #[test]
     fn decide_router_trigger_phrase_is_first_matcher() {
+        let all = all_route_entries();
         let pairs = [
             ("ce-lfg", "feature"),
             ("ce-debug", "repro"),
@@ -2369,8 +2411,7 @@ mod decide_router_tests {
                 "trigger surface for {workflow}"
             );
             assert!(
-                ROUTING_TABLE
-                    .iter()
+                all.iter()
                     .any(|e| e.primitive == workflow && e.matchers.first() == Some(&trigger)),
                 "{workflow} row leads with its trigger {trigger:?}"
             );
@@ -2401,15 +2442,26 @@ mod decide_router_tests {
 
     #[test]
     fn every_routing_table_row_maps_to_delivery_shape_or_kept_primitive() {
-        assert_eq!(ROUTING_TABLE.len(), 44);
+        assert_eq!(ROUTING_TABLE.len(), 31);
+        assert_eq!(DELIVERY_TRIGGERS.len(), 13);
         assert_eq!(DELIVERY_SHAPE_TABLE.len(), 3);
         assert_eq!(KEPT_NON_DELIVERY_PRIMITIVES.len(), 17);
         for row in ROUTING_TABLE {
             assert!(
-                DELIVERY_PRIMITIVES.contains(&row.primitive)
-                    || KEPT_NON_DELIVERY_PRIMITIVES.contains(&row.primitive),
-                "unmapped ROUTING_TABLE primitive: {}",
+                KEPT_NON_DELIVERY_PRIMITIVES.contains(&row.primitive),
+                "ROUTING_TABLE must hold only kept primitives after bd-ecws3: {}",
                 row.primitive
+            );
+        }
+        for trigger in DELIVERY_TRIGGERS {
+            let base = DELIVERY_SHAPE_TABLE
+                .iter()
+                .find(|r| r.shape == trigger.shape)
+                .expect("shape");
+            let prim = trigger.primitive_override.unwrap_or(base.primitive);
+            assert!(
+                DELIVERY_PRIMITIVES.contains(&prim),
+                "unmapped DELIVERY_TRIGGERS primitive: {prim}"
             );
         }
     }
