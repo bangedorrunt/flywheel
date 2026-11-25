@@ -36,11 +36,11 @@ exit 0
 STUB
 chmod +x "$TMP/bin/fakecargo"
 
-# bd-b3j7x: never inherit the operator's identity or daemon route. The Rust
-# witness also hands us a fake `toron` first on PATH via TestSandbox; assert
-# the red mail went there, never to the live daemon.
+# bd-b3j7x + bd-doevk: never inherit the operator's identity or daemon route,
+# and supply a real test pin (`ProofTest`) so red mail reaches the sandboxed
+# fake `toron` first on PATH without touching the live daemon.
 : "${TORON_FAKE_LOG:?bd-b3j7x: run this witness under TestSandbox with a fake toron}"
-out="$(env -u AGENT_NAME -u TORON_MCP_URL \
+out="$(env -u TORON_MCP_URL AGENT_NAME=ProofTest \
   HOME="$TMP/home" XDG_CONFIG_HOME="$TMP/xdg/config" XDG_STATE_HOME="$TMP/xdg/state" \
   XDG_CACHE_HOME="$TMP/xdg/cache" XDG_RUNTIME_DIR="$TMP/xdg/run" \
   CLEAN_PROOF_REPO_ROOT="$REPO" CLEAN_PROOF_LOCK_FILE="$TMP/proof.lock" \
