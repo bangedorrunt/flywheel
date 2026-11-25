@@ -1328,6 +1328,16 @@ pub fn commit_deferred_wakes(state_dir: &Path, project: &str) {
     });
 }
 
+const HOST_LOG_CAP_BYTES: u64 = 8 * 1024 * 1024;
+
+fn rotate_host_log(log: &Path, cap_bytes: u64) {
+    if std::fs::metadata(log).is_ok_and(|m| m.len() > cap_bytes) {
+        let mut old = log.as_os_str().to_owned();
+        old.push(".1");
+        let _ = std::fs::rename(log, old);
+    }
+}
+
 pub fn inject_wake_in(
     state_dir: &Path,
     project: &str,
@@ -1431,6 +1441,16 @@ fn spawn_child(exe: &Path, state_dir: &Path, project: &str, workspace: &str) -> 
     // journals). One append log per workspace, beside the state record.
     let log_dir = state_path.parent().map(std::path::Path::to_path_buf);
     let mut attached = false;
+    if let Some(dir) = &log_dir {
+        rotate_host_log(
+            &dir.join(format!("{workspace}.out.log")),
+            HOST_LOG_CAP_BYTES,
+        );
+        rotate_host_log(
+            &dir.join(format!("{workspace}.err.log")),
+            HOST_LOG_CAP_BYTES,
+        );
+    }
     if let Some(dir) = log_dir
         && std::fs::create_dir_all(&dir).is_ok()
         && let (Ok(out), Ok(err)) = (
@@ -2741,6 +2761,37 @@ mod tests {
                 .any(|(_, row)| row.to_string().contains("probe-b")),
             "no other workspace is read"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crash-looping host appended to one err.log until it reached 471 MB;
+    /// spawn moves an over-size log aside so each workspace keeps two at most.
+    #[test]
+    fn host_log_rotates_when_over_cap_and_keeps_one_old_copy() {
+        let dir = std::env::temp_dir().join(format!("host-log-rotate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("ws.err.log");
+        let old = dir.join("ws.err.log.1");
+
+        std::fs::write(&log, vec![b'a'; 10]).unwrap();
+        rotate_host_log(&log, 10);
+        assert!(log.exists() && !old.exists(), "at the cap the log stays");
+
+        std::fs::write(&log, vec![b'b'; 11]).unwrap();
+        rotate_host_log(&log, 10);
+        assert!(!log.exists(), "over the cap the log moves aside");
+        assert_eq!(std::fs::read(&old).unwrap(), vec![b'b'; 11]);
+
+        std::fs::write(&log, vec![b'c'; 12]).unwrap();
+        rotate_host_log(&log, 10);
+        assert_eq!(
+            std::fs::read(&old).unwrap(),
+            vec![b'c'; 12],
+            "only one old copy"
+        );
+
+        rotate_host_log(&dir.join("missing.err.log"), 10);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
