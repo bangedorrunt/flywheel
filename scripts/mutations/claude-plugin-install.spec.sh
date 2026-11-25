@@ -19,5 +19,5 @@ mutation "P2  the plugin manifest stops declaring its module" \
 mutation "P3  spawn points --plugin-dir at the wrong path" \
     file=src/cmd/spawn.rs \
     expect=proof_claude_plugin_loads_and_installs_to_plugin_dir \
-    find='        agent_args.push(format!("{data_home}/flywheel/plugins/claude-flywheel"));' \
-    replace='        agent_args.push(format!("{data_home}/flywheel/plugins/other"));'
+    find='        format!("{data_home}/flywheel/plugins/claude-flywheel"),' \
+    replace='        format!("{data_home}/flywheel/plugins/other"),'

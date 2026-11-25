@@ -104,6 +104,40 @@ pub struct HarnessSpec {
     /// Orchestration-phase argv: (plan, implement) with a degraded flag each.
     pub phase_plan: (&'static [&'static str], bool),
     pub phase_implement: (&'static [&'static str], bool),
+    /// How a seat's session follows it into a new pane.
+    pub session: SessionResume,
+    /// The harness that replaces this one. A launch warns once.
+    pub deprecated_for: Option<&'static str>,
+}
+
+/// How a seat's harness session survives a move to a new pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionResume {
+    Unsupported,
+    /// flywheel picks the id at spawn with `start` and reopens it with `resume`.
+    ChosenId {
+        start: &'static str,
+        resume: &'static str,
+    },
+    /// The seat's private session dir holds its session; `flag` continues it.
+    SeatDirContinue {
+        flag: &'static str,
+    },
+    /// The harness picks its own id and the seat's hook records it on the
+    /// registry row; `resume` reopens it.
+    RecordedId {
+        resume: &'static str,
+    },
+}
+
+#[must_use]
+pub fn session_resume(harness: &str) -> SessionResume {
+    spec(&canonical(harness)).map_or(SessionResume::Unsupported, |s| s.session)
+}
+
+#[must_use]
+pub fn deprecated_for(harness: &str) -> Option<&'static str> {
+    spec(&canonical(harness)).and_then(|s| s.deprecated_for)
 }
 
 /// The registry. Adding a harness is a one-line change HERE, and the fences at
@@ -111,6 +145,11 @@ pub struct HarnessSpec {
 pub const REGISTRY: &[HarnessSpec] = &[
     HarnessSpec {
         canonical: "opencode",
+        session: SessionResume::ChosenId {
+            start: "--session",
+            resume: "--session",
+        },
+        deprecated_for: None,
         aliases: &["oc"],
         tier: HarnessTier::Open,
         implied_slot: Some(SLOT_CHEAP),
@@ -125,6 +164,8 @@ pub const REGISTRY: &[HarnessSpec] = &[
     },
     HarnessSpec {
         canonical: "pi",
+        session: SessionResume::SeatDirContinue { flag: "--continue" },
+        deprecated_for: None,
         aliases: &[],
         tier: HarnessTier::Open,
         implied_slot: Some(SLOT_STANDARD),
@@ -139,6 +180,8 @@ pub const REGISTRY: &[HarnessSpec] = &[
     },
     HarnessSpec {
         canonical: "grok",
+        session: SessionResume::Unsupported,
+        deprecated_for: None,
         aliases: &["gk"],
         tier: HarnessTier::Closed,
         implied_slot: Some(SLOT_PREMIUM),
@@ -153,6 +196,8 @@ pub const REGISTRY: &[HarnessSpec] = &[
     },
     HarnessSpec {
         canonical: "codex",
+        session: SessionResume::Unsupported,
+        deprecated_for: None,
         aliases: &["cx"],
         tier: HarnessTier::Closed,
         implied_slot: None,
@@ -167,6 +212,11 @@ pub const REGISTRY: &[HarnessSpec] = &[
     },
     HarnessSpec {
         canonical: "claude",
+        session: SessionResume::ChosenId {
+            start: "--session-id",
+            resume: "--resume",
+        },
+        deprecated_for: None,
         aliases: &["cc", "claude-code"],
         tier: HarnessTier::Closed,
         implied_slot: None,
@@ -181,6 +231,8 @@ pub const REGISTRY: &[HarnessSpec] = &[
     },
     HarnessSpec {
         canonical: "fx",
+        session: SessionResume::Unsupported,
+        deprecated_for: None,
         aliases: &[],
         tier: HarnessTier::Open,
         implied_slot: None,
@@ -195,6 +247,10 @@ pub const REGISTRY: &[HarnessSpec] = &[
     },
     HarnessSpec {
         canonical: "antigravity",
+        session: SessionResume::RecordedId {
+            resume: "--conversation",
+        },
+        deprecated_for: None,
         aliases: &["agy", "ag", "antigravity-cli"],
         tier: HarnessTier::Closed,
         implied_slot: None,
@@ -209,6 +265,8 @@ pub const REGISTRY: &[HarnessSpec] = &[
     },
     HarnessSpec {
         canonical: "gemini",
+        session: SessionResume::Unsupported,
+        deprecated_for: Some("antigravity"),
         aliases: &["gm"],
         tier: HarnessTier::Closed,
         implied_slot: None,

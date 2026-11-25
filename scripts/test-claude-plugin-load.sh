@@ -49,8 +49,8 @@ pass "stack.sh installs the plugin to the --plugin-dir path, dry-run is inert"
 
 # The spawn argv must use the SAME path constant, or a seat loads nothing.
 spawn="$ROOT/src/cmd/spawn.rs"
-grep -qF 'agent_args.push("--plugin-dir".to_string());' "$spawn" \
+grep -qF 'agent_args.extend(claude_plugin_args(&kind));' "$spawn" \
   || fail "spawn does not pass --plugin-dir to Claude seats"
-grep -qF 'agent_args.push(format!("{data_home}/flywheel/plugins/claude-flywheel"));' "$spawn" \
+grep -qF 'format!("{data_home}/flywheel/plugins/claude-flywheel"),' "$spawn" \
   || fail "spawn's --plugin-dir path drifted from the installed path"
 pass "spawn --plugin-dir matches the installed plugin path"

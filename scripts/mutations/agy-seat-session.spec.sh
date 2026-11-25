@@ -10,15 +10,19 @@ TEST_FILTER=(
 mutation "A1  spawn reads the conversation id from the spawner env" \
     file=src/cmd/spawn.rs \
     expect=agy_conversation_id_never_read_from_spawner_env \
-    find='    if crate::harness_registry::canonical(kind) != "opencode" {
+    find='    let crate::harness_registry::SessionResume::ChosenId { start, .. } =
+        crate::harness_registry::session_resume(kind)
+    else {
         return None;
-    }' \
+    };' \
     replace='    if crate::harness_registry::canonical(kind) == "antigravity" {
         return std::env::var("ANTIGRAVITY_CONVERSATION_ID").ok();
     }
-    if crate::harness_registry::canonical(kind) != "opencode" {
+    let crate::harness_registry::SessionResume::ChosenId { start, .. } =
+        crate::harness_registry::session_resume(kind)
+    else {
         return None;
-    }'
+    };'
 
 mutation "A2  the hook payload parser never finds a conversation id" \
     file=src/turn_hooks.rs \

@@ -16,6 +16,10 @@ mutation "H2  a compiled-in recipe becomes a registry row too" \
     file=src/harness_registry.rs \
     expect=compiled_in_recipe_harnesses_are_not_registry_rows \
     find='        canonical: "fx",
+        session: SessionResume::Unsupported,
+        deprecated_for: None,
         aliases: &[],' \
     replace='        canonical: "fx",
+        session: SessionResume::Unsupported,
+        deprecated_for: None,
         aliases: &["pa"],'

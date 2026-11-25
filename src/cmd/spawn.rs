@@ -1454,19 +1454,68 @@ pub(crate) fn prepare_seat_events_before_launch<C: crate::events_tokens::TokenCl
 }
 
 pub(crate) fn mint_harness_session(kind: &str, args: &mut Vec<String>) -> Option<String> {
-    if crate::harness_registry::canonical(kind) != "opencode" {
+    let crate::harness_registry::SessionResume::ChosenId { start, .. } =
+        crate::harness_registry::session_resume(kind)
+    else {
         return None;
-    }
+    };
+    let id = if crate::harness_registry::canonical(kind) == "opencode" {
+        opencode_session_id()
+    } else {
+        claude_session_id()
+    };
+    args.push(start.to_string());
+    args.push(id.clone());
+    Some(id)
+}
+
+fn opencode_session_id() -> String {
+    let (pid, now, seq) = session_seed();
+    format!("ses-{pid}-{now}-{seq:x}")
+}
+
+/// A version-4-shaped UUID from the clock, pid and a counter; Claude's
+/// `--session-id` accepts only UUIDs.
+fn claude_session_id() -> String {
+    let (pid, now, seq) = session_seed();
+    let mut bits = now ^ (u128::from(pid) << 96) ^ (u128::from(seq) << 64);
+    bits = (bits & !(0xf << 76)) | (0x4 << 76);
+    bits = (bits & !(0x3 << 62)) | (0x2 << 62);
+    let h = format!("{bits:032x}");
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
+}
+
+fn session_seed() -> (u32, u128, u64) {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let id = format!("ses-{}-{}-{:x}", std::process::id(), now, seq);
-    args.push("--session".to_string());
-    args.push(id.clone());
-    Some(id)
+    (std::process::id(), now, seq)
+}
+
+/// Claude's flywheel plugin rides each seat from the installed data dir
+/// (bd-9os20/bd-mdpfr); other harnesses take nothing.
+pub(crate) fn claude_plugin_args(kind: &str) -> Vec<String> {
+    if crate::harness_registry::canonical(kind) != "claude" {
+        return vec![];
+    }
+    let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.local/share")
+    });
+    vec![
+        "--plugin-dir".to_string(),
+        format!("{data_home}/flywheel/plugins/claude-flywheel"),
+    ]
 }
 
 /// Verbatim `add`-accepted flags from a spawn request (bd-gjtcw): the join
@@ -2311,15 +2360,9 @@ projects available: {}",
                     &mut pane_env,
                 );
             }
-            // bd-9os20/bd-mdpfr: Claude's flywheel plugin is delivered per seat
-            // from the installed data dir (ScarletCove copies it in stack.sh).
-            if crate::harness_registry::canonical(&kind) == "claude" {
-                let data_home = std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| {
-                    let home = std::env::var("HOME").unwrap_or_default();
-                    format!("{home}/.local/share")
-                });
-                agent_args.push("--plugin-dir".to_string());
-                agent_args.push(format!("{data_home}/flywheel/plugins/claude-flywheel"));
+            agent_args.extend(claude_plugin_args(&kind));
+            if let Some(line) = crate::seat_resume::deprecation_notice(&kind) {
+                eprintln!("{line}");
             }
             if let Some(m) = &env_model_pin {
                 hc::apply_opencode_model_pin(&mut pane_env, m)?;
@@ -3686,7 +3729,19 @@ mod spawn_profile_plan_tests {
 
         let mut pi_args = vec!["--model".to_string(), "x".to_string()];
         assert_eq!(mint_harness_session("pi", &mut pi_args), None);
-        assert_eq!(pi_args, vec!["--model", "x"], "non-opencode argv untouched");
+        assert_eq!(
+            pi_args,
+            vec!["--model", "x"],
+            "pi resumes from its seat dir"
+        );
+    }
+
+    #[test]
+    fn claude_session_is_a_uuid_passed_with_session_id() {
+        let mut args = vec![];
+        let sid = mint_harness_session("claude", &mut args).expect("claude session");
+        assert!(uuid::Uuid::parse_str(&sid).is_ok(), "{sid}");
+        assert_eq!(args, vec!["--session-id", sid.as_str()]);
     }
 
     /// bd-4n2bn: omp seats ride the pi-style agentDir bridge (same env the
