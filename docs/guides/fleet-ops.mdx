@@ -56,6 +56,8 @@ Monitor git and beads for truth, not mail. Address the captain by pin: `flywheel
 | Context over 80 percent | loop auto-respawns; else `kill --force-working`, then re-spawn |
 | File conflict | `coalition` intent or `flywheel mail force-unlock` |
 | Dead pane | `flywheel recover <p>` |
+| Seat's pane closed, its session still on disk | In a fresh pane: `flywheel seat resume <pin>` (re-binds the seat, reopens its claude/opencode/pi/agy session) |
+| Agent resumed its own session in a new pane | `flywheel arrive <p> --as <pin>` moves the seat row to this pane; agents do this at session start |
 | Adversarial decision | `flywheel debate "<proposition>" --rounds 3 --agent-a oc --agent-b oc2 --judge gk` (threaded, ack-gated) |
 | Plan approval | `flywheel plan-review <p> "<feature>"` (plan, review gate, implement, verify) |
 | Assignment | `flywheel assign` assigns beads to agents via mail |

@@ -28,6 +28,7 @@ whois resolution will not agree with the ledger.
 ## What arrive does
 
 - Publishes presence (kind 20001) for the pin.
+- Moves the seat to this pane. When the pin's seat row names another pane (the harness was resumed in a new pane), arrive re-binds the row to `$REX_BLOCK`, so wakes reach the agent again. No pin, no seat row, or the same pane: nothing changes.
 - Drains the `helm` report: open decisions, unread status, record divergence. Always printed, even when empty.
 - Joins loudly if a fleet is live. A live fleet proposes join, never a second compose.
 - Claims the captain alias first-come-first-served; never steal a live `whois.stale=false` holder.

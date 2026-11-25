@@ -58,6 +58,7 @@ flywheel swarm plan|apply|status <project> ...
 flywheel burst <project> --kind <harness> --stage <stage> --prompt <text> [--resume <id>] [--dry-run] [--json]
 flywheel seat adopt [<pin>] --pane <block> [--session <id>]   # re-bind a seat to a live pane (bd-01q9d); --session alone finds a resumed seat (bd-gcoq1)
 flywheel seat resume [<pin>] [--dry-run]   # in a new pane: re-bind the seat here and reopen its claude/opencode/pi/agy session
+# a harness resumed in a new pane runs `flywheel arrive <p> --as <pin>`: arrive moves the seat row to $REX_BLOCK
 flywheel retire <pin>... [--project p] [--force-working]
 ```
 

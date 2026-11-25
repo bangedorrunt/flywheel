@@ -6305,6 +6305,40 @@ fn arrive_registers_arriver_pin() {
 /// or say pull-only when the env is absent. A pin with no pane stays
 /// digest-bound (`no_injectable_panes`).
 #[test]
+fn arrive_moves_a_seat_only_when_its_row_names_another_pane() {
+    let row = |pane: &str| state::SpawnEntry {
+        pane_id: pane.to_string(),
+        name: "crew-1".to_string(),
+        profile: None,
+        harness: Some("claude".to_string()),
+        model: None,
+        model_pin: None,
+        effort: None,
+        mode: None,
+        skills_digest: None,
+        mail_identity: Some("DustyHollow".to_string()),
+        skills_injected: false,
+        incarnation: 1,
+        harness_session: None,
+    };
+    assert_eq!(
+        arrive_rebind_project(
+            Some(("flywheel".to_string(), row("block:old"))),
+            "block:new"
+        ),
+        Some("flywheel".to_string())
+    );
+    assert_eq!(
+        arrive_rebind_project(
+            Some(("flywheel".to_string(), row("block:new"))),
+            "block:new"
+        ),
+        None
+    );
+    assert_eq!(arrive_rebind_project(None, "block:new"), None);
+}
+
+#[test]
 fn arrive_binds_open_pane_or_says_pull_only() {
     let src = include_str!("main.rs");
     let start = src
@@ -12158,12 +12192,25 @@ fn arrive_maybe_bind_pane(cfg: &Config, project: &str, pin: &str) {
         Some(pane) => {
             bind_pane_mail_identity(cfg, project, pin, pane, Some(pin));
             eprintln!("arrive bound pane {pane} to {pin} (doorbell can push)");
+            if let Some(seat_project) = arrive_rebind_project(state::find_seat_by_pin(pin), pane) {
+                match crate::cmd::swarm::seat_adopt(&seat_project, Some(pin), pane, None) {
+                    Ok(()) => eprintln!("arrive moved seat {pin} to pane {pane}"),
+                    Err(e) => eprintln!("flywheel: arrive could not move seat {pin}: {e:#}"),
+                }
+            }
         }
         None => eprintln!(
             "flywheel: no REX_BLOCK and no HC_TERMINAL_ID — this session is pull-only; doorbell \
              pushes stay digest-bound. Pull with `toron mail inbox --since last`."
         ),
     }
+}
+
+/// The project whose seat row for this pin points at another pane, so a
+/// harness resumed in a new pane gets its wakes back on arrival.
+fn arrive_rebind_project(seat: Option<(String, state::SpawnEntry)>, pane: &str) -> Option<String> {
+    seat.filter(|(_, row)| row.pane_id != pane)
+        .map(|(project, _)| project)
 }
 
 /// bd-spawn-identity-divergence-2vzw: what arrive may do with `--as`, judged

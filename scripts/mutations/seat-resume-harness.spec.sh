@@ -7,6 +7,7 @@ TEST_FILTER=(
     claude_resume_keeps_the_seat_plugin
     gemini_is_deprecated_for_antigravity
     claude_session_is_a_uuid_passed_with_session_id
+    arrive_moves_a_seat_only_when_its_row_names_another_pane
 )
 
 mutation "R1  agy resume keeps the hook's harness prefix" \
@@ -38,3 +39,9 @@ mutation "R5  claude spawn mints a non-uuid session" \
     expect=claude_session_is_a_uuid_passed_with_session_id \
     find='        claude_session_id()' \
     replace='        opencode_session_id()'
+
+mutation "R6  arrive leaves a moved seat on its old pane" \
+    file=src/main.rs \
+    expect=arrive_moves_a_seat_only_when_its_row_names_another_pane \
+    find='    seat.filter(|(_, row)| row.pane_id != pane)' \
+    replace='    seat.filter(|(_, row)| row.pane_id == pane)'
