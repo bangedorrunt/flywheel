@@ -730,8 +730,23 @@ pub fn probe_workspace_presence(
     if !labels.iter().any(|l| l == workspace) {
         labels.push(workspace.to_string());
     }
-    let found = list.iter().any(|ws| labels.iter().any(|l| l == &ws.label));
-    classify_list_presence(list.is_empty(), found)
+    let listed: Vec<(&str, &str)> = list
+        .iter()
+        .map(|ws| (ws.workspace_id.as_str(), ws.label.as_str()))
+        .collect();
+    classify_list_presence(
+        list.is_empty(),
+        workspace_listed(&listed, &labels, workspace),
+    )
+}
+
+/// A host keyed by session ID must match the ID, not only a label: a renamed
+/// session keeps its ID while its label changes.
+pub fn workspace_listed(listed: &[(&str, &str)], labels: &[String], workspace: &str) -> bool {
+    let id = workspace.strip_prefix("session:").unwrap_or(workspace);
+    listed.iter().any(|(ws_id, label)| {
+        labels.iter().any(|l| l == label) || ws_id.strip_prefix("session:").unwrap_or(ws_id) == id
+    })
 }
 
 /// Cutover registration (bd-asr2.13, Phase 3): spawn records one
@@ -2793,6 +2808,44 @@ mod tests {
 
         rotate_host_log(&dir.join("missing.err.log"), 10);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A host keyed by session ID retired itself as `workspace-gone` after the
+    /// agent renamed its session: the probe compared labels only.
+    #[test]
+    fn renamed_session_is_still_present_for_an_id_keyed_host() {
+        let ws = "session:01a20d25-ef0f-7904-9be1-d05b7050a557";
+        let labels = vec![ws.to_string()];
+        let listed = [
+            (
+                "session:01a20d25-ef0f-7904-9be1-d05b7050a557",
+                "stack-debate-review",
+            ),
+            ("session:01a1d1e6-0b95-767c-861f-176fd88da6ea", "chiebukuro"),
+        ];
+        assert!(workspace_listed(&listed, &labels, ws));
+        let bare = [(
+            "01a20d25-ef0f-7904-9be1-d05b7050a557",
+            "stack-debate-review",
+        )];
+        assert!(
+            workspace_listed(&bare, &labels, ws),
+            "an ID without the prefix still matches"
+        );
+        let others = [("session:01a1d1e6-0b95-767c-861f-176fd88da6ea", "chiebukuro")];
+        assert!(
+            !workspace_listed(&others, &labels, ws),
+            "a missing session is still gone"
+        );
+        let by_label = [(
+            "session:01a1d1e6-0b95-767c-861f-176fd88da6ea",
+            "flywheel-flywheel",
+        )];
+        assert!(workspace_listed(
+            &by_label,
+            &["flywheel-flywheel".to_string()],
+            "flywheel-flywheel"
+        ));
     }
 
     /// An injected row must be attributable to its pin, or
