@@ -1148,10 +1148,7 @@ pub(crate) fn cmd_doorbell_digest(
     crate::check_project_spelling(project, "doorbell digest")?;
     let state_dir = crate::config::state_dir();
     let scoped = crate::doorbell::project_workspaces(&state_dir, project);
-    let entries: Vec<(String, serde_json::Value)> = crate::doorbell::journal_read_all(&state_dir)
-        .into_iter()
-        .filter(|(ws, _)| scoped.contains(ws))
-        .collect();
+    let entries = crate::doorbell::journal_read_workspaces(&state_dir, &scoped);
     let since_us = since.and_then(|s| doorbell_core::parse_rfc3339_micros(s).ok());
     let mut unanswered: std::collections::BTreeSet<String> = Default::default();
     for ws in &scoped {

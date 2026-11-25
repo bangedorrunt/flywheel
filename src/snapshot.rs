@@ -458,7 +458,10 @@ pub fn assemble_with_label(
         degraded.push("lanes".to_string());
     }
 
-    let journal_entries = crate::doorbell::journal_read_all(&crate::config::state_dir());
+    let journal_entries = crate::doorbell::journal_read_workspaces(
+        &crate::config::state_dir(),
+        &std::collections::BTreeSet::from([ws_label.to_string()]),
+    );
     let model = fold_model_for(&journal_entries, ws_label);
     let decisions: Vec<DecisionRow> = crate::workspace::open_decisions(&model)
         .into_iter()

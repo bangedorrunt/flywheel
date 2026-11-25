@@ -1100,10 +1100,7 @@ pub fn unrung_deferrals_after(
 ) -> Vec<(String, String)> {
     let wanted: std::collections::BTreeSet<String> = workspaces.into_iter().collect();
     let mut pending: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for (ws, row) in journal_read_all(state_dir) {
-        if !wanted.contains(&ws) {
-            continue;
-        }
+    for (ws, row) in journal_read_workspaces(state_dir, &wanted) {
         let executed = row.get("executed");
         let handoff = executed
             .and_then(|e| e.get("stage"))
@@ -2118,7 +2115,6 @@ pub fn journal_version_accepted(entry: &serde_json::Value) -> bool {
 /// past the tear so existing callers keep working, and strips the `.N`
 /// generation suffix back to the workspace name.
 pub fn journal_read_all(state_dir: &Path) -> Vec<(String, serde_json::Value)> {
-    let store = doorbell_rt::FileStore::new(state_dir);
     let mut workspaces = std::collections::BTreeSet::new();
     let Ok(entries) = std::fs::read_dir(state_dir.join("journals")) else {
         return Vec::new();
@@ -2133,10 +2129,17 @@ pub fn journal_read_all(state_dir: &Path) -> Vec<(String, serde_json::Value)> {
             workspaces.insert(rest.split('.').next().unwrap_or(rest).to_string());
         }
     }
+    journal_read_workspaces(state_dir, &workspaces)
+}
+
+pub fn journal_read_workspaces(
+    state_dir: &Path,
+    workspaces: &std::collections::BTreeSet<String>,
+) -> Vec<(String, serde_json::Value)> {
+    let store = doorbell_rt::FileStore::new(state_dir);
     let mut out = Vec::new();
     for ws in workspaces {
-        let fold = store.fold_workspace(&ws);
-        for row in fold.rows {
+        for row in store.fold_workspace(ws).rows {
             out.push((ws.clone(), row));
         }
     }
@@ -2706,6 +2709,39 @@ mod tests {
         ev.is_presence = true;
         ev.addressed_to_self = true;
         assert_eq!(classify(&ev), None);
+    }
+
+    /// The snapshot, digest and deferral scan each want a few workspaces, so
+    /// they read only those journals instead of parsing every workspace's.
+    #[test]
+    fn journal_read_workspaces_reads_only_the_wanted_journals() {
+        let dir = std::env::temp_dir().join(format!("journal-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        inject_wake_in(&dir, "proj", "ws-a", "CrimsonHeron", "probe-a", 1_000).expect("inject a");
+        inject_wake_in(&dir, "proj-b", "ws-b", "SlateHarbor", "probe-b", 1_000).expect("inject b");
+
+        let wanted: std::collections::BTreeSet<String> = ["ws-a".to_string()].into();
+        let scoped = journal_read_workspaces(&dir, &wanted);
+        let expected: Vec<_> = journal_read_all(&dir)
+            .into_iter()
+            .filter(|(ws, _)| ws == "ws-a")
+            .collect();
+        assert!(!scoped.is_empty(), "the wanted journal is read");
+        assert!(
+            journal_read_all(&dir).iter().any(|(ws, _)| ws == "ws-b"),
+            "the other journal exists"
+        );
+        assert_eq!(
+            scoped, expected,
+            "same rows as reading everything and filtering"
+        );
+        assert!(
+            !scoped
+                .iter()
+                .any(|(_, row)| row.to_string().contains("probe-b")),
+            "no other workspace is read"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An injected row must be attributable to its pin, or
