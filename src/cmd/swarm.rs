@@ -463,50 +463,67 @@ pub(crate) fn cmd_swarm_apply(
 /// overwrite of a seat someone else is using.
 pub(crate) fn adopt_entry(
     entries: &mut [crate::state::SpawnEntry],
-    pin: &str,
+    pin: Option<&str>,
     pane: &str,
     session: Option<&str>,
-) -> Result<()> {
+) -> Result<String> {
     if pane.trim().is_empty() {
         bail!("seat adopt: --pane is required and must be non-empty");
     }
-    let entry = entries
-        .iter_mut()
-        .find(|e| e.mail_identity.as_deref() == Some(pin) || e.name == pin)
-        .ok_or_else(|| anyhow::anyhow!("seat adopt: no seat for {pin}"))?;
+    let entry = match (pin, session) {
+        (Some(pin), _) => entries
+            .iter_mut()
+            .find(|e| e.mail_identity.as_deref() == Some(pin) || e.name == pin)
+            .ok_or_else(|| anyhow::anyhow!("seat adopt: no seat for {pin}"))?,
+        (None, Some(id)) => entries
+            .iter_mut()
+            .find(|e| e.harness_session.as_deref() == Some(id))
+            .ok_or_else(|| anyhow::anyhow!("seat adopt: no seat recorded harness session {id}"))?,
+        (None, None) => bail!("seat adopt: name a pin or pass --session"),
+    };
     entry.pane_id = pane.to_string();
     if let Some(id) = session {
         entry.harness_session = Some(id.to_string());
     }
-    Ok(())
+    Ok(entry
+        .mail_identity
+        .clone()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| entry.name.clone()))
+}
+
+pub(crate) fn adopt_key(pin: &str, pane: &str) -> String {
+    format!("seat-adopt:{pin}:{pane}")
 }
 
 /// bd-01q9d: journaled wrapper around [`adopt_entry`]. The intent lands before
 /// the registry write; a failed or held journal never rebinds blind.
 pub(crate) fn seat_adopt(
     project: &str,
-    pin: &str,
+    pin: Option<&str>,
     pane: &str,
     session: Option<&str>,
 ) -> Result<()> {
     use crate::supervisor_host::{Begin, EffectJournal, ToronEffectJournal};
-    let key = format!("seat-adopt:{pin}");
+    let mut entries = crate::state::load_spawn_registry(project);
+    let resolved = adopt_entry(&mut entries, pin, pane, session)?;
+    let key = adopt_key(&resolved, pane);
     let mut journal = ToronEffectJournal::open(&format!("plan:{project}"), "seat-adopt")?;
-    let begin = journal.begin(&key);
-    let generation = match begin {
+    let generation = match journal.begin(&key) {
         Begin::Run(n) => n,
-        Begin::Skip => return Ok(()),
+        Begin::Skip => {
+            println!("{resolved}");
+            return Ok(());
+        }
         Begin::Unavailable(e) | Begin::Held(e) => {
-            bail!("seat adopt {pin}: journal refused the claim ({e})")
+            bail!("seat adopt {resolved}: journal refused the claim ({e})")
         }
     };
-    let mut entries = crate::state::load_spawn_registry(project);
-    let result = adopt_entry(&mut entries, pin, pane, session);
-    if result.is_ok() {
-        crate::state::save_spawn_registry(project, &entries)?;
-    }
-    journal.finish(&key, generation, result.is_ok());
-    result
+    let saved = crate::state::save_spawn_registry(project, &entries);
+    journal.finish(&key, generation, saved.is_ok());
+    saved?;
+    println!("{resolved}");
+    Ok(())
 }
 
 /// One `flywheel retire` run's outcome.
@@ -2399,8 +2416,13 @@ mod apply_gate_tests {
         let project = "applyadopt";
         let root = seeded(project);
         let mut entries = crate::state::load_spawn_registry(project);
-        super::adopt_entry(&mut entries, "PinOne", "block:01a1e1c0", Some("ses-live-1"))
-            .expect("adopt the live pane");
+        super::adopt_entry(
+            &mut entries,
+            Some("PinOne"),
+            "block:01a1e1c0",
+            Some("ses-live-1"),
+        )
+        .expect("adopt the live pane");
         let row = entries
             .iter()
             .find(|e| e.mail_identity.as_deref() == Some("PinOne"))
@@ -2432,6 +2454,48 @@ mod apply_gate_tests {
         let bind = crate::inbox_ports::verify_rex_block(&pane, "PinOne", "npub1test");
         assert!(bind.verified, "the adopted rex block must verify: {bind:?}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A harness resumed in a new pane has no pin in its env; the harness
+    /// session it recorded at startup finds the seat.
+    #[test]
+    fn seat_adopt_by_harness_session_moves_a_resumed_seat() {
+        let _g = crate::config::lock_env();
+        let project = "adoptresume";
+        let root = seeded(project);
+        let mut entries = crate::state::load_spawn_registry(project);
+        super::adopt_entry(
+            &mut entries,
+            Some("PinOne"),
+            "block:old",
+            Some("ses-resume-1"),
+        )
+        .expect("startup records the session");
+        let pin = super::adopt_entry(&mut entries, None, "block:new", Some("ses-resume-1"))
+            .expect("resume finds the seat by session");
+        assert_eq!(pin, "PinOne");
+        let row = entries
+            .iter()
+            .find(|e| e.mail_identity.as_deref() == Some("PinOne"))
+            .expect("seeded seat");
+        assert_eq!(row.pane_id, "block:new");
+        assert!(super::adopt_entry(&mut entries, None, "block:x", Some("ses-unknown")).is_err());
+        assert!(super::adopt_entry(&mut entries, None, "block:x", None).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The journal skips a finished key, so a key without the pane let a pin
+    /// re-bind once and then skip every later resume as done.
+    #[test]
+    fn seat_adopt_key_is_per_target_pane() {
+        assert_ne!(
+            super::adopt_key("PinOne", "block:a"),
+            super::adopt_key("PinOne", "block:b")
+        );
+        assert_eq!(
+            super::adopt_key("PinOne", "block:a"),
+            super::adopt_key("PinOne", "block:a")
+        );
     }
 
     /// bd-01q9d: --dry-run previews the same effects but leaves the plan of

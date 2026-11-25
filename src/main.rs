@@ -799,7 +799,7 @@ enum EventsTokenCmd {
 enum SeatCmd {
     /// Re-bind a seat to a live pane (bd-01q9d)
     Adopt {
-        pin: String,
+        pin: Option<String>,
         #[arg(long)]
         pane: String,
         #[arg(long)]
@@ -3399,7 +3399,7 @@ fn main() {
                 std::env::var("FLYWHEEL_PROJECT")
                     .unwrap_or_else(|_| crate::cron::detect_project(&cfg, None).unwrap_or_default())
                     .as_str(),
-                pin,
+                pin.as_deref(),
                 pane,
                 session.as_deref(),
             ),

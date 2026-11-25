@@ -56,7 +56,7 @@ flywheel crew land <brief-id> --proof-receipt <proof.json> [--project p]
 flywheel workflow compose --parts <token> --join [--dry-run|--run --yes]   # bind to live seats (bd-3ann1)
 flywheel swarm plan|apply|status <project> ...
 flywheel burst <project> --kind <harness> --stage <stage> --prompt <text> [--resume <id>] [--dry-run] [--json]
-flywheel seat adopt <pin> --pane <block> [--session <id>]   # re-bind a seat to a live pane (bd-01q9d)
+flywheel seat adopt [<pin>] --pane <block> [--session <id>]   # re-bind a seat to a live pane (bd-01q9d); --session alone finds a resumed seat (bd-gcoq1)
 flywheel retire <pin>... [--project p] [--force-working]
 ```
 
